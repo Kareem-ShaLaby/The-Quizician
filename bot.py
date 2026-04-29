@@ -7,10 +7,11 @@ CHANNEL_ID = "@QuizicianChannel"  # replace this
 
 async def handle_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    lines = text.split("\n")
+
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
 
     if len(lines) < 2:
-        await update.message.reply_text("Invalid format.")
+        await update.message.reply_text("❌ Invalid format: need question + options")
         return
 
     question = lines[0]
@@ -18,20 +19,27 @@ async def handle_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     correct_index = None
 
     for i, line in enumerate(lines[1:]):
-        line = line.strip()
+        is_correct = line.endswith(",")
 
-        if line.endswith(","):
-            correct_index = i
-            line = line[:-1].strip()  # remove comma
+        # remove comma if present
+        if is_correct:
+            line = line[:-1].strip()
 
-        # remove A) / B) etc
+        # remove A) B) C) if present OR not present
         if ")" in line:
             line = line.split(")", 1)[1].strip()
 
         options.append(line)
 
+        if is_correct:
+            correct_index = i
+
     if correct_index is None:
-        await update.message.reply_text("No correct answer marked with a comma.")
+        await update.message.reply_text("❌ No correct answer marked with comma (,)")
+        return
+
+    if len(options) < 2:
+        await update.message.reply_text("❌ Need at least 2 options")
         return
 
     await context.bot.send_poll(
@@ -43,7 +51,7 @@ async def handle_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_anonymous=False
     )
 
-    await update.message.reply_text("Quiz posted ✅")
+    await update.message.reply_text("✅ Quiz posted")
 
 app = ApplicationBuilder().token(TOKEN).build()
 
