@@ -3,7 +3,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = "@TheQuizician_Bot"  # replace this
+CHANNEL_ID = "@QuizicianChannel"  # replace this
 
 async def handle_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
