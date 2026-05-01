@@ -126,7 +126,7 @@ from telegram.constants import ParseMode
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*❤️ صلي على النبي ❤️*\n"
-        "*Created by Kareem Shalaby*\n\n"
+        "*_Created by Kareem Shalaby_*\n\n"
         "Send a question like:\n\n"
         "Question?\n"
         "a) option 1\n"
