@@ -121,19 +121,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- COMMANDS ----------
 
+from telegram.constants import ParseMode
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "**❤️صلي على النبي❤️**"
-        "**Created by Kareem Shalaby**"
+        "*❤️ صلي على النبي ❤️*\n"
+        "*Created by Kareem Shalaby*\n\n"
         "Send a question like:\n\n"
         "Question?\n"
         "a) option 1\n"
         "b) option 2 ✅\n"
         "c) option 3\n\n"
-        "or use Z:\n"
-        "option 1 Z\n"
-        "option 2\n\n"
-        "ex: explanation (optional)"
+        "or use Z instead of ✅\n\n"
+        "ex: explanation (optional)",
+        parse_mode=ParseMode.MARKDOWN
     )
 
 
