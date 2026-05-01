@@ -42,7 +42,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [l.strip() for l in text.split("\n") if l.strip()]
 
         if len(lines) < 3:
-            await update.message.reply_text(" 🙏 yasta أكتب سؤال + اختيارين على الأقل ")
+            await update.message.reply_text(" 🙏 أكتب سؤال + اختيارين على الأقل يسطا ")
             return
 
         question = lines[0]
@@ -123,8 +123,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*❤️صلي على النبي❤️*"
-        "*Created by Kareem Shalaby*"
+        "**❤️صلي على النبي❤️**"
+        "**Created by Kareem Shalaby**"
         "Send a question like:\n\n"
         "Question?\n"
         "a) option 1\n"
