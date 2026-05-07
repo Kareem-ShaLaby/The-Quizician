@@ -141,20 +141,34 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 from telegram.constants import ParseMode
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    # ---------- FIRST MESSAGE ----------
     await update.message.reply_text(
-        "*❤️ ﷽ ❤️*\n"
-        "*Created by Kareem Shalaby*\n"
-          "*منور يا كويزاوي🌹*\n\n"
+        "❤️ <b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b> ❤️\n"
+        "<b><i>Created by Kareem Shalaby</i></b>\n"
+        "<b>منور يا كويزاوي🌹</b>"
         "Send a question like:\n\n"
         "Question?\n"
         "a) option 1\n"
         "b) option 2 ✅\n"
-        "c) option 3\n\n"
-        "or use Z instead of ✅\n\n"
-        "ex: explanation (optional)",
-        parse_mode=ParseMode.MARKDOWN
+        "c) option 3\n"
+        "ex: explanation (optional)\n\n"
+        "or use Z instead of ✅"
+        ,
+        parse_mode=ParseMode.HTML
     )
 
+    # ---------- SECOND MESSAGE ----------
+    await update.message.reply_text(
+        "🆕 <b>Latest Updates</b>\n"
+        "• Multi-question support (up to 5)\n"
+        "• Supports ✅ and Z\n"
+        "• Automatic A) B) C) labels\n"
+        "• Anonymous quizzes\n"
+        "• ex: explanations\n\n",
+
+        parse_mode=ParseMode.HTML
+    )
 
 # ---------- MAIN ----------
 
