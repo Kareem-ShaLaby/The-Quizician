@@ -146,8 +146,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "❤️ <b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b> ❤️\n"
         "<b><i>Created by Kareem Shalaby</i></b>\n"
-        "<b>منور يا كويزاوي🌹</b>"
-        "Send a question like:\n\n"
+        "<b>منور يا كويزاوي🌹</b>\n"
+        "Send a question like:\n"
         "Question?\n"
         "a) option 1\n"
         "b) option 2 ✅\n"
@@ -162,7 +162,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🆕 <b>Latest Updates - V2.1 </b>\n"
         "• Multi-question support (up to 5) - تقدر تحط كذا سؤال مره واحده\n"
-        "• Supports ✅ and Z\n"
         "• Automatic A) B) C) labels\n"
         "• Bug fixes\n",
 
