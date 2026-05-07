@@ -31,7 +31,6 @@ def clean_option(line: str) -> str:
 
 
 # ---------- HANDLER ----------
-
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -39,86 +38,104 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     try:
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        # split questions by double new line
+        question_blocks = re.split(r"\n\s*\n(?=[^\n])", text)
 
-        if len(lines) < 3:
-            await update.message.reply_text(" 🙏 أكتب سؤال + اختيارين على الأقل يسطا ")
+        # max 5 questions
+        if len(question_blocks) > 5:
+            await update.message.reply_text("❌ الحد الأقصى 5 أسئلة مرة واحدة")
             return
 
-        question = lines[0]
+        for block in question_blocks:
 
-        options = []
-        correct_index = None
-        explanation = None
+            lines = [l.strip() for l in block.split("\n") if l.strip()]
 
-        # ---------- detect explanation ----------
-        for i, line in enumerate(lines):
-            if line.lower().startswith("ex:"):
-                explanation = line[3:].strip()
-                lines = lines[:i]
-                break
+            if len(lines) < 3:
+                continue
 
-        # ---------- parse options ----------
-        for line in lines[1:]:
-            option_text = clean_option(line)
+            question = lines[0]
 
-            # detect correct answer using ✅ or Z/z (standalone)
-            if "✅" in option_text or re.search(r"\b[zZ]\b$", option_text):
-                option_text = option_text.replace("✅", "").strip()
-                option_text = re.sub(r"\b[zZ]\b$", "", option_text).strip()
-                correct_index = len(options)
+            options = []
+            correct_index = None
+            explanation = None
 
-            if option_text:
-                options.append(option_text)
+            # ---------- detect explanation ----------
+            for i, line in enumerate(lines):
+                if line.lower().startswith("ex:"):
+                    explanation = line[3:].strip()
+                    lines = lines[:i]
+                    break
 
-        # ---------- auto add A) B) C)... ----------
-        has_labels = all(
-            re.match(r"^[A-Za-z]\)", opt.strip())
-            for opt in options
-        )
+            # ---------- parse options ----------
+            for line in lines[1:]:
+                option_text = clean_option(line)
 
-        if not has_labels:
-            labeled_options = []
-            for i, opt in enumerate(options):
-                label = f"{string.ascii_uppercase[i]}) "
-                labeled_options.append(label + opt)
-            options = labeled_options
+                # detect correct answer using ✅ or Z/z
+                if "✅" in option_text or re.search(r"\b[zZ]\b$", option_text):
+                    option_text = option_text.replace("✅", "").strip()
+                    option_text = re.sub(r"\b[zZ]\b$", "", option_text).strip()
 
-        # ---------- VALIDATION ----------
+                    correct_index = len(options)
 
-        if len(options) < 2:
-            await update.message.reply_text(" 🙃 لازم اختيارين على الأقل")
-            return
+                if option_text:
+                    options.append(option_text)
 
-        if len(options) > 10:
-            await update.message.reply_text(" 🙃 الحد الأقصى 10 اختيارات")
-            return
+            # ---------- auto add A) B) C)... ----------
+            has_labels = all(
+                re.match(r"^[A-Za-z]\)", opt.strip())
+                for opt in options
+            )
 
-        if correct_index is None:
-            await update.message.reply_text("❌ حط ✅ أو Z جنب الإجابة الصح")
-            return
+            if not has_labels:
+                labeled_options = []
 
-        if correct_index >= len(options):
-            await update.message.reply_text("❌😞 في مشكلة في تحديد الإجابة الصح")
-            return
+                for i, opt in enumerate(options):
+                    label = f"{string.ascii_uppercase[i]}) "
+                    labeled_options.append(label + opt)
 
-        # ---------- SEND POLL ----------
+                options = labeled_options
 
-        await context.bot.send_poll(
-            chat_id=update.effective_chat.id,
-            question=question,
-            options=options,
-            type="quiz",
-            correct_option_id=correct_index,
-            explanation=explanation,
-            is_anonymous=True,  # ✅ anonymous enabled
-        )
+            # ---------- VALIDATION ----------
+
+            if len(options) < 2:
+                await update.message.reply_text(
+                    f"❌ السؤال ده محتاج اختيارين على الأقل:\n{question}"
+                )
+                continue
+
+            if len(options) > 12:
+                await update.message.reply_text(
+                    f"❌ السؤال ده فيه أكتر من 12 اختيار:\n{question}"
+                )
+                continue
+
+            if correct_index is None:
+                await update.message.reply_text(
+                    f"❌ حدد الإجابة الصح في السؤال:\n{question}"
+                )
+                continue
+
+            if correct_index >= len(options):
+                await update.message.reply_text(
+                    f"❌ في مشكلة في الإجابة الصح:\n{question}"
+                )
+                continue
+
+            # ---------- SEND POLL ----------
+
+            await context.bot.send_poll(
+                chat_id=update.effective_chat.id,
+                question=question,
+                options=options,
+                type="quiz",
+                correct_option_id=correct_index,
+                explanation=explanation,
+                is_anonymous=True,
+            )
 
     except Exception as e:
         print("ERROR:", e)
         await update.message.reply_text("❌🥸 في مشكلة في التنسيق")
-
-
 # ---------- COMMANDS ----------
 
 from telegram.constants import ParseMode
