@@ -147,33 +147,31 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- START COMMAND ----------
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "❤️ <b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b> ❤️\n"
         "<b><i>Created by Kareem Shalaby</i></b>\n"
-        "<b>منور يا كويزاوي🌹</b>\n"
+        "<b>منور يا كويزاوي🌹</b>\n\n"
+
         "Send a question like:\n"
         "Question?\n"
         "a) option 1\n"
         "b) option 2 ✅\n"
         "c) option 3\n"
         "ex: explanation (optional - لازم تحت السؤال علطول)\n\n"
-        "or use Z instead of ✅"
-        ,
+        "or use Z instead of ✅",
         parse_mode=ParseMode.HTML
     )
 
-    # ---------- SECOND MESSAGE ----------
     await update.message.reply_text(
-        "🆕 <b>Latest Updates - V2.1 </b>\n"
-        "• Multi-question support (up to 5) - تقدر تحط كذا سؤال مره واحده\n"
+        "🆕 <b>Latest Updates - V2.1</b>\n"
+        "• Multi-question support (up to 5)\n"
         "• Automatic A) B) C) labels\n"
         "• Bug fixes\n"
-        "• Smart parsing + reactions🌚\n",
-
-
+        "• Smart parsing + reactions 🫡❤️🏆\n",
+        parse_mode=ParseMode.HTML
+    )
 
 # ---------- MAIN ----------
 
