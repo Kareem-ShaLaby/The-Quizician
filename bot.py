@@ -61,9 +61,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         question_blocks = re.split(r"\n\s*\n(?=[^\n])", text)
 
-        if len(question_blocks) > 5:
-            await update.message.reply_text("❌ الحد الأقصى 5 أسئلة مرة واحدة")
-            return
+        if len(question_blocks) > 10:
+    await update.message.reply_text("🦦 بلاش طفس يسطا الحد الأقصى 10 أسئلة ")
+    return
 
         for block in question_blocks:
 
@@ -111,20 +111,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # ---------- validation ----------
             if len(options) < 2:
-                await update.message.reply_text(f"❌ السؤال ناقص: {question}")
-                continue
+    await update.message.reply_text("❌ السؤال ناقص")
+    continue
 
-            if len(options) > 12:
-                await update.message.reply_text(f"❌ أكتر من 12 اختيار: {question}")
-                continue
+if len(options) > 12:
+    await update.message.reply_text("😭 أكتر من 12 اختيار حرام عليك")
+    continue
 
-            if correct_index is None:
-                await update.message.reply_text(f"❌ مفيش إجابة صح: {question}")
-                continue
+if correct_index is None:
+    await update.message.reply_text("❌ مفيش إجابة صح")
+    continue
 
-            if correct_index >= len(options):
-                await update.message.reply_text(f"❌ مشكلة في الإجابة: {question}")
-                continue
+if correct_index >= len(options):
+    await update.message.reply_text("❌ مشكلة في الإجابة")
+    continue
 
             # ---------- SEND POLL ----------
             await context.bot.send_poll(
@@ -165,11 +165,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🆕 <b>Latest Updates - V2.1</b>\n"
-        "• Multi-question support (up to 5)\n"
-        "• Automatic A) B) C) labels\n"
+        "🆕 <b>Latest Updates - V2.3</b>\n"
+        "• increased maximum Multi-question support (up to 10!)\"
         "• Bug fixes\n"
-        "• Smart parsing + reactions 🫡❤️🏆\n",
+        "❤صلي على النبي❤\n",
         parse_mode=ParseMode.HTML
     )
 
