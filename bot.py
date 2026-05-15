@@ -61,7 +61,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         question_blocks = re.split(r"\n\s*\n(?=[^\n])", text)
 
-        if len(question_blocks) > 10:
+       if len(question_blocks) > 10:
     await update.message.reply_text("🦦 بلاش طفس يسطا الحد الأقصى 10 أسئلة ")
     return
 
