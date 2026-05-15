@@ -51,7 +51,6 @@ async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- HANDLER ----------
-
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -61,9 +60,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         question_blocks = re.split(r"\n\s*\n(?=[^\n])", text)
 
-       if len(question_blocks) > 10:
-    await update.message.reply_text("🦦 بلاش طفس يسطا الحد الأقصى 10 أسئلة ")
-    return
+        # ---------- max questions ----------
+        if len(question_blocks) > 10:
+            await update.message.reply_text(
+                "🦦 بلاش طفس يسطا الحد الأقصى 10 أسئلة "
+            )
+            return
 
         for block in question_blocks:
 
@@ -92,6 +94,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if "✅" in option_text or re.search(r"\b[zZ]\b$", option_text):
                     option_text = option_text.replace("✅", "").strip()
                     option_text = re.sub(r"\b[zZ]\b$", "", option_text).strip()
+
                     correct_index = len(options)
 
                 if option_text:
@@ -105,26 +108,31 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if not has_labels:
                 labeled = []
+
                 for i, opt in enumerate(options):
                     labeled.append(f"{string.ascii_uppercase[i]}) {opt}")
+
                 options = labeled
 
             # ---------- validation ----------
+
             if len(options) < 2:
-    await update.message.reply_text("❌ السؤال ناقص")
-    continue
+                await update.message.reply_text("❌ السؤال ناقص")
+                continue
 
-if len(options) > 12:
-    await update.message.reply_text("😭 أكتر من 12 اختيار حرام عليك")
-    continue
+            if len(options) > 12:
+                await update.message.reply_text(
+                    "😭 أكتر من 12 اختيار حرام عليك"
+                )
+                continue
 
-if correct_index is None:
-    await update.message.reply_text("❌ مفيش إجابة صح")
-    continue
+            if correct_index is None:
+                await update.message.reply_text("❌ مفيش إجابة صح")
+                continue
 
-if correct_index >= len(options):
-    await update.message.reply_text("❌ مشكلة في الإجابة")
-    continue
+            if correct_index >= len(options):
+                await update.message.reply_text("❌ مشكلة في الإجابة")
+                continue
 
             # ---------- SEND POLL ----------
             await context.bot.send_poll(
@@ -140,12 +148,9 @@ if correct_index >= len(options):
             # ---------- REACTION ----------
             await react_random(update, context)
 
-
     except Exception as e:
         print("ERROR:", e)
         await update.message.reply_text("❌🥸 في مشكلة في التنسيق")
-
-
 # ---------- START COMMAND ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
