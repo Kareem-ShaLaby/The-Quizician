@@ -166,7 +166,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🆕 <b>Latest Updates - V2.3</b>\n"
-        "• increased maximum Multi-question support (up to 10!)\"
+        "• increased maximum Multi-question support (up to 10!)\n"
         "• Bug fixes\n"
         "❤صلي على النبي❤\n",
         parse_mode=ParseMode.HTML
