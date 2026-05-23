@@ -232,21 +232,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "❤️ <b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b> ❤️\n"
-        "<b><i>Kareem Shalaby</i></b>\n"
+        "<b><i>Created by Kareem Shalaby</i></b>\n"
         "منور يا كويزاوي🌹",
         parse_mode=ParseMode.HTML
     )
 
     await update.message.reply_text(
         "📚 <b>Ways to use the bot:</b>\n\n"
-        "1) Multi-line MCQ:\n"
+        "1) normal MCQ:\n"
         "Question?\n"
         "a) A\n"
         "b) B z\n"
         "c) C\n\n"
-        "2) Single-line MCQ:\n"
-        "Question? a) A b) B.z c) C\n\n"
-        "3) Written Questions:\n"
+        "2) Single-line MCQ:كله فنفس السطر\n"
+        "Question? a) A b) Bz c) C\n\n"
+        "3) Written Questions: متنساش النقطتين\n"
         "Title\n"
         ".answer1\n"
         "answer2\n"
@@ -260,7 +260,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Single-line MCQ parsing\n"
         "• Written spoiler mode\n"
         "• Reactions\n"
-        "• Bug fixes\n\n"
+        "• أذكار \n\n"
         "❤ صلي على النبي ❤",
         parse_mode=ParseMode.HTML
     )
