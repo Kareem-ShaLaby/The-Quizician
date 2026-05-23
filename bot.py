@@ -1,6 +1,8 @@
 import re
 import string
 import random
+import json
+import os
 
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import (
@@ -16,6 +18,22 @@ from telegram.constants import ParseMode
 BOT_TOKEN = "8661732123:AAEkdln3xbp0EJiNBCKYChH0A8ioCYkSNic"
 
 
+# ---------- USERS STORAGE ----------
+USERS_FILE = "users.json"
+
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def save_users():
+    with open(USERS_FILE, "w") as f:
+        json.dump(list(USERS), f)
+
+USERS = load_users()
+
+
 # ---------- DHIKR ----------
 dhikr_list = [
     "صلي على النبي ﷺ",
@@ -27,7 +45,7 @@ dhikr_list = [
 
 # ---------- HELPERS ----------
 
-def clean_option(line: str) -> str:
+def clean_option(line: str):
     line = line.strip()
     line = re.sub(r"^[A-Za-z0-9]+[\)\.\-]\s*", "", line)
     line = re.sub(r"^[-•]\s*", "", line)
@@ -50,6 +68,21 @@ def normalize_mcq_block(block: str):
     parts = re.split(r"(?=\b[A-Za-z][\)\.])", options_part)
 
     return [question] + [p.strip() for p in parts if p.strip()]
+
+
+def parse_written_question(block: str):
+    lines = [l.rstrip() for l in block.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return None
+
+    title = lines[0]
+    content = "\n".join(lines[1:])
+
+    if not (content.strip().startswith(".") and content.strip().endswith(".")):
+        return None
+
+    content = content.strip()[1:-1].strip()
+    return title, content
 
 
 # ---------- REACTIONS ----------
@@ -86,14 +119,6 @@ async def react_fire(context, chat_id, message_id):
         pass
 
 
-async def send_dhikr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        msg = random.choice(dhikr_list)
-        await update.message.reply_text(msg)
-    except:
-        pass
-
-
 # ---------- HANDLER ----------
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -111,6 +136,18 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for block in blocks:
 
+            # ---------- WRITTEN ----------
+            written = parse_written_question(block)
+            if written:
+                title, content = written
+
+                await update.message.reply_text(
+                    f"*{title}*\n||{content}||",
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+                continue
+
+            # ---------- MCQ ----------
             lines = normalize_mcq_block(block)
 
             if len(lines) < 3:
@@ -122,14 +159,14 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             correct_index = None
             explanation = None
 
-            # ---------- explanation ----------
+            # explanation
             for i, line in enumerate(lines):
                 if line.lower().startswith("ex:"):
                     explanation = line[3:].strip()
                     lines = lines[:i]
                     break
 
-            # ---------- options ----------
+            # options
             for line in lines[1:]:
                 option_text = clean_option(line)
 
@@ -141,14 +178,14 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if option_text:
                     options.append(option_text)
 
-            # ---------- auto labels ----------
+            # auto labels
             if options and not all(re.match(r"^[A-Za-z]\)", o) for o in options):
                 options = [
                     f"{string.ascii_uppercase[i]}) {opt}"
                     for i, opt in enumerate(options)
                 ]
 
-            # ---------- validation ----------
+            # validation
             if len(options) < 2:
                 await update.message.reply_text("❌ السؤال ناقص")
                 continue
@@ -165,7 +202,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ خطأ في الإجابة")
                 continue
 
-            # ---------- SEND POLL ----------
+            # send poll
             poll_msg = await context.bot.send_poll(
                 chat_id=update.effective_chat.id,
                 question=question,
@@ -176,29 +213,23 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 is_anonymous=True,
             )
 
-            # ---------- REACTIONS ----------
             await react_fire(context, poll_msg.chat.id, poll_msg.message_id)
             await react_random(update, context)
-
-            # ---------- DHIKR ----------
-            await send_dhikr(update, context)
 
     except Exception as e:
         print("ERROR:", e)
         await update.message.reply_text("❌ خطأ في التنسيق")
 
 
-# ---------- START ----------
+# ---------- START (YOUR VERSION) ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    # save user for broadcasts
     if chat_id not in USERS:
         USERS.add(chat_id)
         save_users()
 
-    # message 1
     await update.message.reply_text(
         "❤️ <b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b> ❤️\n"
         "<b><i>Kareem Shalaby</i></b>\n"
@@ -206,7 +237,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-    # message 2
     await update.message.reply_text(
         "📚 <b>Ways to use the bot:</b>\n\n"
         "1) Multi-line MCQ:\n"
@@ -224,7 +254,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-    # message 3
     await update.message.reply_text(
         "🆕 <b>Latest Updates - V2.4</b>\n"
         "• 20-question support\n"
