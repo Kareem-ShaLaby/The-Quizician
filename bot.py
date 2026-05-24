@@ -17,7 +17,6 @@ from telegram.constants import ParseMode
 
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
 
 
 BOT_TOKEN = "8661732123:AAEkdln3xbp0EJiNBCKYChH0A8ioCYkSNic"
@@ -39,8 +38,8 @@ def save_users():
 USERS = load_users()
 
 
-# ---------- PDF STORAGE ----------
-PDF_BUFFER = {}  # user_id -> list of items
+# ---------- PDF MEMORY ----------
+PDF_BUFFER = {}  # user_id -> list
 
 
 # ---------- DHIKR ----------
@@ -96,6 +95,7 @@ def parse_written_question(block: str):
 async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         roll = random.randint(1, 20)
+
         emoji = "🫡" if roll <= 15 else "❤️" if roll <= 19 else "🏆"
 
         await context.bot.set_message_reaction(
@@ -123,8 +123,8 @@ async def react_fire(context, chat_id, message_id):
 def generate_pdf(items):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer)
-
     styles = getSampleStyleSheet()
+
     content = []
 
     for item in items:
@@ -134,11 +134,10 @@ def generate_pdf(items):
 
             for i, opt in enumerate(item["options"]):
                 if i == item["correct"]:
-                    content.append(Paragraph(f"<b><font color='green'>{opt}</font></b>", styles["Normal"]))
+                    content.append(Paragraph(f"<b>{opt}</b>", styles["Normal"]))
                 else:
                     content.append(Paragraph(opt, styles["Normal"]))
 
-            content.append(Spacer(1, 12))
             content.append(PageBreak())
 
         else:
@@ -157,8 +156,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    text = update.message.text.strip()
     user_id = update.effective_chat.id
+    text = update.message.text.strip()
 
     try:
         blocks = re.split(r"\n\s*\n", text)
@@ -174,13 +173,19 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if written:
                 title, content = written
 
-                PDF_BUFFER.setdefault(user_id, []).append({
-                    "type": "written",
-                    "title": title,
-                    "content": content
-                })
-
-                await update.message.reply_text("📝 تم حفظ السؤال المكتوب")
+                # ONLY save if PDF mode is active
+                if user_id in PDF_BUFFER:
+                    PDF_BUFFER[user_id].append({
+                        "type": "written",
+                        "title": title,
+                        "content": content
+                    })
+                    await update.message.reply_text("📝 تم حفظ سؤال PDF")
+                else:
+                    await update.message.reply_text(
+                        f"*{title}*\n||{content}||",
+                        parse_mode=ParseMode.MARKDOWN_V2
+                    )
                 continue
 
             # ---------- MCQ ----------
@@ -196,7 +201,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 opt = clean_option(line)
 
                 if "z" in opt.lower() or "✅" in opt:
-                    opt = opt.replace("✅", "").strip()
+                    opt = opt.replace("✅", "")
                     opt = re.sub(r"[zZ]\s*$", "", opt).strip()
                     correct_index = len(options)
 
@@ -212,25 +217,46 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ خطأ في السؤال")
                 continue
 
-            PDF_BUFFER.setdefault(user_id, []).append({
-                "type": "mcq",
-                "q": question,
-                "options": options,
-                "correct": correct_index
-            })
+            # ---------- PDF MODE ----------
+            if user_id in PDF_BUFFER:
+                PDF_BUFFER[user_id].append({
+                    "type": "mcq",
+                    "q": question,
+                    "options": options,
+                    "correct": correct_index
+                })
+                await update.message.reply_text("🧠 تم حفظ السؤال للـ PDF")
+                continue
 
-            await update.message.reply_text("🧠 تم حفظ السؤال")
+            # ---------- NORMAL QUIZ ----------
+            poll_msg = await context.bot.send_poll(
+                chat_id=user_id,
+                question=question,
+                options=options,
+                type="quiz",
+                correct_option_id=correct_index,
+                is_anonymous=True,
+            )
 
+            await react_fire(context, poll_msg.chat.id, poll_msg.message_id)
+            await react_random(update, context)
+
+            # DHIKR 70%
+            if random.randint(1, 10) <= 7:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=random.choice(dhikr_list)
+                )
 
     except Exception as e:
         print("ERROR:", e)
-        await update.message.reply_text("❌ خطأ")
+        await update.message.reply_text("❌ خطأ في التنسيق")
 
 
 # ---------- PDF COMMANDS ----------
 async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PDF_BUFFER[update.effective_chat.id] = []
-    await update.message.reply_text("📥 تم بدء جمع الأسئلة للـ PDF")
+    await update.message.reply_text("📥 بدأ وضع PDF — ابعت الأسئلة")
 
 
 async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,13 +274,17 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename="questions.pdf"
     )
 
+    # RESET AFTER EXPORT (IMPORTANT FIX)
+    PDF_BUFFER.pop(user_id, None)
+
 
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PDF_BUFFER.pop(update.effective_chat.id, None)
-    await update.message.reply_text("🗑 تم المسح")
+    await update.message.reply_text("🗑 تم مسح PDF")
 
 
 # ---------- START ----------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -287,7 +317,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🆕 <b>Latest Updates - V3.1</b>\n"
+        "🆕 <b>Latest Updates - V2.4</b>\n"
         "• 20-question support\n"
         "• Single-line MCQ parsing\n"
         "• Written spoiler mode\n"
@@ -296,7 +326,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❤ صلي على النبي ❤",
         parse_mode=ParseMode.HTML
     )
-
 
 
 # ---------- MAIN ----------
