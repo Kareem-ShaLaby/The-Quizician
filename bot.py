@@ -3,6 +3,7 @@ import string
 import random
 import json
 import os
+from io import BytesIO
 
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import (
@@ -13,6 +14,10 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.constants import ParseMode
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
 
 BOT_TOKEN = "8661732123:AAEkdln3xbp0EJiNBCKYChH0A8ioCYkSNic"
@@ -34,6 +39,10 @@ def save_users():
 USERS = load_users()
 
 
+# ---------- PDF STORAGE ----------
+PDF_BUFFER = {}  # user_id -> list of items
+
+
 # ---------- DHIKR ----------
 dhikr_list = [
     "صلي على النبي ﷺ",
@@ -44,27 +53,19 @@ dhikr_list = [
 
 
 # ---------- HELPERS ----------
-
 def clean_option(line: str):
     line = line.strip()
-
-    # Remove A) / A. / 1) / 1. / a)
     line = re.sub(r"^[A-Ea-e1-5][\)\.\-]\s*", "", line)
-
-    # Remove bullets
     line = re.sub(r"^[-•]\s*", "", line)
-
     return line.strip()
 
 
 def normalize_mcq_block(block: str):
     block = block.strip()
 
-    # multiline MCQ
     if "\n" in block:
         return [l.strip() for l in block.split("\n") if l.strip()]
 
-    # detect first option
     match = re.search(r"\b([A-Ea-e1-5])[\)\.]", block)
     if not match:
         return [block]
@@ -72,9 +73,7 @@ def normalize_mcq_block(block: str):
     question = block[:match.start()].strip()
     options_part = block[match.start():]
 
-    # split before A) / A. / 1) / 1.
     parts = re.split(r"(?=\b[A-Ea-e1-5][\)\.])", options_part)
-
     return [question] + [p.strip() for p in parts if p.strip()]
 
 
@@ -94,17 +93,10 @@ def parse_written_question(block: str):
 
 
 # ---------- REACTIONS ----------
-
 async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         roll = random.randint(1, 20)
-
-        if roll <= 15:
-            emoji = "🫡"
-        elif roll <= 19:
-            emoji = "❤️"
-        else:
-            emoji = "🏆"
+        emoji = "🫡" if roll <= 15 else "❤️" if roll <= 19 else "🏆"
 
         await context.bot.set_message_reaction(
             chat_id=update.effective_chat.id,
@@ -127,19 +119,52 @@ async def react_fire(context, chat_id, message_id):
         pass
 
 
-# ---------- HANDLER ----------
+# ---------- PDF BUILDER ----------
+def generate_pdf(items):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer)
 
+    styles = getSampleStyleSheet()
+    content = []
+
+    for item in items:
+        if item["type"] == "mcq":
+            content.append(Paragraph(f"<b>{item['q']}</b>", styles["Normal"]))
+            content.append(Spacer(1, 6))
+
+            for i, opt in enumerate(item["options"]):
+                if i == item["correct"]:
+                    content.append(Paragraph(f"<b><font color='green'>{opt}</font></b>", styles["Normal"]))
+                else:
+                    content.append(Paragraph(opt, styles["Normal"]))
+
+            content.append(Spacer(1, 12))
+            content.append(PageBreak())
+
+        else:
+            content.append(Paragraph(f"<b>{item['title']}</b>", styles["Normal"]))
+            content.append(Spacer(1, 6))
+            content.append(Paragraph(item["content"], styles["Normal"]))
+            content.append(PageBreak())
+
+    doc.build(content)
+    buffer.seek(0)
+    return buffer
+
+
+# ---------- HANDLER ----------
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     text = update.message.text.strip()
+    user_id = update.effective_chat.id
 
     try:
         blocks = re.split(r"\n\s*\n", text)
 
         if len(blocks) > 20:
-            await update.message.reply_text("❌ الحد الأقصى 20 سؤال/كتلة")
+            await update.message.reply_text("❌ الحد الأقصى 20")
             return
 
         for block in blocks:
@@ -149,96 +174,87 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if written:
                 title, content = written
 
-                await update.message.reply_text(
-                    f"*{title}*\n||{content}||",
-                    parse_mode=ParseMode.MARKDOWN_V2
-                )
+                PDF_BUFFER.setdefault(user_id, []).append({
+                    "type": "written",
+                    "title": title,
+                    "content": content
+                })
+
+                await update.message.reply_text("📝 تم حفظ السؤال المكتوب")
                 continue
 
             # ---------- MCQ ----------
             lines = normalize_mcq_block(block)
-
             if len(lines) < 3:
                 continue
 
             question = lines[0]
-
             options = []
             correct_index = None
-            explanation = None
 
-            # explanation
-            for i, line in enumerate(lines):
-                if line.lower().startswith("ex:"):
-                    explanation = line[3:].strip()
-                    lines = lines[:i]
-                    break
-
-            # options
             for line in lines[1:]:
-                option_text = clean_option(line)
+                opt = clean_option(line)
 
-                # detect correct answer
-                if "✅" in option_text or re.search(r"[zZ]\s*$", option_text):
-                    option_text = option_text.replace("✅", "")
-                    option_text = re.sub(r"[zZ]\s*$", "", option_text).strip()
+                if "z" in opt.lower() or "✅" in opt:
+                    opt = opt.replace("✅", "").strip()
+                    opt = re.sub(r"[zZ]\s*$", "", opt).strip()
                     correct_index = len(options)
 
-                if option_text:
-                    options.append(option_text)
+                if opt:
+                    options.append(opt)
 
-            # auto labels
-            if options:
-                options = [
-                    f"{string.ascii_uppercase[i]}) {opt}"
-                    for i, opt in enumerate(options)
-                ]
+            options = [
+                f"{string.ascii_uppercase[i]}) {opt}"
+                for i, opt in enumerate(options)
+            ]
 
-            # validation
-            if len(options) < 2:
-                await update.message.reply_text("❌ السؤال ناقص")
+            if correct_index is None or correct_index >= len(options):
+                await update.message.reply_text("❌ خطأ في السؤال")
                 continue
 
-            if len(options) > 12:
-                await update.message.reply_text("❌ أكثر من 12 اختيار")
-                continue
+            PDF_BUFFER.setdefault(user_id, []).append({
+                "type": "mcq",
+                "q": question,
+                "options": options,
+                "correct": correct_index
+            })
 
-            if correct_index is None:
-                await update.message.reply_text("❌ لا يوجد إجابة صحيحة")
-                continue
+            await update.message.reply_text("🧠 تم حفظ السؤال")
 
-            if correct_index >= len(options):
-                await update.message.reply_text("❌ خطأ في الإجابة")
-                continue
-
-            # send poll
-            poll_msg = await context.bot.send_poll(
-                chat_id=update.effective_chat.id,
-                question=question,
-                options=options,
-                type="quiz",
-                correct_option_id=correct_index,
-                explanation=explanation,
-                is_anonymous=True,
-            )
-
-            await react_fire(context, poll_msg.chat.id, poll_msg.message_id)
-            await react_random(update, context)
-
-            # 70% dhikr chance
-            if random.randint(1, 10) <= 7:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=random.choice(dhikr_list)
-                )
 
     except Exception as e:
         print("ERROR:", e)
-        await update.message.reply_text("❌ خطأ في التنسيق")
+        await update.message.reply_text("❌ خطأ")
+
+
+# ---------- PDF COMMANDS ----------
+async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    PDF_BUFFER[update.effective_chat.id] = []
+    await update.message.reply_text("📥 تم بدء جمع الأسئلة للـ PDF")
+
+
+async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+
+    items = PDF_BUFFER.get(user_id, [])
+    if not items:
+        await update.message.reply_text("❌ لا يوجد بيانات")
+        return
+
+    pdf = generate_pdf(items)
+
+    await update.message.reply_document(
+        document=pdf,
+        filename="questions.pdf"
+    )
+
+
+async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    PDF_BUFFER.pop(update.effective_chat.id, None)
+    await update.message.reply_text("🗑 تم المسح")
 
 
 # ---------- START ----------
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -271,7 +287,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🆕 <b>Latest Updates - V2.4</b>\n"
+        "🆕 <b>Latest Updates - V3.1</b>\n"
         "• 20-question support\n"
         "• Single-line MCQ parsing\n"
         "• Written spoiler mode\n"
@@ -282,12 +298,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- MAIN ----------
 
+# ---------- MAIN ----------
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("pdf_start", pdf_start))
+app.add_handler(CommandHandler("pdf_generate", pdf_generate))
+app.add_handler(CommandHandler("pdf_clear", pdf_clear))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
 print("Bot running...")
-app.run_polling()
+app.run_polling() 
