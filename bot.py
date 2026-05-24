@@ -47,25 +47,33 @@ dhikr_list = [
 
 def clean_option(line: str):
     line = line.strip()
-    line = re.sub(r"^[A-Za-z0-9]+[\)\.\-]\s*", "", line)
+
+    # Remove A) / A. / 1) / 1. / a)
+    line = re.sub(r"^[A-Ea-e1-5][\)\.\-]\s*", "", line)
+
+    # Remove bullets
     line = re.sub(r"^[-•]\s*", "", line)
+
     return line.strip()
 
 
 def normalize_mcq_block(block: str):
     block = block.strip()
 
+    # multiline MCQ
     if "\n" in block:
         return [l.strip() for l in block.split("\n") if l.strip()]
 
-    match = re.search(r"\b[aA][\)\.]", block)
+    # detect first option
+    match = re.search(r"\b([A-Ea-e1-5])[\)\.]", block)
     if not match:
         return [block]
 
     question = block[:match.start()].strip()
     options_part = block[match.start():]
 
-    parts = re.split(r"(?=\b[A-Za-z][\)\.])", options_part)
+    # split before A) / A. / 1) / 1.
+    parts = re.split(r"(?=\b[A-Ea-e1-5][\)\.])", options_part)
 
     return [question] + [p.strip() for p in parts if p.strip()]
 
@@ -170,6 +178,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for line in lines[1:]:
                 option_text = clean_option(line)
 
+                # detect correct answer
                 if "✅" in option_text or re.search(r"[zZ]\s*$", option_text):
                     option_text = option_text.replace("✅", "")
                     option_text = re.sub(r"[zZ]\s*$", "", option_text).strip()
@@ -179,7 +188,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     options.append(option_text)
 
             # auto labels
-            if options and not all(re.match(r"^[A-Za-z]\)", o) for o in options):
+            if options:
                 options = [
                     f"{string.ascii_uppercase[i]}) {opt}"
                     for i, opt in enumerate(options)
@@ -216,12 +225,19 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await react_fire(context, poll_msg.chat.id, poll_msg.message_id)
             await react_random(update, context)
 
+            # 70% dhikr chance
+            if random.randint(1, 10) <= 7:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=random.choice(dhikr_list)
+                )
+
     except Exception as e:
         print("ERROR:", e)
         await update.message.reply_text("❌ خطأ في التنسيق")
 
 
-# ---------- START (YOUR VERSION) ----------
+# ---------- START ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -244,7 +260,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "a) A\n"
         "b) B z\n"
         "c) C\n\n"
-        "2) Single-line MCQ:كله فنفس السطر\n"
+        "2) Single-line MCQ: كله فنفس السطر\n"
         "Question? a) A b) Bz c) C\n\n"
         "3) Written Questions: متنساش النقطتين\n"
         "Title\n"
@@ -260,7 +276,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Single-line MCQ parsing\n"
         "• Written spoiler mode\n"
         "• Reactions\n"
-        "• أذكار \n\n"
+        "• أذكار\n\n"
         "❤ صلي على النبي ❤",
         parse_mode=ParseMode.HTML
     )
