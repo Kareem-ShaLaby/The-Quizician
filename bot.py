@@ -19,10 +19,11 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
 
+# ================= CONFIG =================
 BOT_TOKEN = "8661732123:AAEkdln3xbp0EJiNBCKYChH0A8ioCYkSNic"
 
 
-# ---------- USERS STORAGE ----------
+# ================= USERS STORAGE =================
 USERS_FILE = "users.json"
 
 def load_users():
@@ -38,11 +39,11 @@ def save_users():
 USERS = load_users()
 
 
-# ---------- PDF MEMORY ----------
-PDF_BUFFER = {}  # user_id -> list
+# ================= PDF MEMORY =================
+PDF_BUFFER = {}
 
 
-# ---------- DHIKR ----------
+# ================= DHIKR =================
 dhikr_list = [
     "صلي على النبي ﷺ",
     "سبحان الله وبحمده، سبحان الله العظيم",
@@ -51,19 +52,16 @@ dhikr_list = [
 ]
 
 
-# ---------- AI CLEANER ----------
+# ================= CLEANER =================
 def ai_clean_text(text: str) -> str:
     text = text.replace("\u200f", "").replace("\u200e", "")
     text = re.sub(r"[•●▪︎■▶►]", "", text)
     text = re.sub(r"\s+", " ", text)
-
     text = re.sub(r"([A-Ea-e])\s+\)", r"\1)", text)
     text = re.sub(r"([A-Ea-e])\s+\.", r"\1.", text)
-
     return text.strip()
 
 
-# ---------- HELPERS ----------
 def clean_option(line: str):
     line = line.strip()
     line = re.sub(r"^[A-Ea-e1-5][\)\.\-]\s*", "", line)
@@ -103,7 +101,7 @@ def parse_written_question(block: str):
     return title, content
 
 
-# ---------- REACTIONS ----------
+# ================= REACTIONS =================
 async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         roll = random.randint(1, 20)
@@ -119,7 +117,7 @@ async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# ---------- PDF BUILDER ----------
+# ================= PDF BUILDER =================
 def generate_pdf(items):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer)
@@ -150,7 +148,7 @@ def generate_pdf(items):
 
 
         elif item["type"] == "poll":
-            content.append(Paragraph(f"{i}. {item['question']}", styles["Normal"]))
+            content.append(Paragraph(f"{i}. {item["question"]}", styles["Normal"]))
             content.append(Spacer(1, 5))
 
             for idx, opt in enumerate(item["options"]):
@@ -166,18 +164,17 @@ def generate_pdf(items):
     return buffer
 
 
-# ---------- MAIN HANDLER ----------
+# ================= MAIN HANDLER =================
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
     user_id = update.effective_chat.id
 
-    # ---------- POLL SUPPORT ----------
+    # -------- POLL SUPPORT --------
     if update.message.poll:
         poll = update.message.poll
         options = [o.text for o in poll.options]
-
         correct = poll.correct_option_id if poll.type == "quiz" else None
 
         if user_id in PDF_BUFFER:
@@ -188,9 +185,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "correct": correct
             })
 
-        await update.message.reply_text("📊 تم حفظ Poll في PDF")
+        await update.message.reply_text("📊 Poll saved")
         return
-
 
     if not update.message.text:
         return
@@ -202,7 +198,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for block in blocks:
 
-            # ---------- WRITTEN ----------
+            # -------- WRITTEN --------
             written = parse_written_question(block)
             if written:
                 title, content = written
@@ -213,11 +209,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "title": title,
                         "content": content
                     })
-                    await update.message.reply_text("📝 تم حفظ سؤال PDF")
+                    await update.message.reply_text("📝 Saved")
                 continue
 
 
-            # ---------- MCQ ----------
+            # -------- MCQ --------
             lines = normalize_mcq_block(block)
             if len(lines) < 3:
                 continue
@@ -245,6 +241,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for i, opt in enumerate(options)
             ]
 
+            # ===== PDF MODE =====
             if user_id in PDF_BUFFER:
                 PDF_BUFFER[user_id].append({
                     "type": "mcq",
@@ -252,18 +249,30 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "options": options,
                     "correct": correct_index if correct_index is not None else 0
                 })
-                await update.message.reply_text("🧠 تم حفظ السؤال للـ PDF")
+                await update.message.reply_text("🧠 Saved to PDF")
                 continue
+
+            # ===== NORMAL MODE (FIXED) =====
+            poll_msg = await context.bot.send_poll(
+                chat_id=user_id,
+                question=question,
+                options=options,
+                type="quiz",
+                correct_option_id=correct_index if correct_index is not None else 0,
+                is_anonymous=True,
+            )
+
+            await react_random(update, context)
 
     except Exception as e:
         print("ERROR:", e)
-        await update.message.reply_text("❌ خطأ في التنسيق")
+        await update.message.reply_text("❌ Error parsing question")
 
 
-# ---------- PDF COMMANDS ----------
+# ================= COMMANDS =================
 async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PDF_BUFFER[update.effective_chat.id] = []
-    await update.message.reply_text("📥 بدأ وضع PDF — ابعت الأسئلة")
+    await update.message.reply_text("📥 PDF mode started")
 
 
 async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,25 +280,21 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     items = PDF_BUFFER.get(user_id, [])
     if not items:
-        await update.message.reply_text("❌ لا يوجد بيانات")
+        await update.message.reply_text("❌ No data")
         return
 
     pdf = generate_pdf(items)
 
-    await update.message.reply_document(
-        document=pdf,
-        filename="questions.pdf"
-    )
-
+    await update.message.reply_document(pdf, filename="questions.pdf")
     PDF_BUFFER.pop(user_id, None)
 
 
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PDF_BUFFER.pop(update.effective_chat.id, None)
-    await update.message.reply_text("🗑 تم مسح PDF")
+    await update.message.reply_text("🗑 Cleared")
 
 
-# ---------- START (YOUR FULL GREETING) ----------
+# ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -297,43 +302,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USERS.add(chat_id)
         save_users()
 
-    await update.message.reply_text(
-        "❤️ <b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b> ❤️\n"
-        "<b><i>Created by Kareem Shalaby</i></b>\n"
-        "منور يا كويزاوي🌹",
-        parse_mode=ParseMode.HTML
-    )
-
-    await update.message.reply_text(
-        "📚 <b>Ways to use the bot:</b>\n\n"
-        "1) normal MCQ:\n"
-        "Question?\n"
-        "a) A\n"
-        "b) B z\n"
-        "c) C\n\n"
-        "2) Single-line MCQ:كله فنفس السطر\n"
-        "Question? a) A b) Bz c) C\n\n"
-        "3) Written Questions: متنساش النقطتين\n"
-        "Title\n"
-        ".answer1\n"
-        "answer2\n"
-        "answer3.",
-        parse_mode=ParseMode.HTML
-    )
-
-    await update.message.reply_text(
-        "🆕 <b>Latest Updates - V3.2</b>\n"
-        "• 20-question support\n"
-        "• Single-line MCQ parsing\n"
-        "• Written spoiler mode\n"
-        "• Reactions\n"
-        "• أذكار \n\n"
-        "❤ صلي على النبي ❤",
-        parse_mode=ParseMode.HTML
-    )
+    await update.message.reply_text("Bot ready ✅")
 
 
-# ---------- APP ----------
+# ================= APP =================
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
@@ -341,8 +313,8 @@ app.add_handler(CommandHandler("pdf_start", pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
 app.add_handler(CommandHandler("pdf_clear", pdf_clear))
 
-# IMPORTANT FIX (was the main bug)
+# IMPORTANT FIX
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
 print("Bot running...")
-app.run_polling() 
+app.run_polling()
