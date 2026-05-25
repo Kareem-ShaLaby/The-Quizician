@@ -51,22 +51,14 @@ dhikr_list = [
 ]
 
 
-# ---------- 🧠 AI AUTO-CLEANER ----------
+# ---------- AI CLEANER ----------
 def ai_clean_text(text: str) -> str:
-    """
-    Lightweight AI-like cleaner for messy quiz input.
-    """
+    text = text.replace("\u200f", "").replace("\u200e", "")
+    text = re.sub(r"[•●▪︎■▶►]", "", text)
+    text = re.sub(r"\s+", " ", text)
 
-    text = text.replace("\u200f", "").replace("\u200e", "")  # RTL/LTR marks
-    text = re.sub(r"[•●▪︎■▶►]", "", text)  # bullet noise
-    text = re.sub(r"\s+", " ", text)  # collapse spaces
-
-    # Fix spaced options like "A )" → "A)"
     text = re.sub(r"([A-Ea-e])\s+\)", r"\1)", text)
     text = re.sub(r"([A-Ea-e])\s+\.", r"\1.", text)
-
-    # Normalize weird separators
-    text = text.replace("–", "-").replace("—", "-")
 
     return text.strip()
 
@@ -75,7 +67,7 @@ def ai_clean_text(text: str) -> str:
 def clean_option(line: str):
     line = line.strip()
     line = re.sub(r"^[A-Ea-e1-5][\)\.\-]\s*", "", line)
-    line = re.sub(r"^[-•]\s*", "", line)
+    line = re.sub(r"^[-•]", "", line)
     return line.strip()
 
 
@@ -122,17 +114,6 @@ async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_id=update.message.message_id,
             reaction=[ReactionTypeEmoji(emoji)],
             is_big=False
-        )
-    except:
-        pass
-
-
-async def react_fire(context, chat_id, message_id):
-    try:
-        await context.bot.set_message_reaction(
-            chat_id=chat_id,
-            message_id=message_id,
-            reaction=[ReactionTypeEmoji("🔥")]
         )
     except:
         pass
@@ -185,7 +166,7 @@ def generate_pdf(items):
     return buffer
 
 
-# ---------- HANDLER ----------
+# ---------- MAIN HANDLER ----------
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -194,7 +175,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- POLL SUPPORT ----------
     if update.message.poll:
-
         poll = update.message.poll
         options = [o.text for o in poll.options]
 
@@ -309,7 +289,7 @@ async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 تم مسح PDF")
 
 
-# ---------- START ----------
+# ---------- START (YOUR FULL GREETING) ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -317,17 +297,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USERS.add(chat_id)
         save_users()
 
-    await update.message.reply_text("Bot ready ✅")
+    await update.message.reply_text(
+        "❤️ <b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b> ❤️\n"
+        "<b><i>Created by Kareem Shalaby</i></b>\n"
+        "منور يا كويزاوي🌹",
+        parse_mode=ParseMode.HTML
+    )
+
+    await update.message.reply_text(
+        "📚 <b>Ways to use the bot:</b>\n\n"
+        "1) normal MCQ:\n"
+        "Question?\n"
+        "a) A\n"
+        "b) B z\n"
+        "c) C\n\n"
+        "2) Single-line MCQ:كله فنفس السطر\n"
+        "Question? a) A b) Bz c) C\n\n"
+        "3) Written Questions: متنساش النقطتين\n"
+        "Title\n"
+        ".answer1\n"
+        "answer2\n"
+        "answer3.",
+        parse_mode=ParseMode.HTML
+    )
+
+    await update.message.reply_text(
+        "🆕 <b>Latest Updates - V3.2</b>\n"
+        "• 20-question support\n"
+        "• Single-line MCQ parsing\n"
+        "• Written spoiler mode\n"
+        "• Reactions\n"
+        "• أذكار \n\n"
+        "❤ صلي على النبي ❤",
+        parse_mode=ParseMode.HTML
+    )
 
 
-# ---------- MAIN ----------
+# ---------- APP ----------
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("pdf_start", pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
 app.add_handler(CommandHandler("pdf_clear", pdf_clear))
-app.add_handler(MessageHandler(filters.ALL, handle))
+
+# IMPORTANT FIX (was the main bug)
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
 print("Bot running...")
-app.run_polling()
+app.run_polling() 
