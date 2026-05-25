@@ -198,15 +198,19 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             correct_index = None
 
             for line in lines[1:]:
-                opt = clean_option(line)
+    opt = clean_option(line)
 
-                if "z" in opt.lower() or "✅" in opt:
-                    opt = opt.replace("✅", "")
-                    opt = re.sub(r"[zZ]\s*$", "", opt).strip()
-                    correct_index = len(options)
+    # detect ONLY z/Z at END of line OR checkmark
+    has_z_end = re.search(r"\s+[zZ]\s*$", opt)
+    has_check = "✅" in opt
 
-                if opt:
-                    options.append(opt)
+    if has_z_end or has_check:
+        opt = opt.replace("✅", "")
+        opt = re.sub(r"\s+[zZ]\s*$", "", opt).strip()
+        correct_index = len(options)
+
+    if opt:
+        options.append(opt)
 
             options = [
                 f"{string.ascii_uppercase[i]}) {opt}"
@@ -317,11 +321,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🆕 <b>Latest Updates - V2.4</b>\n"
+        "🆕 <b>Latest Updates - V3.2</b>\n"
         "• 20-question support\n"
         "• Single-line MCQ parsing\n"
         "• Written spoiler mode\n"
-        "• Reactions\n"
+        "• PDF Generator\n"
         "• أذكار\n\n"
         "❤ صلي على النبي ❤",
         parse_mode=ParseMode.HTML
