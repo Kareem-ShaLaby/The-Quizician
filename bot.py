@@ -3,6 +3,8 @@ import string
 import random
 import json
 import os
+import subprocess
+import tempfile
 from io import BytesIO
 
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
@@ -23,11 +25,11 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import Frame, PageTemplate
+from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
 
 # ═══════════════════════════════════════════════════════════════
 # FONT SETUP
-# Drop your Comic Sans file (named "comic.ttf") in the same
-# folder as this script. If not found, falls back to Helvetica.
 # ═══════════════════════════════════════════════════════════════
 FONT_NAME      = "Helvetica"
 FONT_NAME_BOLD = "Helvetica-Bold"
@@ -36,13 +38,12 @@ if os.path.exists("comic.ttf"):
     try:
         pdfmetrics.registerFont(TTFont("ComicSans", "comic.ttf"))
         FONT_NAME      = "ComicSans"
-        FONT_NAME_BOLD = "ComicSans"   # use same file; bold handled via <b> tags
+        FONT_NAME_BOLD = "ComicSans"
         print("✅ Comic Sans loaded")
     except Exception as e:
         print(f"⚠️  Could not load comic.ttf: {e} — using Helvetica")
 else:
-    print("ℹ️  comic.ttf not found — using Helvetica. "
-          "Place comic.ttf next to the script to enable Comic Sans.")
+    print("ℹ️  comic.ttf not found — using Helvetica.")
 
 BOT_TOKEN = "8661732123:AAEkdln3xbp0EJiNBCKYChH0A8ioCYkSNic"
 
@@ -64,9 +65,11 @@ def save_users():
 USERS = load_users()
 
 # ═══════════════════════════════════════════════════════════════
-# PDF MEMORY
+# PDF MEMORY  +  STATE MACHINE
 # ═══════════════════════════════════════════════════════════════
-PDF_BUFFER = {}   # user_id -> list of question dicts
+PDF_BUFFER    = {}   # user_id -> list of question dicts
+PDF_NAMES     = {}   # user_id -> str  (file name chosen by user)
+AWAITING_NAME = {}   # user_id -> True  (waiting for name input)
 
 # ═══════════════════════════════════════════════════════════════
 # DHIKR
@@ -75,8 +78,17 @@ dhikr_list = [
     "صلي على النبي ﷺ",
     "سبحان الله وبحمده، سبحان الله العظيم",
     "لا حول ولا قوة إلا بالله",
-    "الحمد لله",
+    "لا إله إلا الله، محمد رسول الله",
 ]
+
+# ═══════════════════════════════════════════════════════════════
+# MAX quiz per message in normal mode
+# ═══════════════════════════════════════════════════════════════
+MAX_QUESTIONS_PER_MSG = 40
+
+# Telegram poll question limit (300 chars) and description limit (200 chars)
+TELEGRAM_Q_LIMIT = 300
+TELEGRAM_DESC_LIMIT = 200
 
 # ═══════════════════════════════════════════════════════════════
 # HELPERS
@@ -86,6 +98,10 @@ def clean_option(line: str) -> str:
     line = re.sub(r"^[A-Ea-e1-5][).\-]\s*", "", line)
     line = re.sub(r"^[-•]\s*", "", line)
     return line.strip()
+
+def strip_leading_letter_prefix(option: str) -> str:
+    """Remove A) B) C) D) E) prefix if already present."""
+    return re.sub(r"^[A-Ea-e]\)\s*", "", option).strip()
 
 def normalize_mcq_block(block: str):
     block = block.strip()
@@ -110,25 +126,75 @@ def parse_written_question(block: str):
     content = content.strip()[1:-1].strip()
     return title, content
 
+def split_question_for_telegram(question: str):
+    """
+    If question exceeds Telegram's 300-char limit, split it:
+    - First TELEGRAM_Q_LIMIT chars go into the question field
+    - Remainder goes into explanation/description (shown after answer)
+    Returns (main_question, description_or_None)
+    """
+    if len(question) <= TELEGRAM_Q_LIMIT:
+        return question, None
+    # Try to split at a sentence boundary near the limit
+    cutoff = TELEGRAM_Q_LIMIT - 3  # leave room for "..."
+    split_pos = question.rfind(". ", 0, cutoff)
+    if split_pos == -1:
+        split_pos = question.rfind(" ", 0, cutoff)
+    if split_pos == -1:
+        split_pos = cutoff
+    main = question[:split_pos].strip()
+    rest = question[split_pos:].strip()
+    # Trim description to Telegram's limit
+    if len(rest) > TELEGRAM_DESC_LIMIT:
+        rest = rest[:TELEGRAM_DESC_LIMIT - 1].rsplit(" ", 1)[0] + "…"
+    return main, rest
+
 # ═══════════════════════════════════════════════════════════════
-# GENERATE PDF BUTTON
+# KEYBOARD HELPERS
 # ═══════════════════════════════════════════════════════════════
 def generate_pdf_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Generate PDF", callback_data="gen_pdf")],
+        [
+            InlineKeyboardButton("📄 Export as PDF",  callback_data="gen_pdf"),
+            InlineKeyboardButton("📝 Export as DOCX", callback_data="gen_docx"),
+        ],
         [InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
     ])
 
 # ═══════════════════════════════════════════════════════════════
-# PDF BUILDER
+# PDF BUILDER  (with header)
 # ═══════════════════════════════════════════════════════════════
-def build_pdf(items: list) -> BytesIO:
+def build_pdf(items: list, doc_title: str = "questions") -> BytesIO:
     buffer = BytesIO()
+
+    LEFT_TEXT  = "MDM44 | NOTES"
+    RIGHT_TEXT = "Made by The Quizician"
+    LEFT_COLOR  = colors.HexColor("#00BCD4")   # Cyan
+    RIGHT_COLOR = colors.HexColor("#7B1FA2")   # Purple
+
+    # ── Header drawing function ──────────────────────────────────
+    def draw_header(canvas, doc):
+        canvas.saveState()
+        # Left label — Cyan
+        canvas.setFont(FONT_NAME_BOLD, 9)
+        canvas.setFillColor(LEFT_COLOR)
+        canvas.drawString(2*cm, A4[1] - 1.4*cm, LEFT_TEXT)
+        # Right label — Purple
+        canvas.setFillColor(RIGHT_COLOR)
+        canvas.drawRightString(A4[0] - 2*cm, A4[1] - 1.4*cm, RIGHT_TEXT)
+        # Thin separator line under header
+        canvas.setStrokeColor(colors.HexColor("#CFD8DC"))
+        canvas.setLineWidth(0.5)
+        canvas.line(2*cm, A4[1] - 1.65*cm, A4[0] - 2*cm, A4[1] - 1.65*cm)
+        canvas.restoreState()
+
     doc = SimpleDocTemplate(
         buffer,
         pagesize=A4,
         leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=2*cm,  bottomMargin=2*cm,
+        topMargin=2.4*cm, bottomMargin=2*cm,
+        onFirstPage=draw_header,
+        onLaterPages=draw_header,
     )
 
     # ── Styles ──────────────────────────────────────────────────
@@ -155,7 +221,7 @@ def build_pdf(items: list) -> BytesIO:
         fontName=FONT_NAME_BOLD,
         fontSize=11,
         leading=15,
-        textColor=colors.HexColor("#1B5E20"),   # dark green
+        textColor=colors.HexColor("#1B5E20"),
         leftIndent=14,
         spaceAfter=3,
     )
@@ -189,7 +255,6 @@ def build_pdf(items: list) -> BytesIO:
 
     story = []
     for idx, item in enumerate(items, 1):
-        # Question number
         story.append(Paragraph(f"Q{idx}", NUM_STYLE))
 
         if item["type"] == "mcq":
@@ -202,13 +267,11 @@ def build_pdf(items: list) -> BytesIO:
 
         elif item["type"] == "written":
             story.append(Paragraph(item["title"], WRITTEN_TITLE))
-            # Each content line as its own paragraph
             for line in item["content"].split("\n"):
                 line = line.strip()
                 if line:
                     story.append(Paragraph(f"• {line}", WRITTEN_BODY))
 
-        # Separator line between questions (not after last)
         if idx < len(items):
             story.append(Spacer(1, 6))
             story.append(HRFlowable(
@@ -219,6 +282,174 @@ def build_pdf(items: list) -> BytesIO:
     doc.build(story)
     buffer.seek(0)
     return buffer
+
+# ═══════════════════════════════════════════════════════════════
+# DOCX BUILDER  (via Node.js / docx npm)
+# ═══════════════════════════════════════════════════════════════
+def build_docx(items: list, doc_title: str = "questions") -> BytesIO:
+    """Generate a .docx using the docx npm package via a temp Node script."""
+
+    # Build JS-safe data structure
+    questions_json = json.dumps(items, ensure_ascii=False)
+
+    js_script = r"""
+const { Document, Packer, Paragraph, TextRun, AlignmentType, BorderStyle,
+        TabStopType, TabStopPosition } = require('docx');
+const fs = require('fs');
+
+const items = JSON.parse(process.env.QUESTIONS_JSON);
+const outPath = process.env.OUT_PATH;
+
+const LEFT_COLOR  = "00ACC1";  // cyan
+const RIGHT_COLOR = "7B1FA2"; // purple
+const GREEN_COLOR = "1B5E20";
+const DARK_COLOR  = "1A1A2E";
+const GRAY_COLOR  = "546E7A";
+
+const CONTENT_WIDTH_DXA = 9026; // A4 with 2cm margins each side ≈ 9026 DXA
+
+function headerParagraph() {
+    return new Paragraph({
+        tabStops: [{ type: TabStopType.RIGHT, position: CONTENT_WIDTH_DXA }],
+        children: [
+            new TextRun({
+                text: "MDM44 | NOTES",
+                bold: true,
+                color: LEFT_COLOR,
+                size: 18,
+                font: "Arial",
+            }),
+            new TextRun({
+                text: "\tMade by The Quizician",
+                bold: true,
+                color: RIGHT_COLOR,
+                size: 18,
+                font: "Arial",
+            }),
+        ],
+        border: {
+            bottom: { style: BorderStyle.SINGLE, size: 4, color: "CFD8DC", space: 4 }
+        },
+        spacing: { after: 160 },
+    });
+}
+
+function hrParagraph() {
+    return new Paragraph({
+        children: [],
+        border: {
+            bottom: { style: BorderStyle.SINGLE, size: 2, color: "CFD8DC", space: 1 }
+        },
+        spacing: { before: 80, after: 80 },
+    });
+}
+
+const children = [headerParagraph()];
+
+items.forEach((item, idx) => {
+    // Question number label
+    children.push(new Paragraph({
+        children: [new TextRun({ text: `Q${idx + 1}`, bold: true, color: "90A4AE", size: 18, font: "Arial" })],
+        spacing: { before: 200, after: 40 },
+    }));
+
+    if (item.type === "mcq") {
+        children.push(new Paragraph({
+            children: [new TextRun({ text: item.q, bold: true, color: DARK_COLOR, size: 24, font: "Arial" })],
+            spacing: { after: 80 },
+        }));
+        item.options.forEach((opt, i) => {
+            const isCorrect = i === item.correct;
+            children.push(new Paragraph({
+                children: [new TextRun({
+                    text: (isCorrect ? "✓  " : "     ") + opt,
+                    bold: isCorrect,
+                    color: isCorrect ? GREEN_COLOR : DARK_COLOR,
+                    size: 22,
+                    font: "Arial",
+                })],
+                indent: { left: 280 },
+                spacing: { after: 60 },
+            }));
+        });
+    } else if (item.type === "written") {
+        children.push(new Paragraph({
+            children: [new TextRun({ text: item.title, bold: true, color: DARK_COLOR, size: 24, font: "Arial" })],
+            spacing: { after: 80 },
+        }));
+        item.content.split("\n").forEach(line => {
+            line = line.trim();
+            if (line) {
+                children.push(new Paragraph({
+                    numbering: { reference: "bullets", level: 0 },
+                    children: [new TextRun({ text: line, color: GRAY_COLOR, size: 22, font: "Arial" })],
+                    spacing: { after: 60 },
+                }));
+            }
+        });
+    }
+
+    if (idx < items.length - 1) {
+        children.push(hrParagraph());
+    }
+});
+
+const doc = new Document({
+    numbering: {
+        config: [{
+            reference: "bullets",
+            levels: [{
+                level: 0,
+                format: "bullet",
+                text: "•",
+                alignment: AlignmentType.LEFT,
+                style: { paragraph: { indent: { left: 720, hanging: 360 } } }
+            }]
+        }]
+    },
+    sections: [{
+        properties: {
+            page: {
+                size: { width: 11906, height: 16838 },
+                margin: { top: 1134, right: 1134, bottom: 1134, left: 1134 }
+            }
+        },
+        children,
+    }]
+});
+
+Packer.toBuffer(doc).then(buf => {
+    fs.writeFileSync(outPath, buf);
+    console.log("OK");
+});
+"""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        script_path = os.path.join(tmpdir, "gen.js")
+        out_path    = os.path.join(tmpdir, "output.docx")
+
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(js_script)
+
+        env = os.environ.copy()
+        env["QUESTIONS_JSON"] = questions_json
+        env["OUT_PATH"]       = out_path
+        # ensure docx module is findable
+        env["NODE_PATH"] = os.path.expanduser("~/.npm-global/lib/node_modules")
+
+        result = subprocess.run(
+            ["node", script_path],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Node error: {result.stderr}")
+
+        with open(out_path, "rb") as f:
+            return BytesIO(f.read())
 
 # ═══════════════════════════════════════════════════════════════
 # REACTIONS
@@ -248,17 +479,13 @@ async def react_fire(context, chat_id, message_id):
 
 # ═══════════════════════════════════════════════════════════════
 # FORWARDED POLL HANDLER
-# Catches forwarded Telegram quiz/poll messages and saves them
-# to PDF_BUFFER when PDF mode is active.
 # ═══════════════════════════════════════════════════════════════
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle forwarded poll/quiz messages."""
     if not update.message or not update.message.poll:
         return
 
     user_id = update.effective_chat.id
 
-    # Only capture polls when PDF mode is active
     if user_id not in PDF_BUFFER:
         await update.message.reply_text(
             "ℹ️  ابدأ وضع PDF أولاً بـ /pdf_start ثم ابعت الأسئلة."
@@ -269,17 +496,16 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = poll.question
     options  = [opt.text for opt in poll.options]
 
-    # Telegram quiz polls expose the correct option index
-    correct_index = poll.correct_option_id  # None for regular polls
-
+    correct_index = poll.correct_option_id
     if correct_index is None:
-        # Regular poll (not quiz) — save without marking correct
-        correct_index = 0   # default; user can't tell from a regular poll
+        correct_index = 0
 
-    # Prefix options with letters: A) B) C) …
+    # ── FIX: strip existing A) B) C) prefix before re-labeling ──
+    cleaned_options = [strip_leading_letter_prefix(opt) for opt in options]
+
     labeled_options = [
         f"{string.ascii_uppercase[i]}) {opt}"
-        for i, opt in enumerate(options)
+        for i, opt in enumerate(cleaned_options)
     ]
 
     PDF_BUFFER[user_id].append({
@@ -305,11 +531,27 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     text    = update.message.text.strip()
 
+    # ── AWAITING PDF NAME ────────────────────────────────────────
+    if AWAITING_NAME.get(user_id):
+        name = text.strip()
+        PDF_NAMES[user_id]    = name
+        PDF_BUFFER[user_id]   = []
+        del AWAITING_NAME[user_id]
+        await update.message.reply_text(
+            f"📥 <b>PDF mode Activated</b> — File name: <i>{name}</i>\n\n"
+            "• ابعت أسئلة نصية (MCQ أو مكتوبة)\n"
+            "• أو <b>فوروارد</b> كويزات سبق ما الـ Bot بعتها\n\n"
+            "اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b> لما تخلص 👇",
+            parse_mode=ParseMode.HTML,
+            reply_markup=generate_pdf_keyboard(),
+        )
+        return
+
     try:
         blocks = re.split(r"\n\s*\n", text)
 
-        if len(blocks) > 20:
-            await update.message.reply_text("❌ الحد الأقصى 20 سؤال في المرة الواحدة")
+        if len(blocks) > MAX_QUESTIONS_PER_MSG:
+            await update.message.reply_text(f"❌ الحد الأقصى {MAX_QUESTIONS_PER_MSG} سؤال في المرة الواحدة")
             return
 
         for block in blocks:
@@ -384,19 +626,25 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             # ── NORMAL QUIZ MODE ─────────────────────────────────
-            poll_msg = await context.bot.send_poll(
+            # Split long questions across question + explanation fields
+            main_q, description = split_question_for_telegram(question)
+
+            poll_kwargs = dict(
                 chat_id=user_id,
-                question=question,
+                question=main_q,
                 options=options,
                 type="quiz",
                 correct_option_id=correct_index,
                 is_anonymous=True,
             )
+            if description:
+                poll_kwargs["explanation"] = description
+
+            poll_msg = await context.bot.send_poll(**poll_kwargs)
 
             await react_fire(context, poll_msg.chat.id, poll_msg.message_id)
             await react_random(update, context)
 
-            # DHIKR 70%
             if random.randint(1, 10) <= 7:
                 await context.bot.send_message(
                     chat_id=user_id,
@@ -408,46 +656,69 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ خطأ في التنسيق")
 
 # ═══════════════════════════════════════════════════════════════
-# INLINE BUTTON HANDLER  (Generate PDF / Clear)
+# INLINE BUTTON HANDLER
 # ═══════════════════════════════════════════════════════════════
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
     await query.answer()
 
+    items = PDF_BUFFER.get(user_id, [])
+    name  = PDF_NAMES.get(user_id, "questions")
+
     if query.data == "gen_pdf":
-        items = PDF_BUFFER.get(user_id, [])
         if not items:
             await query.message.reply_text("❌ لا يوجد أسئلة محفوظة بعد")
             return
-
-        await query.message.reply_text(
-            f"⏳ جاري توليد PDF لـ {len(items)} سؤال..."
-        )
-        pdf = build_pdf(items)
+        await query.message.reply_text(f"⏳ جاري توليد PDF لـ {len(items)} سؤال...")
+        pdf = build_pdf(items, name)
+        safe_name = re.sub(r'[^\w\s\-]', '', name).strip().replace(" ", "_") or "questions"
         await query.message.reply_document(
             document=pdf,
-            filename="questions.pdf",
-            caption=f"📄 {len(items)} سؤال — Quizician Bot ❤️",
+            filename=f"{safe_name}.pdf",
+            caption=f"📄 {len(items)} سؤال — {name} ❤️",
         )
-        PDF_BUFFER.pop(user_id, None)   # reset after export
+        PDF_BUFFER.pop(user_id, None)
+        PDF_NAMES.pop(user_id, None)
+
+    elif query.data == "gen_docx":
+        if not items:
+            await query.message.reply_text("❌ لا يوجد أسئلة محفوظة بعد")
+            return
+        await query.message.reply_text(f"⏳ جاري توليد DOCX لـ {len(items)} سؤال...")
+        try:
+            docx_buf = build_docx(items, name)
+            safe_name = re.sub(r'[^\w\s\-]', '', name).strip().replace(" ", "_") or "questions"
+            await query.message.reply_document(
+                document=docx_buf,
+                filename=f"{safe_name}.docx",
+                caption=f"📝 {len(items)} سؤال — {name} ❤️",
+            )
+        except Exception as e:
+            print("DOCX ERROR:", e)
+            await query.message.reply_text(f"❌ خطأ في توليد الـ DOCX: {e}")
+        PDF_BUFFER.pop(user_id, None)
+        PDF_NAMES.pop(user_id, None)
 
     elif query.data == "clear_pdf":
         PDF_BUFFER.pop(user_id, None)
+        PDF_NAMES.pop(user_id, None)
+        AWAITING_NAME.pop(user_id, None)
         await query.message.reply_text("🗑 تم مسح كل الأسئلة المحفوظة")
 
 # ═══════════════════════════════════════════════════════════════
-# PDF COMMANDS  (keep old slash commands too)
+# PDF COMMANDS
 # ═══════════════════════════════════════════════════════════════
 async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    PDF_BUFFER[update.effective_chat.id] = []
+    user_id = update.effective_chat.id
+    AWAITING_NAME[user_id] = True
+    # Clear any previous session
+    PDF_BUFFER.pop(user_id, None)
+    PDF_NAMES.pop(user_id, None)
     await update.message.reply_text(
-        "📥 <b>وضع PDF نشط</b>\n\n"
-        "• ابعت أسئلة نصية (MCQ أو مكتوبة)\n"
-        "• أو <b>فوروارد</b> كويزات سبق ما الـ Bot بعتها\n\n"
-        "اضغط <b>Generate PDF</b> لما تخلص 👇",
+        "✏️ <b>اكتب اسم الملف اللي عايزه:</b>\n"
+        "<i>مثال: فيزياء الفصل الدراسي الأول</i>",
         parse_mode=ParseMode.HTML,
-        reply_markup=generate_pdf_keyboard(),
     )
 
 async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -456,17 +727,23 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text("❌ لا يوجد أسئلة محفوظة")
         return
+    name = PDF_NAMES.get(user_id, "questions")
     await update.message.reply_text(f"⏳ جاري توليد PDF لـ {len(items)} سؤال...")
-    pdf = build_pdf(items)
+    pdf = build_pdf(items, name)
+    safe_name = re.sub(r'[^\w\s\-]', '', name).strip().replace(" ", "_") or "questions"
     await update.message.reply_document(
         document=pdf,
-        filename="questions.pdf",
-        caption=f"📄 {len(items)} سؤال — Quizician Bot ❤️",
+        filename=f"{safe_name}.pdf",
+        caption=f"📄 {len(items)} سؤال — {name} ❤️",
     )
     PDF_BUFFER.pop(user_id, None)
+    PDF_NAMES.pop(user_id, None)
 
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    PDF_BUFFER.pop(update.effective_chat.id, None)
+    user_id = update.effective_chat.id
+    PDF_BUFFER.pop(user_id, None)
+    PDF_NAMES.pop(user_id, None)
+    AWAITING_NAME.pop(user_id, None)
     await update.message.reply_text("🗑 تم مسح الأسئلة المحفوظة")
 
 # ═══════════════════════════════════════════════════════════════
@@ -480,8 +757,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "❤️ <b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b> ❤️\n"
-        "<b><i>Created by Kareem Shalaby</i></b>\n"
-        "منور يا كويزاوي 🌹",
+        "<b><i>منور يا كويزاوي🌹</i></b>\n",
         parse_mode=ParseMode.HTML,
     )
     await update.message.reply_text(
@@ -492,24 +768,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "b) B z   ← correct answer\n"
         "c) C\n\n"
         "2) Single-line MCQ:\n"
-        "Question? a) A b) Bz c) C\n\n"
+        "Question? a) A b) B z c) C\n\n"
         "3) Written Questions:\n"
         "Title\n"
         ".answer line 1\n"
         "answer line 2.\n\n"
-        "4) PDF Mode:\n"
-        "• /pdf_start — then send text questions OR forward old quizzes\n"
-        "• Press <b>Generate PDF</b> button when done\n"
-        "• /pdf_clear — cancel",
+        "4) PDF / DOCX Mode:\n"
+        "• /pdf_start — اكتب اسم الملف، ثم ابعت الأسئلة أو فوروارد كويزات\n"
+        "• اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b>\n"
+        "• /pdf_clear — إلغاء",
         parse_mode=ParseMode.HTML,
     )
     await update.message.reply_text(
-        "🆕 <b>Latest Updates — V4.0</b>\n"
-        "• Forward old quizzes directly into PDF\n"
-        "• Generate PDF button (no need for /pdf_generate)\n"
-        "• Questions flow continuously — no wasted pages\n"
-        "• Comic Sans font support (drop comic.ttf next to script)\n"
-        "• Correct answer highlighted in green ✓\n\n"
+        "🆕 <b>Latest Updates — V5.0</b>\n"
+        "• Change PDF name\n"
+        "• Export your file in PDF/DOCX\n"
+        "• إصلاح تكرار A) B) C) \n"
+        "• improved quiz file formating\n"
+        "•زيادة الحد الأقصى للأسئلة في المرة الواحدة: 40\n"
+        "• الأسئلة الطويلة تتقسم تلقائياً بين السؤال والـ Description\n\n"
         "❤ صلي على النبي ❤",
         parse_mode=ParseMode.HTML,
     )
@@ -524,14 +801,9 @@ app.add_handler(CommandHandler("pdf_start",    pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
 
-# Poll handler MUST come before the text handler
 app.add_handler(MessageHandler(filters.FORWARDED & filters.POLL, handle_poll))
-
-# Inline button handler
 app.add_handler(CallbackQueryHandler(button_handler))
-
-# Text handler (non-command)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-print("Bot running... V4.0")
+print("Bot running... V5.0")
 app.run_polling()
