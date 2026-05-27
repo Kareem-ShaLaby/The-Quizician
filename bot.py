@@ -52,7 +52,7 @@ else:
 # so Node can find it without needing NODE_PATH tricks.
 NPM_MODULES_DIR = "/home/claude/.npm-global/lib/node_modules"
 
-BOT_TOKEN = "8661732123:AAEkdln3xbp0EJiNBCKYChH0A8ioCYkSNic"
+BOT_TOKEN = "8661732123:AAFZ-NZjhNyZQz75j0u4Rv9syFEo9twmisY"
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
