@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Image as RLImage
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -27,7 +27,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 # ═══════════════════════════════════════════════════════════════
-# FONT SETUP  — Poppins (always available, no extra files needed)
+# FONT SETUP
 # ═══════════════════════════════════════════════════════════════
 _POPPINS_REG  = "/usr/share/fonts/truetype/google-fonts/Poppins-Regular.ttf"
 _POPPINS_BOLD = "/usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf"
@@ -37,22 +37,18 @@ FONT_NAME_BOLD = "Helvetica-Bold"
 
 if os.path.exists(_POPPINS_REG) and os.path.exists(_POPPINS_BOLD):
     try:
-        pdfmetrics.registerFont(TTFont("Poppins",     _POPPINS_REG))
+        pdfmetrics.registerFont(TTFont("Poppins",      _POPPINS_REG))
         pdfmetrics.registerFont(TTFont("Poppins-Bold", _POPPINS_BOLD))
         FONT_NAME      = "Poppins"
         FONT_NAME_BOLD = "Poppins-Bold"
-        print("✅ Poppins font loaded")
+        print("Poppins font loaded")
     except Exception as e:
-        print(f"⚠️  Poppins load error: {e} — using Helvetica")
+        print(f"Poppins load error: {e} — using Helvetica")
 else:
-    print("ℹ️  Poppins not found — using Helvetica")
+    print("Poppins not found — using Helvetica")
 
-# ── Node / docx module path ──────────────────────────────────────
-# The docx npm package lives here; we symlink it into every tempdir
-# so Node can find it without needing NODE_PATH tricks.
 NPM_MODULES_DIR = "/home/claude/.npm-global/lib/node_modules"
-
-BOT_TOKEN = "8661732123:AAFZ-NZjhNyZQz75j0u4Rv9syFEo9twmisY"
+BOT_TOKEN       = "8661732123:AAEkdln3xbp0EJiNBCKYChH0A8ioCYkSNic"
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
@@ -72,11 +68,12 @@ def save_users():
 USERS = load_users()
 
 # ═══════════════════════════════════════════════════════════════
-# PDF / DOCX SESSION MEMORY
+# STATE
 # ═══════════════════════════════════════════════════════════════
-PDF_BUFFER    = {}   # user_id -> list of question dicts
-PDF_NAMES     = {}   # user_id -> str (file name chosen by user)
-AWAITING_NAME = {}   # user_id -> True (waiting for name input)
+PDF_BUFFER    = {}   # user_id -> list of item dicts
+PDF_NAMES     = {}   # user_id -> str
+AWAITING_NAME = {}   # user_id -> True
+SLEEPING      = set()  # user_ids that are muted with /sleep
 
 # ═══════════════════════════════════════════════════════════════
 # DHIKR
@@ -91,8 +88,9 @@ dhikr_list = [
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_QUESTIONS_PER_MSG = 40   # max blocks per single text message
-TELEGRAM_Q_LIMIT      = 300  # Telegram poll question hard limit
+MAX_QUESTIONS_PER_MSG = 40
+TELEGRAM_Q_LIMIT      = 300
+PDF_MAX_IMG_WIDTH     = 13 * cm   # max image width in PDF (fits A4 with 2cm margins)
 
 # ═══════════════════════════════════════════════════════════════
 # HELPERS
@@ -104,7 +102,6 @@ def clean_option(line: str) -> str:
     return line.strip()
 
 def strip_leading_letter_prefix(option: str) -> str:
-    """Remove A) B) C) D) E) prefix if already present (from forwarded polls)."""
     return re.sub(r"^[A-Ea-e]\)\s*", "", option).strip()
 
 def normalize_mcq_block(block: str):
@@ -119,35 +116,80 @@ def normalize_mcq_block(block: str):
     parts = re.split(r"(?=\b[A-Ea-e1-5][).])", options_part)
     return [question] + [p.strip() for p in parts if p.strip()]
 
+def strip_spoiler_markers(text: str) -> str:
+    """Remove Telegram spoiler markers ||...|| and return clean text."""
+    return re.sub(r"\|\|(.+?)\|\|", r"\1", text, flags=re.DOTALL)
+
 def parse_written_question(block: str):
+    """
+    Accepts written questions in two formats:
+
+    FORMAT A (original):
+        Title
+        .answer content.
+
+    FORMAT B (spoiler / forwarded style):
+        Title ""               ← title line (may end with " or quotes)
+        ||hidden answer text||  ← one or more spoiler lines
+        OR plain lines after title
+
+    In PDF mode we also accept a relaxed format:
+        Title
+        any content (no dot requirement)
+    Returns (title, content) or None.
+    """
+    # First strip all spoiler markers from the whole block
+    block = strip_spoiler_markers(block)
+    lines = [l.rstrip() for l in block.split("\n") if l.strip()]
+
+    if len(lines) < 2:
+        return None
+
+    # Clean title: remove trailing quotes/speech marks that Telegram adds
+    title = re.sub(r'[\""\']+$', "", lines[0]).strip()
+    content_lines = lines[1:]
+    content = "\n".join(content_lines).strip()
+
+    if not content:
+        return None
+
+    # FORMAT A: dot-wrapped content  .content.
+    if content.startswith(".") and content.endswith("."):
+        content = content[1:-1].strip()
+        return title, content
+
+    # FORMAT B (PDF mode only): relaxed — title + any content lines
+    # We detect this if the title looks like a question/header
+    # (doesn't start with a letter-option pattern like "A)" or "a.")
+    # and there are content lines present.
+    # We return it so PDF mode can use it; normal mode will ignore it
+    # (it won't match FORMAT A so normal mode still requires dots).
+    if content:
+        return title, content
+
+    return None
+
+def parse_written_strict(block: str):
+    """Strict version — only FORMAT A (dot-wrapped). Used in normal (non-PDF) mode."""
+    block = strip_spoiler_markers(block)
     lines = [l.rstrip() for l in block.split("\n") if l.strip()]
     if len(lines) < 2:
         return None
     title   = lines[0]
-    content = "\n".join(lines[1:])
-    if not (content.strip().startswith(".") and content.strip().endswith(".")):
-        return None
-    content = content.strip()[1:-1].strip()
-    return title, content
+    content = "\n".join(lines[1:]).strip()
+    if content.startswith(".") and content.endswith("."):
+        return title, content[1:-1].strip()
+    return None
 
 def split_question_for_telegram(question: str):
-    """
-    Telegram polls have NO description/caption field.
-    If a question exceeds 300 chars, split it:
-      - PART 1  (≤ 300 chars) → goes into the poll 'question' field
-      - PART 2  (remainder)   → sent as a plain text message BEFORE the poll
-    Returns (main_question, overflow_text_or_None)
-    """
     if len(question) <= TELEGRAM_Q_LIMIT:
         return question, None
-
-    cutoff     = TELEGRAM_Q_LIMIT - 3
-    split_pos  = question.rfind(". ", 0, cutoff)
+    cutoff    = TELEGRAM_Q_LIMIT - 3
+    split_pos = question.rfind(". ", 0, cutoff)
     if split_pos == -1:
         split_pos = question.rfind(" ", 0, cutoff)
     if split_pos == -1:
         split_pos = cutoff
-
     main     = question[:split_pos].strip() + "…"
     overflow = "…" + question[split_pos:].strip()
     return main, overflow
@@ -170,80 +212,59 @@ def export_keyboard():
 def build_pdf(items: list, doc_title: str = "questions") -> BytesIO:
     buffer = BytesIO()
 
-    LEFT_TEXT   = "MDM44 | Notes & Files"
-    RIGHT_TEXT  = "Made by The Quizician"
-    LEFT_COLOR  = colors.HexColor("#00BCD4")   # Cyan
-    RIGHT_COLOR = colors.HexColor("#7B1FA2")   # Purple
+    LEFT_COLOR  = colors.HexColor("#00BCD4")
+    RIGHT_COLOR = colors.HexColor("#7B1FA2")
 
     def draw_header(canvas, doc):
         canvas.saveState()
         canvas.setFont(FONT_NAME_BOLD, 9)
-        # Left — Cyan
         canvas.setFillColor(LEFT_COLOR)
-        canvas.drawString(2 * cm, A4[1] - 1.4 * cm, LEFT_TEXT)
-        # Right — Purple
+        canvas.drawString(2 * cm, A4[1] - 1.4 * cm, "MDM44 | Notes & Files")
         canvas.setFillColor(RIGHT_COLOR)
-        canvas.drawRightString(A4[0] - 2 * cm, A4[1] - 1.4 * cm, RIGHT_TEXT)
-        # Thin rule under header
+        canvas.drawRightString(A4[0] - 2 * cm, A4[1] - 1.4 * cm, "Made by The Quizician")
         canvas.setStrokeColor(colors.HexColor("#CFD8DC"))
         canvas.setLineWidth(0.5)
         canvas.line(2 * cm, A4[1] - 1.65 * cm, A4[0] - 2 * cm, A4[1] - 1.65 * cm)
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        leftMargin=2 * cm, rightMargin=2 * cm,
-        topMargin=2.5 * cm, bottomMargin=2 * cm,
+        buffer, pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=2.5*cm, bottomMargin=2*cm,
     )
 
-    # ── Styles ─────────────────────────────────────────────────
     Q_STYLE = ParagraphStyle(
-        "QStyle",
-        fontName=FONT_NAME_BOLD,
-        fontSize=12, leading=16,
-        textColor=colors.HexColor("#1A1A2E"),
-        spaceAfter=6, spaceBefore=14,
+        "QStyle", fontName=FONT_NAME_BOLD, fontSize=12, leading=16,
+        textColor=colors.HexColor("#1A1A2E"), spaceAfter=6, spaceBefore=14,
     )
     OPT_STYLE = ParagraphStyle(
-        "OptStyle",
-        fontName=FONT_NAME,
-        fontSize=11, leading=15,
-        textColor=colors.HexColor("#1A1A2E"),
-        leftIndent=14, spaceAfter=3,
+        "OptStyle", fontName=FONT_NAME, fontSize=11, leading=15,
+        textColor=colors.HexColor("#1A1A2E"), leftIndent=14, spaceAfter=3,
     )
     OPT_CORRECT = ParagraphStyle(
-        "OptCorrect",
-        fontName=FONT_NAME_BOLD,
-        fontSize=11, leading=15,
-        textColor=colors.HexColor("#1B5E20"),   # dark green
-        leftIndent=14, spaceAfter=3,
+        "OptCorrect", fontName=FONT_NAME_BOLD, fontSize=11, leading=15,
+        textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=3,
     )
     WRITTEN_TITLE = ParagraphStyle(
-        "WTitle",
-        fontName=FONT_NAME_BOLD,
-        fontSize=12, leading=16,
-        textColor=colors.HexColor("#1A1A2E"),
-        spaceAfter=4, spaceBefore=14,
+        "WTitle", fontName=FONT_NAME_BOLD, fontSize=12, leading=16,
+        textColor=colors.HexColor("#1A1A2E"), spaceAfter=4, spaceBefore=14,
     )
     WRITTEN_BODY = ParagraphStyle(
-        "WBody",
-        fontName=FONT_NAME,
-        fontSize=11, leading=15,
-        textColor=colors.HexColor("#37474F"),
-        leftIndent=14, spaceAfter=6,
+        "WBody", fontName=FONT_NAME, fontSize=11, leading=15,
+        textColor=colors.HexColor("#37474F"), leftIndent=14, spaceAfter=6,
     )
     NUM_STYLE = ParagraphStyle(
-        "NumStyle",
-        fontName=FONT_NAME_BOLD,
-        fontSize=9,
-        textColor=colors.HexColor("#90A4AE"),
-        spaceAfter=2,
+        "NumStyle", fontName=FONT_NAME_BOLD, fontSize=9,
+        textColor=colors.HexColor("#90A4AE"), spaceAfter=2,
+    )
+    IMG_CAPTION = ParagraphStyle(
+        "ImgCaption", fontName=FONT_NAME, fontSize=9, leading=12,
+        textColor=colors.HexColor("#78909C"), spaceAfter=6, spaceBefore=4,
     )
 
     HR_COLOR = colors.HexColor("#CFD8DC")
+    story    = []
 
-    story = []
     for idx, item in enumerate(items, 1):
         story.append(Paragraph(f"Q{idx}", NUM_STYLE))
 
@@ -262,12 +283,27 @@ def build_pdf(items: list, doc_title: str = "questions") -> BytesIO:
                 if line:
                     story.append(Paragraph(f"• {line}", WRITTEN_BODY))
 
+        elif item["type"] == "image":
+            # Embed image, scaled to fit page width
+            img_path = item["path"]
+            try:
+                img = RLImage(img_path)
+                # Scale proportionally to fit within PDF_MAX_IMG_WIDTH
+                if img.imageWidth > PDF_MAX_IMG_WIDTH:
+                    scale = PDF_MAX_IMG_WIDTH / img.imageWidth
+                    img.drawWidth  = PDF_MAX_IMG_WIDTH
+                    img.drawHeight = img.imageHeight * scale
+                story.append(Spacer(1, 8))
+                story.append(img)
+                if item.get("caption"):
+                    story.append(Paragraph(f"📷 {item['caption']}", IMG_CAPTION))
+                story.append(Spacer(1, 4))
+            except Exception as e:
+                story.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
+
         if idx < len(items):
             story.append(Spacer(1, 6))
-            story.append(HRFlowable(
-                width="100%", thickness=0.5,
-                color=HR_COLOR, spaceAfter=4,
-            ))
+            story.append(HRFlowable(width="100%", thickness=0.5, color=HR_COLOR, spaceAfter=4))
 
     doc.build(story, onFirstPage=draw_header, onLaterPages=draw_header)
     buffer.seek(0)
@@ -275,11 +311,10 @@ def build_pdf(items: list, doc_title: str = "questions") -> BytesIO:
 
 # ═══════════════════════════════════════════════════════════════
 # DOCX BUILDER
-# Fix: symlink node_modules into the tempdir so Node can find 'docx'
 # ═══════════════════════════════════════════════════════════════
 JS_TEMPLATE = r"""
-const { Document, Packer, Paragraph, TextRun, BorderStyle,
-        TabStopType, AlignmentType } = require('docx');
+const { Document, Packer, Paragraph, TextRun, BorderStyle, TabStopType,
+        ImageRun, AlignmentType } = require('docx');
 const fs   = require('fs');
 const path = require('path');
 
@@ -292,8 +327,6 @@ const GREEN_C  = "1B5E20";
 const DARK_C   = "1A1A2E";
 const GRAY_C   = "546E7A";
 const RULE_C   = "CFD8DC";
-
-// Content width in DXA (A4 minus 2cm margins each side ≈ 9026 DXA)
 const CONTENT_W = 9026;
 
 function headerParagraph() {
@@ -305,8 +338,7 @@ function headerParagraph() {
             new TextRun({ text: "\tMade by The Quizician", bold: true,
                           color: PURPLE_C, size: 18, font: "Arial" }),
         ],
-        border: { bottom: { style: BorderStyle.SINGLE, size: 4,
-                             color: RULE_C, space: 4 } },
+        border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: RULE_C, space: 4 } },
         spacing: { after: 160 },
     });
 }
@@ -314,8 +346,7 @@ function headerParagraph() {
 function hrParagraph() {
     return new Paragraph({
         children: [],
-        border: { bottom: { style: BorderStyle.SINGLE, size: 2,
-                              color: RULE_C, space: 1 } },
+        border: { bottom: { style: BorderStyle.SINGLE, size: 2, color: RULE_C, space: 1 } },
         spacing: { before: 80, after: 80 },
     });
 }
@@ -323,7 +354,6 @@ function hrParagraph() {
 const children = [headerParagraph()];
 
 items.forEach((item, idx) => {
-    // Q-number label
     children.push(new Paragraph({
         children: [new TextRun({ text: `Q${idx + 1}`, bold: true,
                                  color: "90A4AE", size: 18, font: "Arial" })],
@@ -367,11 +397,40 @@ items.forEach((item, idx) => {
                 }));
             }
         });
+
+    } else if (item.type === "image" && item.path && fs.existsSync(item.path)) {
+        try {
+            const imgData = fs.readFileSync(item.path);
+            const ext = path.extname(item.path).toLowerCase().replace(".", "");
+            const typeMap = { jpg: "jpg", jpeg: "jpg", png: "png", gif: "gif", bmp: "bmp" };
+            const imgType = typeMap[ext] || "png";
+            children.push(new Paragraph({
+                alignment: AlignmentType.CENTER,
+                children: [new ImageRun({
+                    data: imgData,
+                    transformation: { width: 500, height: 350 },
+                    type: imgType,
+                })],
+                spacing: { before: 100, after: 60 },
+            }));
+            if (item.caption) {
+                children.push(new Paragraph({
+                    alignment: AlignmentType.CENTER,
+                    children: [new TextRun({ text: "📷 " + item.caption,
+                                             color: "78909C", size: 18,
+                                             italics: true, font: "Arial" })],
+                    spacing: { after: 80 },
+                }));
+            }
+        } catch(e) {
+            children.push(new Paragraph({
+                children: [new TextRun({ text: "[Image error: " + e.message + "]",
+                                         color: "B71C1C", size: 20, font: "Arial" })],
+            }));
+        }
     }
 
-    if (idx < items.length - 1) {
-        children.push(hrParagraph());
-    }
+    if (idx < items.length - 1) children.push(hrParagraph());
 });
 
 const doc = new Document({
@@ -392,12 +451,7 @@ Packer.toBuffer(doc)
 """
 
 def build_docx(items: list, doc_title: str = "questions") -> BytesIO:
-    """
-    Generate .docx via the 'docx' npm package.
-    Key fix: symlink node_modules into the tempdir so Node.js can resolve 'docx'.
-    """
     with tempfile.TemporaryDirectory() as tmpdir:
-        # ── Symlink node_modules so require('docx') works ────────
         nm_link = os.path.join(tmpdir, "node_modules")
         os.symlink(NPM_MODULES_DIR, nm_link)
 
@@ -413,11 +467,7 @@ def build_docx(items: list, doc_title: str = "questions") -> BytesIO:
 
         result = subprocess.run(
             ["node", script_path],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=tmpdir,       # run from tmpdir so relative require works
+            env=env, capture_output=True, text=True, timeout=30, cwd=tmpdir,
         )
 
         if result.returncode != 0:
@@ -445,12 +495,23 @@ async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def react_fire(context, chat_id, message_id):
     try:
         await context.bot.set_message_reaction(
-            chat_id=chat_id,
-            message_id=message_id,
+            chat_id=chat_id, message_id=message_id,
             reaction=[ReactionTypeEmoji("🔥")],
         )
     except Exception:
         pass
+
+# ═══════════════════════════════════════════════════════════════
+# SLEEP / WAKE COMMANDS
+# ═══════════════════════════════════════════════════════════════
+async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mute the bot — it will silently ignore all messages until /start."""
+    user_id = update.effective_chat.id
+    SLEEPING.add(user_id)
+    await update.message.reply_text(
+        "😴 البوت هيستنى ولا يرد على أي رسالة.\n"
+        "ابعت /start لما تحتاجه تاني."
+    )
 
 # ═══════════════════════════════════════════════════════════════
 # FORWARDED POLL HANDLER
@@ -460,20 +521,19 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_chat.id
+    if user_id in SLEEPING:
+        return
 
     if user_id not in PDF_BUFFER:
         await update.message.reply_text(
-            "ℹ️  ابدأ وضع PDF أولاً بـ /pdf_start ثم ابعت الأسئلة."
+            "ابدأ وضع PDF أولاً بـ /pdf_start ثم ابعت الأسئلة."
         )
         return
 
-    poll     = update.message.poll
-    question = poll.question
-
-    # Strip existing A) B) C) prefixes before re-labeling — prevents double-prefix bug
-    raw_options = [strip_leading_letter_prefix(opt.text) for opt in poll.options]
-
-    correct_index = poll.correct_option_id or 0
+    poll          = update.message.poll
+    question      = poll.question
+    raw_options   = [strip_leading_letter_prefix(opt.text) for opt in poll.options]
+    correct_index = poll.correct_option_id if poll.correct_option_id is not None else 0
 
     labeled_options = [
         f"{string.ascii_uppercase[i]}) {opt}"
@@ -494,6 +554,53 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ═══════════════════════════════════════════════════════════════
+# IMAGE HANDLER (PDF mode only)
+# ═══════════════════════════════════════════════════════════════
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download forwarded/sent images and embed them in the PDF buffer."""
+    if not update.message:
+        return
+
+    user_id = update.effective_chat.id
+    if user_id in SLEEPING:
+        return
+
+    # Only accept images in PDF mode
+    if user_id not in PDF_BUFFER:
+        return   # silently ignore images outside PDF mode
+
+    # Get the best quality photo
+    photo = update.message.photo[-1] if update.message.photo else None
+    if not photo:
+        return
+
+    # Caption becomes the image label in the PDF
+    caption = update.message.caption or ""
+
+    # Download image to a temp file (persist until PDF is generated)
+    # We store images in a per-user temp dir
+    img_dir = f"/tmp/quizician_imgs/{user_id}"
+    os.makedirs(img_dir, exist_ok=True)
+
+    img_count = sum(1 for i in PDF_BUFFER[user_id] if i["type"] == "image")
+    img_path  = os.path.join(img_dir, f"img_{img_count + 1}.jpg")
+
+    tg_file = await context.bot.get_file(photo.file_id)
+    await tg_file.download_to_drive(img_path)
+
+    PDF_BUFFER[user_id].append({
+        "type":    "image",
+        "path":    img_path,
+        "caption": caption,
+    })
+
+    count = len(PDF_BUFFER[user_id])
+    await update.message.reply_text(
+        f"🖼 تم حفظ الصورة ({count} حتى الآن)",
+        reply_markup=export_keyboard(),
+    )
+
+# ═══════════════════════════════════════════════════════════════
 # TEXT MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -501,7 +608,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_chat.id
-    text    = update.message.text.strip()
+    if user_id in SLEEPING:
+        return   # fully silent while sleeping
+
+    text = update.message.text.strip()
 
     # ── AWAITING PDF NAME ────────────────────────────────────────
     if AWAITING_NAME.get(user_id):
@@ -512,39 +622,49 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📥 <b>PDF mode activated</b> — File name: <i>{name}</i>\n\n"
             "• ابعت أسئلة نصية (MCQ أو مكتوبة)\n"
-            "• أو <b>فوروارد</b> كويزات سبق ما الـ Bot بعتها\n\n"
+            "• أو <b>فوروارد</b> كويزات أو صور/جداول مقارنة\n\n"
             "اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b> لما تخلص 👇",
             parse_mode=ParseMode.HTML,
             reply_markup=export_keyboard(),
         )
         return
 
+    # ── PDF MODE: accept relaxed written format ──────────────────
+    in_pdf_mode = user_id in PDF_BUFFER
+
     try:
         blocks = re.split(r"\n\s*\n", text)
 
-        if len(blocks) > MAX_QUESTIONS_PER_MSG:
+        if not in_pdf_mode and len(blocks) > MAX_QUESTIONS_PER_MSG:
             await update.message.reply_text(
                 f"❌ الحد الأقصى {MAX_QUESTIONS_PER_MSG} سؤال في المرة الواحدة"
             )
             return
 
+        any_saved = False
+
         for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
 
             # ── WRITTEN ─────────────────────────────────────────
-            written = parse_written_question(block)
+            if in_pdf_mode:
+                # Use relaxed parser in PDF mode (accepts spoiler format too)
+                written = parse_written_question(block)
+            else:
+                # Use strict parser in normal mode (dots required)
+                written = parse_written_strict(block)
+
             if written:
                 title, content = written
-                if user_id in PDF_BUFFER:
+                if in_pdf_mode:
                     PDF_BUFFER[user_id].append({
                         "type":    "written",
                         "title":   title,
                         "content": content,
                     })
-                    count = len(PDF_BUFFER[user_id])
-                    await update.message.reply_text(
-                        f"📝 تم حفظ سؤال مكتوب ({count} حتى الآن)",
-                        reply_markup=export_keyboard(),
-                    )
+                    any_saved = True
                 else:
                     await update.message.reply_text(
                         f"*{title}*\n||{content}||",
@@ -555,7 +675,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # ── MCQ ─────────────────────────────────────────────
             lines = normalize_mcq_block(block)
             if len(lines) < 3:
-                continue
+                continue   # silently skip — no error message
 
             question      = lines[0]
             options       = []
@@ -579,28 +699,22 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for i, opt in enumerate(options)
             ]
 
+            # Silently skip if no correct answer marked — no error message
             if correct_index is None or correct_index >= len(options):
-                await update.message.reply_text("❌ مفيش إجابة صح محددة")
                 continue
 
             # ── PDF MODE ────────────────────────────────────────
-            if user_id in PDF_BUFFER:
+            if in_pdf_mode:
                 PDF_BUFFER[user_id].append({
                     "type":    "mcq",
                     "q":       question,
                     "options": options,
                     "correct": correct_index,
                 })
-                count = len(PDF_BUFFER[user_id])
-                await update.message.reply_text(
-                    f"🧠 تم حفظ السؤال ({count} حتى الآن)",
-                    reply_markup=export_keyboard(),
-                )
+                any_saved = True
                 continue
 
             # ── NORMAL QUIZ MODE ─────────────────────────────────
-            # Telegram polls have NO description field.
-            # If question > 300 chars: send overflow as text BEFORE the poll.
             main_q, overflow = split_question_for_telegram(question)
 
             if overflow:
@@ -628,12 +742,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=random.choice(dhikr_list),
                 )
 
+        # After processing all blocks in PDF mode, send ONE summary reply
+        if in_pdf_mode and any_saved:
+            count = len(PDF_BUFFER[user_id])
+            await update.message.reply_text(
+                f"✅ تم الحفظ ({count} عنصر حتى الآن)",
+                reply_markup=export_keyboard(),
+            )
+
     except Exception as e:
         print("ERROR:", e)
-        await update.message.reply_text("❌ خطأ في التنسيق")
+        # Silent fail — no error message to user unless in debug mode
 
 # ═══════════════════════════════════════════════════════════════
-# INLINE BUTTON HANDLER  (Export PDF / Export DOCX / Clear)
+# INLINE BUTTON HANDLER
 # ═══════════════════════════════════════════════════════════════
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
@@ -648,13 +770,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not items:
             await query.message.reply_text("❌ لا يوجد أسئلة محفوظة بعد")
             return
-        await query.message.reply_text(f"⏳ جاري توليد PDF لـ {len(items)} سؤال...")
+        await query.message.reply_text(f"⏳ جاري توليد PDF لـ {len(items)} عنصر...")
         pdf = build_pdf(items, name)
         await query.message.reply_document(
-            document=pdf,
-            filename=f"{safe}.pdf",
+            document=pdf, filename=f"{safe}.pdf",
             caption=f"📄 {len(items)} سؤال — {name} ❤️",
         )
+        # Clean up downloaded images
+        _cleanup_images(user_id)
         PDF_BUFFER.pop(user_id, None)
         PDF_NAMES.pop(user_id, None)
 
@@ -662,14 +785,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not items:
             await query.message.reply_text("❌ لا يوجد أسئلة محفوظة بعد")
             return
-        await query.message.reply_text(f"⏳ جاري توليد DOCX لـ {len(items)} سؤال...")
+        await query.message.reply_text(f"⏳ جاري توليد DOCX لـ {len(items)} عنصر...")
         try:
             docx_buf = build_docx(items, name)
             await query.message.reply_document(
-                document=docx_buf,
-                filename=f"{safe}.docx",
+                document=docx_buf, filename=f"{safe}.docx",
                 caption=f"📝 {len(items)} سؤال — {name} ❤️",
             )
+            _cleanup_images(user_id)
             PDF_BUFFER.pop(user_id, None)
             PDF_NAMES.pop(user_id, None)
         except Exception as e:
@@ -680,22 +803,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif query.data == "clear_pdf":
+        _cleanup_images(user_id)
         PDF_BUFFER.pop(user_id, None)
         PDF_NAMES.pop(user_id, None)
         AWAITING_NAME.pop(user_id, None)
         await query.message.reply_text("🗑 تم مسح كل الأسئلة المحفوظة")
 
+def _cleanup_images(user_id: int):
+    """Remove downloaded images from disk after export."""
+    import shutil
+    img_dir = f"/tmp/quizician_imgs/{user_id}"
+    if os.path.exists(img_dir):
+        shutil.rmtree(img_dir, ignore_errors=True)
+
 # ═══════════════════════════════════════════════════════════════
-# PDF COMMANDS  (slash versions kept for convenience)
+# PDF COMMANDS
 # ═══════════════════════════════════════════════════════════════
 async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
+    _cleanup_images(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME[user_id] = True
     await update.message.reply_text(
         "✏️ <b>اكتب اسم الملف اللي عايزه:</b>\n"
-        "<i> End module Quiz </i>",
+        "<i>مثال: فيزياء الفصل الدراسي الأول</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -705,30 +837,33 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text("❌ لا يوجد أسئلة محفوظة")
         return
-    name  = PDF_NAMES.get(user_id, "questions")
-    safe  = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
-    await update.message.reply_text(f"⏳ جاري توليد PDF لـ {len(items)} سؤال...")
+    name = PDF_NAMES.get(user_id, "questions")
+    safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
+    await update.message.reply_text(f"⏳ جاري توليد PDF لـ {len(items)} عنصر...")
     pdf = build_pdf(items, name)
     await update.message.reply_document(
-        document=pdf,
-        filename=f"{safe}.pdf",
+        document=pdf, filename=f"{safe}.pdf",
         caption=f"📄 {len(items)} سؤال — {name} ❤️",
     )
+    _cleanup_images(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
 
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
+    _cleanup_images(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
     await update.message.reply_text("🗑 تم مسح الأسئلة المحفوظة")
 
 # ═══════════════════════════════════════════════════════════════
-# START
+# START  (also wakes bot from sleep)
 # ═══════════════════════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    SLEEPING.discard(chat_id)   # wake up if sleeping
+
     if chat_id not in USERS:
         USERS.add(chat_id)
         save_users()
@@ -752,20 +887,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ".answer line 1\n"
         "answer line 2.\n\n"
         "4) PDF / DOCX Mode:\n"
-        "• /pdf_start — اكتب اسم الملف، ثم ابعت الأسئلة أو فوروارد كويزات\n"
-        "• اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b> لما تخلص\n"
-        "• /pdf_clear — إلغاء",
+        "• /pdf_start — اكتب اسم الملف، ثم:\n"
+        "  – ابعت MCQ أو أسئلة مكتوبة\n"
+        "  – فوروارد كويزات قديمة\n"
+        "  – ابعت صور / جداول مقارنة\n"
+        "  – فوروارد رسائل فيها spoilers\n"
+        "• اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b>\n"
+        "• /pdf_clear — إلغاء\n\n"
+        "😴 /sleep — البوت يصمت لحد ما تبعت /start",
         parse_mode=ParseMode.HTML,
     )
     await update.message.reply_text(
-        "🆕 <b>Latest Updates — V5.1</b>\n"
-        "• ✅ DOCX generator fixed (node_modules path issue resolved)\n"
-        "• ✅ PDF header: purple 'Made by The Quizician' + cyan 'MDM44 | Notes &amp; Files'\n"
-        "• ✅ إصلاح تكرار A) B) C) في الأسئلة المعاد توجيهها\n"
-        "• ✅ الأسئلة الطويلة: الزيادة تتبعت كرسالة نصية قبل البول\n"
-        "• ✅ الـ explanation بقت خالصة لـ ex: بس\n"
-        "• ✅ الحد الأقصى للأسئلة في المرة الواحدة: 40\n"
-        "• ✅ Poppins font بدل Helvetica\n\n"
+        "🆕 <b>Latest Updates — V5.2</b>\n"
+        "• 😴 /sleep command — البوت يصمت تماماً\n"
+        "  /start يصحيه تاني\n"
+        "• 🖼 PDF/DOCX يقبل صور وجداول مقارنة\n"
+        "• 📝 تحسين التعرف على الأسئلة المكتوبة\n"
+        "  (يقبل spoiler format والأسئلة المعاد توجيهها)\n"
+        "• 🔇 إزالة رسالة الخطأ للأسئلة بدون إجابة صح\n\n"
         "❤ صلي على النبي ❤",
         parse_mode=ParseMode.HTML,
     )
@@ -776,14 +915,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start",        start))
+app.add_handler(CommandHandler("sleep",        sleep_cmd))
 app.add_handler(CommandHandler("pdf_start",    pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
 
-# Poll handler MUST be registered before the text handler
+# Poll handler before text handler
 app.add_handler(MessageHandler(filters.FORWARDED & filters.POLL, handle_poll))
+
+# Image handler (photos in PDF mode)
+app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+
+# Inline buttons
 app.add_handler(CallbackQueryHandler(button_handler))
+
+# Text handler last
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-print("Bot running... V5.1")
+print("Bot running... V5.2")
 app.run_polling()
