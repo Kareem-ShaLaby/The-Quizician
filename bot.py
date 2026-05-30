@@ -48,7 +48,7 @@ else:
     print("Poppins not found — using Helvetica")
 
 NPM_MODULES_DIR = "/home/claude/.npm-global/lib/node_modules"
-BOT_TOKEN       = "8661732123:AAFZ-NZjhNyZQz75j0u4Rv9syFEo9twmisY"
+BOT_TOKEN       = "8661732123:AAEkdln3xbp0EJiNBCKYChH0A8ioCYkSNic"
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
@@ -465,8 +465,11 @@ def build_docx(items: list, doc_title: str = "questions") -> BytesIO:
         env["QUESTIONS_JSON"] = json.dumps(items, ensure_ascii=False)
         env["OUT_PATH"]       = out_path
 
+        # Use absolute path — works even when PATH is stripped (systemd/service)
+        node_bin = "/usr/bin/node" if os.path.exists("/usr/bin/node") else "node"
+
         result = subprocess.run(
-            ["node", script_path],
+            [node_bin, script_path],
             env=env, capture_output=True, text=True, timeout=30, cwd=tmpdir,
         )
 
@@ -509,9 +512,9 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     SLEEPING.add(user_id)
     await update.message.reply_text(
-        "😴 والله لأنا سايبهالكو وداخل أنام.\n"
-        "لما تحتاجني تاني مش معبرك"
-    )
+        "😴 والله لأنا سايبهالك وداخل أنام\n"
+            "لما تحتاجني تاني مش معبرك\n" 
+)
 
 # ═══════════════════════════════════════════════════════════════
 # FORWARDED POLL HANDLER
@@ -827,7 +830,7 @@ async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AWAITING_NAME[user_id] = True
     await update.message.reply_text(
         "✏️ <b>اكتب اسم الملف اللي عايزه:</b>\n"
-        "<i>مثال: فيزياء الفصل الدراسي الأول</i>",
+        "<i>بطاطس</i>",
         parse_mode=ParseMode.HTML,
     )
 
