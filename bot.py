@@ -584,8 +584,8 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     SLEEPING.add(user_id)
     await update.message.reply_text(
-        "😴 والله لأنا سايبهالك وداخل أنام\n"
-        "لما تحتاجني تاني مش معبرك\n"
+        "والله لأنا سايبهالك وداخل تيم أنظف 😴\n"
+        "لما تحتاجني تاني مش معبرك 😘\n"
     )
 
 # ═══════════════════════════════════════════════════════════════
