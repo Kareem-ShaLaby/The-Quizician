@@ -81,20 +81,12 @@ SLEEPING        = set()
 PROGRESS_MSG_ID = {}   # user_id -> message_id of the live progress message
 
 # ═══════════════════════════════════════════════════════════════
-# DHIKR
-# ═══════════════════════════════════════════════════════════════
-dhikr_list = [
-    "صلي على النبي ﷺ",
-    "سبحان الله وبحمده، سبحان الله العظيم",
-    "لا حول ولا قوة إلا بالله",
-    "لا إله إلا الله، محمد رسول الله",
-]
-
-# ═══════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════
 MAX_QUESTIONS_PER_MSG = 40
-TELEGRAM_Q_LIMIT      = 300
+TELEGRAM_Q_LIMIT      = 300   # max chars in poll question field
+TELEGRAM_DESC_LIMIT   = 200   # max chars in poll description (shown above question)
+TELEGRAM_EX_LIMIT     = 200   # max chars in poll explanation (shown after answering)
 PDF_MAX_IMG_WIDTH     = 13 * cm
 
 # ═══════════════════════════════════════════════════════════════
@@ -153,8 +145,16 @@ def parse_written_strict(block: str):
     return None
 
 def split_question_for_telegram(question: str):
+    """
+    Returns (main_q, description_overflow) where:
+    - main_q fits in TELEGRAM_Q_LIMIT
+    - description_overflow goes into the 'description' field (shown above question)
+      and is capped at TELEGRAM_DESC_LIMIT
+    If question fits in Q_LIMIT, description_overflow is None.
+    """
     if len(question) <= TELEGRAM_Q_LIMIT:
         return question, None
+    # Try to split at a sentence boundary
     cutoff    = TELEGRAM_Q_LIMIT - 3
     split_pos = question.rfind(". ", 0, cutoff)
     if split_pos == -1:
@@ -163,7 +163,18 @@ def split_question_for_telegram(question: str):
         split_pos = cutoff
     main     = question[:split_pos].strip() + "…"
     overflow = "…" + question[split_pos:].strip()
+    # Cap overflow to TELEGRAM_DESC_LIMIT
+    if len(overflow) > TELEGRAM_DESC_LIMIT:
+        overflow = overflow[:TELEGRAM_DESC_LIMIT - 1] + "…"
     return main, overflow
+
+def options_too_long(options: list) -> bool:
+    """Check if any single option exceeds Telegram's 100-char option limit."""
+    return any(len(o) > 100 for o in options)
+
+def make_letter_only_options(count: int) -> list:
+    """Return ['A', 'B', 'C', ...] for poll when answers are too long."""
+    return [string.ascii_uppercase[i] for i in range(count)]
 
 def _cleanup_images(user_id: int):
     import shutil
@@ -265,7 +276,8 @@ HOW_TO_USE_TEXT = (
     "<code>Question?\n"
     "a) Option A\n"
     "b) Option B z   ← mark correct with z\n"
-    "c) Option C</code>\n\n"
+    "c) Option C\n"
+    "ex: Explanation here (optional)</code>\n\n"
     "<b>2) Single-line MCQ</b>\n"
     "<code>Question? a) A b) B z c) C</code>\n\n"
     "<b>3) Written / Flashcard</b>\n"
@@ -273,22 +285,27 @@ HOW_TO_USE_TEXT = (
     ".answer line 1\n"
     "answer line 2.</code>\n"
     "<i>Wrap the answer between dots.</i>\n\n"
-    "<b>4) PDF / DOCX Mode</b>\n"
+    "<b>4) Forwarded Quiz Polls</b>\n"
+    "Forward any Telegram quiz — the bot re-sends it with the correct answer preserved.\n\n"
+    "<b>5) PDF / DOCX Mode</b>\n"
     "Use /pdf_start, collect items, then export.\n\n"
     "😴 /sleep — mute the bot until /start"
 )
 
 LATEST_UPDATES_TEXT = (
-    "🆕 <b>Latest Updates — V5.3</b>\n\n"
-    "• 🎛 <b>Clean start menu</b> with inline buttons\n"
-    "• 📊 <b>Live progress bar</b> in PDF mode — edits the same message\n"
-    "  (no more spam per question)\n"
-    "• 📝 <b>Pure Python DOCX</b> — no Node.js required, always works\n"
-    "• 🖼 PDF/DOCX accepts images and comparison tables\n"
-    "• 📩 Spoiler format and forwarded quizzes supported\n"
-    "• 😴 /sleep command — bot goes fully silent\n"
-    "• 🔇 Removed error messages for unanswered MCQs\n\n"
-    "❤ صلي على النبي ❤"
+    "🆕 <b>Latest Updates — V5.4</b>\n\n"
+    "• 📖 <b>ex: explanation support</b> — add <code>ex: your explanation</code> "
+    "after answers to show it after answering the poll\n"
+    "• ✅ <b>Forwarded quiz correct answer</b> — re-sent polls now preserve "
+    "the correct answer and work outside PDF mode too\n"
+    "• ⚠️ <b>Format error messages</b> — bot tells you exactly what's wrong\n"
+    "• 📋 <b>Long question handling</b> — if Q is too long, sends text first then poll; "
+    "if both Q and answers are too long, shows A/B/C/D only in poll\n"
+    "• 🔥 Removed fire self-reaction\n"
+    "• 🕌 Removed dhikr messages\n"
+    "• 🎛 Clean start menu with inline buttons\n"
+    "• 📊 Live progress bar in PDF mode\n"
+    "• 📝 PDF + DOCX export both supported"
 )
 
 PDF_MODE_GUIDE_TEXT = (
@@ -568,15 +585,6 @@ async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-async def react_fire(context, chat_id, message_id):
-    try:
-        await context.bot.set_message_reaction(
-            chat_id=chat_id, message_id=message_id,
-            reaction=[ReactionTypeEmoji("🔥")],
-        )
-    except Exception:
-        pass
-
 # ═══════════════════════════════════════════════════════════════
 # SLEEP / WAKE COMMANDS
 # ═══════════════════════════════════════════════════════════════
@@ -584,8 +592,8 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     SLEEPING.add(user_id)
     await update.message.reply_text(
-        "والله لأنا سايبهالك وداخل تيم أنظف 😴\n"
-        "لما تحتاجني تاني مش معبرك 😘\n"
+        "😴 والله لأنا سايبهالك وداخل أنام\n"
+        "لما تحتاجني تاني مش معبرك\n"
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -599,13 +607,88 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in SLEEPING:
         return
 
+    poll = update.message.poll
+
+    # ── Normal mode: re-send the forwarded quiz as a live poll ──
     if user_id not in PDF_BUFFER:
-        await update.message.reply_text(
-            "ابدأ وضع PDF أولاً بـ /pdf_start ثم ابعت الأسئلة."
-        )
+        question      = poll.question
+        # Strip any existing A) B) C) prefixes from options to avoid double-labeling
+        raw_options   = [strip_leading_letter_prefix(opt.text) for opt in poll.options]
+        correct_index = poll.correct_option_id if poll.correct_option_id is not None else 0
+
+        labeled_options = [
+            f"{string.ascii_uppercase[i]}) {opt}"
+            for i, opt in enumerate(raw_options)
+        ]
+
+        # Check if question or options are too long
+        q_fits      = len(question) <= TELEGRAM_Q_LIMIT
+        answers_fit = not options_too_long(labeled_options)
+
+        if q_fits and answers_fit:
+            poll_kwargs = dict(
+                chat_id=user_id,
+                question=question,
+                options=labeled_options,
+                type="quiz",
+                correct_option_id=correct_index,
+                is_anonymous=True,
+            )
+            if poll.explanation:
+                poll_kwargs["explanation"] = poll.explanation[:TELEGRAM_EX_LIMIT]
+            await context.bot.send_poll(**poll_kwargs)
+
+        elif not q_fits and answers_fit:
+            letter_labels = "\n".join(
+                f"{string.ascii_uppercase[i]}) {opt}"
+                for i, opt in enumerate(raw_options)
+            )
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{letter_labels}",
+                parse_mode=ParseMode.HTML,
+            )
+            short_q = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
+            poll_kwargs = dict(
+                chat_id=user_id,
+                question=short_q,
+                options=labeled_options,
+                type="quiz",
+                correct_option_id=correct_index,
+                is_anonymous=True,
+            )
+            if poll.explanation:
+                poll_kwargs["explanation"] = poll.explanation[:TELEGRAM_EX_LIMIT]
+            await context.bot.send_poll(**poll_kwargs)
+
+        else:
+            answer_lines = "\n".join(
+                f"{'✅ ' if i == correct_index else ''}"
+                f"{string.ascii_uppercase[i]}) {opt}"
+                for i, opt in enumerate(raw_options)
+            )
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}",
+                parse_mode=ParseMode.HTML,
+            )
+            short_q     = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
+            letter_opts = make_letter_only_options(len(raw_options))
+            poll_kwargs = dict(
+                chat_id=user_id,
+                question=short_q,
+                options=letter_opts,
+                type="quiz",
+                correct_option_id=correct_index,
+                is_anonymous=True,
+            )
+            if poll.explanation:
+                poll_kwargs["explanation"] = poll.explanation[:TELEGRAM_EX_LIMIT]
+            await context.bot.send_poll(**poll_kwargs)
+
         return
 
-    poll          = update.message.poll
+    # ── PDF mode: save poll to buffer ───────────────────────────
     question      = poll.question
     raw_options   = [strip_leading_letter_prefix(opt.text) for opt in poll.options]
     correct_index = poll.correct_option_id if poll.correct_option_id is not None else 0
@@ -741,13 +824,31 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # ── MCQ ─────────────────────────────────────────────
             lines = normalize_mcq_block(block)
             if len(lines) < 3:
+                if not in_pdf_mode:
+                    await update.message.reply_text(
+                        "⚠️ <b>الصيغة غلط!</b>\n\n"
+                        "الشكل الصح هو:\n"
+                        "<code>السؤال\n"
+                        "a) خيار 1\n"
+                        "b) خيار 2 z  ← علّم الصح بـ z\n"
+                        "c) خيار 3\n"
+                        "ex: الشرح (اختياري)</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
                 continue
 
             question      = lines[0]
             options       = []
             correct_index = None
+            explanation   = None  # from ex: line
 
             for line in lines[1:]:
+                # Check for ex: explanation line
+                ex_match = re.match(r"^ex:\s*(.+)", line, re.IGNORECASE)
+                if ex_match:
+                    explanation = ex_match.group(1).strip()
+                    continue
+
                 opt       = clean_option(line)
                 has_z_end = re.search(r"\s+[zZ]\s*$", opt)
                 has_check = "✅" in opt
@@ -760,12 +861,21 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if opt:
                     options.append(opt)
 
+            raw_options = options[:]  # keep unformatted for text fallback
+
             options = [
                 f"{string.ascii_uppercase[i]}) {opt}"
                 for i, opt in enumerate(options)
             ]
 
             if correct_index is None or correct_index >= len(options):
+                if not in_pdf_mode:
+                    await update.message.reply_text(
+                        "⚠️ <b>ما فيش إجابة صح!</b>\n\n"
+                        "علّم الإجابة الصحيحة بـ <code>z</code> في نهايتها:\n"
+                        "<code>b) الإجابة الصح z</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
                 continue
 
             # ── PDF MODE ────────────────────────────────────────
@@ -781,32 +891,90 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             # ── NORMAL QUIZ MODE ─────────────────────────────────
-            main_q, overflow = split_question_for_telegram(question)
+            # Determine overflow situation
+            q_fits       = len(question) <= TELEGRAM_Q_LIMIT
+            answers_fit  = not options_too_long(options)
 
-            if overflow:
+            if q_fits and answers_fit:
+                # ── Case 1: Everything fits — send normally ──────
+                main_q, desc_overflow = split_question_for_telegram(question)
+
+                poll_kwargs = dict(
+                    chat_id=user_id,
+                    question=main_q,
+                    options=options,
+                    type="quiz",
+                    correct_option_id=correct_index,
+                    is_anonymous=True,
+                )
+                if desc_overflow:
+                    poll_kwargs["question_parse_mode"] = None
+                    # Send overflow as a separate message before the poll
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"📋 <b>تكملة السؤال:</b>\n{desc_overflow}",
+                        parse_mode=ParseMode.HTML,
+                    )
+                if explanation:
+                    ex_trimmed = explanation[:TELEGRAM_EX_LIMIT]
+                    poll_kwargs["explanation"] = ex_trimmed
+
+                await context.bot.send_poll(**poll_kwargs)
+
+            elif not q_fits and answers_fit:
+                # ── Case 2: Question too long, answers OK ────────
+                # Send full question as text, then poll with truncated q + full answers
+                letter_labels = " / ".join(
+                    f"{string.ascii_uppercase[i]}) {opt}"
+                    for i, opt in enumerate(raw_options)
+                )
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"📋 <b>تكملة السؤال:</b>\n{overflow}",
+                    text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{letter_labels}",
                     parse_mode=ParseMode.HTML,
                 )
+                # Poll question: truncated to fit
+                short_q = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
+                poll_kwargs = dict(
+                    chat_id=user_id,
+                    question=short_q,
+                    options=options,
+                    type="quiz",
+                    correct_option_id=correct_index,
+                    is_anonymous=True,
+                )
+                if explanation:
+                    poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
+                await context.bot.send_poll(**poll_kwargs)
 
-            poll_msg = await context.bot.send_poll(
-                chat_id=user_id,
-                question=main_q,
-                options=options,
-                type="quiz",
-                correct_option_id=correct_index,
-                is_anonymous=True,
-            )
-
-            await react_fire(context, poll_msg.chat.id, poll_msg.message_id)
-            await react_random(update, context)
-
-            if random.randint(1, 10) <= 7:
+            else:
+                # ── Case 3: Both question AND answers too long ───
+                # Send full question + full answers as text, poll has short q + A/B/C/D
+                answer_lines = "\n".join(
+                    f"{'✅ ' if i == correct_index else ''}"
+                    f"{string.ascii_uppercase[i]}) {opt}"
+                    for i, opt in enumerate(raw_options)
+                )
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=random.choice(dhikr_list),
+                    text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}",
+                    parse_mode=ParseMode.HTML,
                 )
+                short_q      = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
+                letter_opts  = make_letter_only_options(len(raw_options))
+                poll_kwargs  = dict(
+                    chat_id=user_id,
+                    question=short_q,
+                    options=letter_opts,
+                    type="quiz",
+                    correct_option_id=correct_index,
+                    is_anonymous=True,
+                )
+                if explanation:
+                    poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
+                await context.bot.send_poll(**poll_kwargs)
+
+            await react_random(update, context)
 
         # After all blocks in PDF mode — update the single progress message
         if in_pdf_mode and any_saved:
@@ -961,8 +1129,8 @@ app.add_handler(CommandHandler("pdf_start",    pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
 
-# Poll handler before text handler
-app.add_handler(MessageHandler(filters.FORWARDED & filters.POLL, handle_poll))
+# Poll handler before text handler (forwarded OR own quiz polls)
+app.add_handler(MessageHandler(filters.POLL, handle_poll))
 
 # Image handler (photos in PDF mode)
 app.add_handler(MessageHandler(filters.PHOTO, handle_image))
@@ -973,5 +1141,5 @@ app.add_handler(CallbackQueryHandler(button_handler))
 # Text handler last
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-print("Bot running... V5.3")
+print("Bot running... V5.4")
 app.run_polling()
