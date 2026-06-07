@@ -644,10 +644,9 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"📋 <b>السؤال:</b>\n{question}",
                 parse_mode=ParseMode.HTML,
             )
-            short_q = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
             poll_kwargs = dict(
                 chat_id=user_id,
-                question=short_q,
+                question=".",
                 options=labeled_options,
                 type="quiz",
                 correct_option_id=correct_index,
@@ -668,7 +667,7 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}",
                 parse_mode=ParseMode.HTML,
             )
-            short_q     = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
+            short_q     = "."
             letter_opts = make_letter_only_options(len(raw_options))
             poll_kwargs = dict(
                 chat_id=user_id,
@@ -925,11 +924,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"📋 <b>السؤال:</b>\n{question}",
                     parse_mode=ParseMode.HTML,
                 )
-                # Poll question: truncated to fit, full answers in poll
-                short_q = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
+                # Poll question: just a dot — full question already sent as text
                 poll_kwargs = dict(
                     chat_id=user_id,
-                    question=short_q,
+                    question=".",
                     options=options,
                     type="quiz",
                     correct_option_id=correct_index,
@@ -952,7 +950,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}",
                     parse_mode=ParseMode.HTML,
                 )
-                short_q      = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
+                short_q      = "."
                 letter_opts  = make_letter_only_options(len(raw_options))
                 poll_kwargs  = dict(
                     chat_id=user_id,
