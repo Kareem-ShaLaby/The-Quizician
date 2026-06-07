@@ -639,13 +639,9 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_poll(**poll_kwargs)
 
         elif not q_fits and answers_fit:
-            letter_labels = "\n".join(
-                f"{string.ascii_uppercase[i]}) {opt}"
-                for i, opt in enumerate(raw_options)
-            )
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{letter_labels}",
+                text=f"📋 <b>السؤال:</b>\n{question}",
                 parse_mode=ParseMode.HTML,
             )
             short_q = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
@@ -923,17 +919,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             elif not q_fits and answers_fit:
                 # ── Case 2: Question too long, answers OK ────────
-                # Send full question as text, then poll with truncated q + full answers
-                letter_labels = " / ".join(
-                    f"{string.ascii_uppercase[i]}) {opt}"
-                    for i, opt in enumerate(raw_options)
-                )
+                # Send full question as text only (no answers — they'll appear in poll)
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{letter_labels}",
+                    text=f"📋 <b>السؤال:</b>\n{question}",
                     parse_mode=ParseMode.HTML,
                 )
-                # Poll question: truncated to fit
+                # Poll question: truncated to fit, full answers in poll
                 short_q = question[:TELEGRAM_Q_LIMIT - 3].rstrip() + "…"
                 poll_kwargs = dict(
                     chat_id=user_id,
@@ -949,7 +941,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             else:
                 # ── Case 3: Both question AND answers too long ───
-                # Send full question + full answers as text, poll has short q + A/B/C/D
+                # Send full question + full answers (one per line), poll has A/B/C/D only
                 answer_lines = "\n".join(
                     f"{'✅ ' if i == correct_index else ''}"
                     f"{string.ascii_uppercase[i]}) {opt}"
