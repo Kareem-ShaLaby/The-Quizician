@@ -1100,7 +1100,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_users()
 
     await update.message.reply_text(
-        "❤️<b><i>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</i></b>\n
+        "❤️<b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b>\n
         "<b>منور يا كويزاوي 🌹</b>\n\n"
         "Choose an option below to get started:",
         parse_mode=ParseMode.HTML,
