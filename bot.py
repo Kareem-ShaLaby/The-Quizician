@@ -302,10 +302,10 @@ LATEST_UPDATES_TEXT = (
     "• 📋 <b>Long question handling</b> — if Q is too long, sends text first then poll; "
     "if both Q and answers are too long, shows A/B/C/D only in poll\n"
     "• 🔥 Removed fire self-reaction\n"
-    "• 🕌 Removed dhikr messages\n"
     "• 🎛 Clean start menu with inline buttons\n"
     "• 📊 Live progress bar in PDF mode\n"
     "• 📝 PDF + DOCX export both supported"
+    " ❤️ وأدعيلي دعوة حلوه ❤️\n" 
 )
 
 PDF_MODE_GUIDE_TEXT = (
@@ -821,7 +821,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(lines) < 3:
                 if not in_pdf_mode:
                     await update.message.reply_text(
-                        "⚠️ <b>الصيغة غلط!</b>\n\n"
+                        "⚠️ <b>الصياغة غلط!</b>\n\n"
                         "الشكل الصح هو:\n"
                         "<code>السؤال\n"
                         "a) خيار 1\n"
@@ -1056,7 +1056,7 @@ async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AWAITING_NAME[user_id] = True
     await update.message.reply_text(
         "✏️ <b>اكتب اسم الملف اللي عايزه:</b>\n"
-        "<i>بطاطس</i>",
+        "<i>Lecture 1 Anatomy Questions</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1086,7 +1086,7 @@ async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
-    await update.message.reply_text("🗑 تم مسح الأسئلة المحفوظة")
+    await update.message.reply_text("🗑 تم قرار إزالة")
 
 # ═══════════════════════════════════════════════════════════════
 # START  (also wakes bot from sleep)
@@ -1100,8 +1100,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_users()
 
     await update.message.reply_text(
-        "❤️ <b>Quizician Bot</b>\n\n"
-        "<i>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</i>\n"
+        "❤️<b><i>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</i></b>\n
         "<b>منور يا كويزاوي 🌹</b>\n\n"
         "Choose an option below to get started:",
         parse_mode=ParseMode.HTML,
