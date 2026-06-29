@@ -54,6 +54,10 @@ else:
 
 BOT_TOKEN = "8661732123:AAFZ-NZjhNyZQz75j0u4Rv9syFEo9twmisY"
 
+# ── Replace with YOUR Telegram numeric user ID ──────────────────
+# To find it: message @userinfobot on Telegram → it replies with your ID
+ADMIN_ID = 123456789   # ← CHANGE THIS
+
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
 # ═══════════════════════════════════════════════════════════════
@@ -1108,12 +1112,87 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ═══════════════════════════════════════════════════════════════
+# ADMIN HELPERS
+# ═══════════════════════════════════════════════════════════════
+def is_admin(update: Update) -> bool:
+    return update.effective_user and update.effective_user.id == ADMIN_ID
+
+# ═══════════════════════════════════════════════════════════════
+# BROADCAST COMMAND  (admin only)
+# ═══════════════════════════════════════════════════════════════
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("🚫 هذا الأمر للأدمن فقط")
+        return
+
+    # Message text comes after /broadcast, or from a replied-to message
+    if context.args:
+        text = " ".join(context.args)
+    elif update.message.reply_to_message and update.message.reply_to_message.text:
+        text = update.message.reply_to_message.text
+    else:
+        await update.message.reply_text(
+            "⚠️ استخدام:\n"
+            "<code>/broadcast رسالتك هنا</code>\n\n"
+            "أو رد بـ /broadcast على رسالة موجودة.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not text.strip():
+        await update.message.reply_text("❌ الرسالة فارغة")
+        return
+
+    users_list = list(USERS)
+    total      = len(users_list)
+
+    status_msg = await update.message.reply_text(
+        f"📡 <b>جاري الإرسال لـ {total} مستخدم...</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    success = 0
+    failed  = 0
+    blocked = []
+
+    for uid in users_list:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+            success += 1
+        except Exception as e:
+            failed += 1
+            blocked.append(uid)
+            print(f"Broadcast failed for {uid}: {e}")
+
+    # Remove users who blocked the bot
+    if blocked:
+        for uid in blocked:
+            USERS.discard(uid)
+        save_users()
+
+    summary = (
+        f"✅ <b>Broadcast اتبعت!</b>\n\n"
+        f"👥 المستخدمين: <b>{total}</b>\n"
+        f"✔️ نجح: <b>{success}</b>\n"
+        f"❌ فشل / بلوك: <b>{failed}</b>"
+    )
+    if blocked:
+        summary += f"\n🗑 تم حذف {len(blocked)} يوزر بلوك البوت من القائمة"
+
+    await status_msg.edit_text(summary, parse_mode=ParseMode.HTML)
+
+# ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start",        start))
 app.add_handler(CommandHandler("sleep",        sleep_cmd))
+app.add_handler(CommandHandler("broadcast",    broadcast_cmd))
 app.add_handler(CommandHandler("pdf_start",    pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
@@ -1130,5 +1209,5 @@ app.add_handler(CallbackQueryHandler(button_handler))
 # Text handler last
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-print("Bot running... V5.4")
+print("Bot running... V5.5")
 app.run_polling()
