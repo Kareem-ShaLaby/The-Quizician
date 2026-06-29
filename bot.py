@@ -56,7 +56,7 @@ BOT_TOKEN = "8661732123:AAFZ-NZjhNyZQz75j0u4Rv9syFEo9twmisY"
 
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
-ADMIN_ID = 940770584   # ← CHANGE THIS
+ADMIN_ID = 123456789   # ← CHANGE THIS
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
@@ -1117,6 +1117,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def is_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == ADMIN_ID
 
+async def admincheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else "?"
+    if is_admin(update):
+        await update.message.reply_text(
+            f"✅ <b>أنت الأدمن!</b>\n"
+            f"🆔 Your ID: <code>{uid}</code>\n"
+            f"👥 Total users: <b>{len(USERS)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"🚫 مش أدمن\n🆔 Your ID: <code>{uid}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
 # ═══════════════════════════════════════════════════════════════
 # BROADCAST COMMAND  (admin only)
 # ═══════════════════════════════════════════════════════════════
@@ -1192,6 +1207,7 @@ app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start",        start))
 app.add_handler(CommandHandler("sleep",        sleep_cmd))
+app.add_handler(CommandHandler("admincheck",   admincheck_cmd))
 app.add_handler(CommandHandler("broadcast",    broadcast_cmd))
 app.add_handler(CommandHandler("pdf_start",    pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
