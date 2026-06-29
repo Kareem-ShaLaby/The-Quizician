@@ -56,7 +56,7 @@ BOT_TOKEN = "8661732123:AAFZ-NZjhNyZQz75j0u4Rv9syFEo9twmisY"
 
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
-ADMIN_ID = 123456789   # ← CHANGE THIS
+ADMIN_ID = 940770584   # ← CHANGE THIS
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
