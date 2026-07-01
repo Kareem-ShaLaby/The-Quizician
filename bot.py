@@ -56,7 +56,7 @@ BOT_TOKEN = "8661732123:AAFZ-NZjhNyZQz75j0u4Rv9syFEo9twmisY"
 
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
-ADMIN_ID = 940770584   # ← CHANGE THIS
+ADMIN_ID = 123456789   # ← CHANGE THIS
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
@@ -76,13 +76,32 @@ def save_users():
 USERS = load_users()
 
 # ═══════════════════════════════════════════════════════════════
+# GALLERY STORAGE
+# ═══════════════════════════════════════════════════════════════
+GALLERY_FILE = "gallery.json"
+
+def load_gallery():
+    if os.path.exists(GALLERY_FILE):
+        with open(GALLERY_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_gallery():
+    with open(GALLERY_FILE, "w") as f:
+        json.dump(GALLERY, f)
+
+GALLERY: list = load_gallery()   # [{"file_id": "...", "caption": "..."}, ...]
+
+# ═══════════════════════════════════════════════════════════════
 # STATE
 # ═══════════════════════════════════════════════════════════════
-PDF_BUFFER      = {}   # user_id -> list of item dicts
-PDF_NAMES       = {}   # user_id -> str
-AWAITING_NAME   = {}   # user_id -> True
-SLEEPING        = set()
-PROGRESS_MSG_ID = {}   # user_id -> message_id of the live progress message
+PDF_BUFFER             = {}    # user_id -> list of item dicts
+PDF_NAMES              = {}    # user_id -> str
+AWAITING_NAME          = {}    # user_id -> True
+SLEEPING               = set()
+PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
+GALLERY_SESSION        = {}    # user_id -> next photo index to send (0-based)
+AWAITING_GALLERY_PHOTO = set() # admin is expected to send the next photo to add
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -720,12 +739,27 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in SLEEPING:
         return
 
-    if user_id not in PDF_BUFFER:
-        return   # silently ignore images outside PDF mode
-
-    photo   = update.message.photo[-1] if update.message.photo else None
+    photo = update.message.photo[-1] if update.message.photo else None
     if not photo:
         return
+
+    # ── Admin adding a photo to the gallery ─────────────────────
+    if user_id in AWAITING_GALLERY_PHOTO and is_admin(update):
+        caption = update.message.caption or ""
+        GALLERY.append({"file_id": photo.file_id, "caption": caption})
+        save_gallery()
+        AWAITING_GALLERY_PHOTO.discard(user_id)
+        await update.message.reply_text(
+            "✅ <b>تمت إضافة الصورة للمعرض!</b>\n"
+            f"📸 إجمالي الصور: <b>{len(GALLERY)}</b>\n\n"
+            "ابعت /gallery_add تاني لإضافة صورة أخرى\n"
+            "أو /gallery_list لتشوف المعرض",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if user_id not in PDF_BUFFER:
+        return   # silently ignore images outside PDF mode
 
     caption = update.message.caption or ""
 
@@ -775,6 +809,28 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• أو <b>فوروارد</b> كويزات أو صور/جداول مقارنة\n\n"
             "اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b> لما تخلص 👇",
             parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── GALLERY TRIGGER ──────────────────────────────────────────
+    if text.lower() == "year 2: mission accomplished":
+        if not GALLERY:
+            await update.message.reply_text("🖼 مفيش صور في المعرض دلوقتي!")
+            return
+        GALLERY_SESSION[user_id] = 1
+        photo  = GALLERY[0]
+        total  = len(GALLERY)
+        cap    = (photo.get("caption") or "").strip()
+        parts  = []
+        if cap:
+            parts.append(cap)
+        parts.append(f"📸 1 / {total}")
+        if total > 1:
+            parts.append("\nاستخدم /next للصورة الجاية 👇")
+        await context.bot.send_photo(
+            chat_id=user_id,
+            photo=photo["file_id"],
+            caption="\n".join(parts),
         )
         return
 
@@ -1201,17 +1257,154 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text(summary, parse_mode=ParseMode.HTML)
 
 # ═══════════════════════════════════════════════════════════════
+# GALLERY ADMIN COMMANDS
+# ═══════════════════════════════════════════════════════════════
+async def gallery_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: enter add-photo mode."""
+    if not is_admin(update):
+        await update.message.reply_text("🚫 للأدمن فقط")
+        return
+    AWAITING_GALLERY_PHOTO.add(update.effective_chat.id)
+    await update.message.reply_text(
+        "🖼 <b>ابعت الصورة اللي عايز تضيفها للمعرض</b>\n"
+        "ممكن تبعت كابشن معاها لو حبيت.",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def gallery_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: view all gallery photos with index numbers."""
+    if not is_admin(update):
+        await update.message.reply_text("🚫 للأدمن فقط")
+        return
+    if not GALLERY:
+        await update.message.reply_text("📭 المعرض فاضي حالياً. استخدم /gallery_add لإضافة صور.")
+        return
+    await update.message.reply_text(
+        f"🖼 <b>المعرض — {len(GALLERY)} صورة:</b>\n"
+        "/gallery_delete &lt;رقم&gt; — حذف صورة\n"
+        "/gallery_move &lt;من&gt; &lt;إلى&gt; — تغيير الترتيب",
+        parse_mode=ParseMode.HTML,
+    )
+    for i, item in enumerate(GALLERY, 1):
+        cap = (item.get("caption") or "").strip()
+        try:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=item["file_id"],
+                caption=f"#{i}" + (f" — {cap}" if cap else ""),
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ صورة #{i} فيها مشكلة: {e}")
+
+async def gallery_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /gallery_delete <n>"""
+    if not is_admin(update):
+        await update.message.reply_text("🚫 للأدمن فقط")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("استخدام: /gallery_delete <رقم>\nمثال: /gallery_delete 2")
+        return
+    n = int(context.args[0])
+    if n < 1 or n > len(GALLERY):
+        await update.message.reply_text(f"❌ رقم غلط — المعرض فيه {len(GALLERY)} صورة فقط")
+        return
+    removed = GALLERY.pop(n - 1)
+    save_gallery()
+    cap = (removed.get("caption") or "").strip()
+    await update.message.reply_text(
+        f"✅ تم حذف صورة #{n}" + (f" — {cap}" if cap else "") + f"\n"
+        f"تبقى {len(GALLERY)} صورة في المعرض"
+    )
+
+async def gallery_move_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /gallery_move <from> <to>"""
+    if not is_admin(update):
+        await update.message.reply_text("🚫 للأدمن فقط")
+        return
+    if (not context.args or len(context.args) < 2
+            or not context.args[0].isdigit() or not context.args[1].isdigit()):
+        await update.message.reply_text(
+            "استخدام: /gallery_move <من> <إلى>\nمثال: /gallery_move 3 1"
+        )
+        return
+    frm, to = int(context.args[0]), int(context.args[1])
+    n = len(GALLERY)
+    if frm < 1 or frm > n or to < 1 or to > n:
+        await update.message.reply_text(f"❌ الأرقام غلط — المعرض فيه {n} صورة")
+        return
+    if frm == to:
+        await update.message.reply_text("الصورة موجودة فعلاً في المكان ده!")
+        return
+    item = GALLERY.pop(frm - 1)
+    GALLERY.insert(to - 1, item)
+    save_gallery()
+    await update.message.reply_text(f"✅ تم نقل صورة #{frm} إلى موضع #{to}")
+
+async def gallery_clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: wipe the entire gallery."""
+    if not is_admin(update):
+        await update.message.reply_text("🚫 للأدمن فقط")
+        return
+    count = len(GALLERY)
+    GALLERY.clear()
+    save_gallery()
+    await update.message.reply_text(f"🗑 تم مسح المعرض — حُذفت {count} صورة")
+
+# ═══════════════════════════════════════════════════════════════
+# /next COMMAND
+# ═══════════════════════════════════════════════════════════════
+async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    if user_id not in GALLERY_SESSION:
+        await update.message.reply_text(
+            "❌ مفيش معرض شغال دلوقتي.\nابعت الكلمة السحرية الأول! 😉"
+        )
+        return
+    idx   = GALLERY_SESSION[user_id]
+    total = len(GALLERY)
+    if idx >= total or not GALLERY:
+        GALLERY_SESSION.pop(user_id, None)
+        await update.message.reply_text("🎉 خلصت الصور كلها!\nربنا يوفقك ❤️")
+        return
+    photo = GALLERY[idx]
+    GALLERY_SESSION[user_id] = idx + 1
+    remaining = total - (idx + 1)
+    cap   = (photo.get("caption") or "").strip()
+    parts = []
+    if cap:
+        parts.append(cap)
+    parts.append(f"📸 {idx + 1} / {total}")
+    if remaining > 0:
+        parts.append("استخدم /next للصورة الجاية 👇")
+    else:
+        parts.append("🎉 دي آخر صورة! ربنا يوفقك ❤️")
+        GALLERY_SESSION.pop(user_id, None)
+    await context.bot.send_photo(
+        chat_id=user_id,
+        photo=photo["file_id"],
+        caption="\n".join(parts),
+    )
+
+# ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-app.add_handler(CommandHandler("start",        start))
-app.add_handler(CommandHandler("sleep",        sleep_cmd))
-app.add_handler(CommandHandler("admincheck",   admincheck_cmd))
-app.add_handler(CommandHandler("broadcast",    broadcast_cmd))
-app.add_handler(CommandHandler("pdf_start",    pdf_start))
-app.add_handler(CommandHandler("pdf_generate", pdf_generate))
-app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
+app.add_handler(CommandHandler("start",          start))
+app.add_handler(CommandHandler("sleep",          sleep_cmd))
+app.add_handler(CommandHandler("admincheck",     admincheck_cmd))
+app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
+app.add_handler(CommandHandler("pdf_start",      pdf_start))
+app.add_handler(CommandHandler("pdf_generate",   pdf_generate))
+app.add_handler(CommandHandler("pdf_clear",      pdf_clear))
+# Gallery admin
+app.add_handler(CommandHandler("gallery_add",    gallery_add_cmd))
+app.add_handler(CommandHandler("gallery_list",   gallery_list_cmd))
+app.add_handler(CommandHandler("gallery_delete", gallery_delete_cmd))
+app.add_handler(CommandHandler("gallery_move",   gallery_move_cmd))
+app.add_handler(CommandHandler("gallery_clear",  gallery_clear_cmd))
+# User navigation
+app.add_handler(CommandHandler("next",           next_cmd))
 
 # Poll handler before text handler (forwarded OR own quiz polls)
 app.add_handler(MessageHandler(filters.POLL, handle_poll))
