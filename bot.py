@@ -102,6 +102,7 @@ SLEEPING               = set()
 PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
 GALLERY_SESSION        = {}    # user_id -> next photo index to send (0-based)
 AWAITING_GALLERY_PHOTO = set() # admin is expected to send the next photo to add
+PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -138,6 +139,55 @@ def normalize_mcq_block(block: str):
 
 def strip_spoiler_markers(text: str) -> str:
     return re.sub(r"\|\|(.+?)\|\|", r"\1", text, flags=re.DOTALL)
+
+def parse_mcq_lines(lines: list):
+    """
+    Given already-normalized MCQ lines (question line + option lines),
+    extracts (question, raw_options, correct_index, explanation).
+    correct_index is None if no option was marked correct.
+    Shared by the text handler and the image-caption parser so the
+    MCQ grammar only lives in one place.
+    """
+    question      = lines[0]
+    options       = []
+    correct_index = None
+    explanation   = None
+
+    for line in lines[1:]:
+        ex_match = re.match(r"^ex:\s*(.+)", line, re.IGNORECASE)
+        if ex_match:
+            explanation = ex_match.group(1).strip()
+            continue
+
+        opt       = clean_option(line)
+        has_z_end = re.search(r"\s+[zZ]\s*$", opt)
+        has_check = "✅" in opt
+
+        if has_z_end or has_check:
+            opt           = opt.replace("✅", "")
+            opt           = re.sub(r"\s+[zZ]\s*$", "", opt).strip()
+            correct_index = len(options)
+
+        if opt:
+            options.append(opt)
+
+    return question, options, correct_index, explanation
+
+def parse_mcq_block(block: str):
+    """
+    Full validation on top of parse_mcq_lines: returns
+    (question, raw_options, correct_index, explanation) only if the block
+    is a COMPLETE, valid MCQ (>=3 lines, a correct answer marked).
+    Returns None otherwise. Used to detect a fully-formed question in an
+    image caption so we don't need to ask the user to resend it.
+    """
+    lines = normalize_mcq_block(block.strip())
+    if len(lines) < 3:
+        return None
+    question, options, correct_index, explanation = parse_mcq_lines(lines)
+    if correct_index is None or correct_index >= len(options):
+        return None
+    return question, options, correct_index, explanation
 
 def parse_written_question(block: str):
     block = strip_spoiler_markers(block)
@@ -204,6 +254,113 @@ def _cleanup_images(user_id: int):
     img_dir = f"/tmp/quizician_imgs/{user_id}"
     if os.path.exists(img_dir):
         shutil.rmtree(img_dir, ignore_errors=True)
+
+def _clear_pending_image(user_id: int):
+    """Drop any image that's still waiting for a question, deleting its file."""
+    path = PENDING_IMAGE.pop(user_id, None)
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+# ═══════════════════════════════════════════════════════════════
+# QUIZ DELIVERY  (single source of truth for sending a live quiz poll)
+# ═══════════════════════════════════════════════════════════════
+async def deliver_quiz(
+    context, chat_id: int, question: str, raw_options: list, correct_index: int,
+    explanation: str = None, image_path: str = None,
+    always_show_question_text: bool = False, header_label: str = "📋 <b>السؤال:</b>",
+):
+    """
+    Sends a single live quiz poll to chat_id, handling Telegram's field-length
+    limits consistently (question <=300, options <=100, explanation <=200).
+    Optionally precedes the poll with an image (Telegram polls can't carry
+    media natively, so the image is sent as its own message right before it).
+
+    always_show_question_text=True forces the original question text to be
+    shown as a message even when it fits inside the poll's question field —
+    used for forwarded quizzes so the original wording is always visible.
+
+    This is the ONLY place that builds/sends quiz polls in non-PDF mode, so
+    forwarded polls, typed MCQs, and image-paired MCQs all share one code path.
+    """
+    labeled_options = [
+        f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
+    ]
+    q_fits      = len(question) <= TELEGRAM_Q_LIMIT
+    answers_fit = not options_too_long(labeled_options)
+
+    async def send_image(caption: str = None):
+        with open(image_path, "rb") as f:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=f,
+                caption=(caption[:1024] if caption else None),
+                parse_mode=ParseMode.HTML if caption else None,
+            )
+
+    if q_fits and answers_fit:
+        main_q, desc_overflow = split_question_for_telegram(question)
+
+        if always_show_question_text:
+            text = f"{header_label}\n{question}"
+            if image_path:
+                await send_image(text)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        elif image_path:
+            await send_image()
+
+        if desc_overflow:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"📋 <b>تكملة السؤال:</b>\n{desc_overflow}",
+                parse_mode=ParseMode.HTML,
+            )
+
+        poll_kwargs = dict(
+            chat_id=chat_id, question=main_q, options=labeled_options,
+            type="quiz", correct_option_id=correct_index, is_anonymous=True,
+        )
+        if explanation:
+            poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
+        await context.bot.send_poll(**poll_kwargs)
+
+    elif not q_fits and answers_fit:
+        text = f"{header_label}\n{question}"
+        if image_path:
+            await send_image(text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+
+        poll_kwargs = dict(
+            chat_id=chat_id, question=".", options=labeled_options,
+            type="quiz", correct_option_id=correct_index, is_anonymous=True,
+        )
+        if explanation:
+            poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
+        await context.bot.send_poll(**poll_kwargs)
+
+    else:
+        answer_lines = "\n".join(
+            f"{'✅ ' if i == correct_index else ''}{string.ascii_uppercase[i]}) {opt}"
+            for i, opt in enumerate(raw_options)
+        )
+        text = f"{header_label}\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}"
+        if image_path:
+            await send_image(text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+
+        letter_opts = make_letter_only_options(len(raw_options))
+        poll_kwargs = dict(
+            chat_id=chat_id, question=".", options=letter_opts,
+            type="quiz", correct_option_id=correct_index, is_anonymous=True,
+        )
+        if explanation:
+            poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
+        await context.bot.send_poll(**poll_kwargs)
 
 # ═══════════════════════════════════════════════════════════════
 # PROGRESS MESSAGE BUILDER
@@ -413,6 +570,18 @@ def build_pdf(items: list, doc_title: str = "questions") -> BytesIO:
 
         if item["type"] == "mcq":
             story.append(Paragraph(item["q"], Q_STYLE))
+            if item.get("image"):
+                try:
+                    img = RLImage(item["image"])
+                    if img.imageWidth > PDF_MAX_IMG_WIDTH:
+                        scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
+                        img.drawWidth  = PDF_MAX_IMG_WIDTH
+                        img.drawHeight = img.imageHeight * scale
+                    story.append(Spacer(1, 6))
+                    story.append(img)
+                    story.append(Spacer(1, 6))
+                except Exception as e:
+                    story.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
             for i, opt in enumerate(item["options"]):
                 if i == item["correct"]:
                     story.append(Paragraph(f"✓  {opt}", OPT_CORRECT))
@@ -539,6 +708,17 @@ def build_docx(items: list, doc_title: str = "questions") -> BytesIO:
         if item["type"] == "mcq":
             _add_paragraph(doc, item["q"], bold=True, size_pt=12,
                            color_hex="1A1A2E", space_before=0, space_after=4)
+            if item.get("image") and os.path.exists(item["image"]):
+                try:
+                    p = doc.add_paragraph()
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    p.paragraph_format.space_before = Pt(4)
+                    p.paragraph_format.space_after  = Pt(6)
+                    run = p.add_run()
+                    run.add_picture(item["image"], width=Inches(5.5))
+                except Exception as e:
+                    _add_paragraph(doc, f"[Image error: {e}]",
+                                   size_pt=10, color_hex="B71C1C")
             for i, opt in enumerate(item["options"]):
                 correct = (i == item["correct"])
                 _add_paragraph(
@@ -631,101 +811,42 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     poll = update.message.poll
-
-    # ── Normal mode: re-send the forwarded quiz as a live poll ──
-    if user_id not in PDF_BUFFER:
-        question      = poll.question
-        # Strip any existing A) B) C) prefixes from options to avoid double-labeling
-        raw_options   = [strip_leading_letter_prefix(opt.text) for opt in poll.options]
-        correct_index = poll.correct_option_id if poll.correct_option_id is not None else 0
-
-        labeled_options = [
-            f"{string.ascii_uppercase[i]}) {opt}"
-            for i, opt in enumerate(raw_options)
-        ]
-
-        # Check if question or options are too long
-        q_fits      = len(question) <= TELEGRAM_Q_LIMIT
-        answers_fit = not options_too_long(labeled_options)
-
-        if q_fits and answers_fit:
-            poll_kwargs = dict(
-                chat_id=user_id,
-                question=question,
-                options=labeled_options,
-                type="quiz",
-                correct_option_id=correct_index,
-                is_anonymous=True,
-            )
-            if poll.explanation:
-                poll_kwargs["explanation"] = poll.explanation[:TELEGRAM_EX_LIMIT]
-            await context.bot.send_poll(**poll_kwargs)
-
-        elif not q_fits and answers_fit:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"📋 <b>السؤال:</b>\n{question}",
-                parse_mode=ParseMode.HTML,
-            )
-            poll_kwargs = dict(
-                chat_id=user_id,
-                question=".",
-                options=labeled_options,
-                type="quiz",
-                correct_option_id=correct_index,
-                is_anonymous=True,
-            )
-            if poll.explanation:
-                poll_kwargs["explanation"] = poll.explanation[:TELEGRAM_EX_LIMIT]
-            await context.bot.send_poll(**poll_kwargs)
-
-        else:
-            answer_lines = "\n".join(
-                f"{'✅ ' if i == correct_index else ''}"
-                f"{string.ascii_uppercase[i]}) {opt}"
-                for i, opt in enumerate(raw_options)
-            )
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}",
-                parse_mode=ParseMode.HTML,
-            )
-            short_q     = "."
-            letter_opts = make_letter_only_options(len(raw_options))
-            poll_kwargs = dict(
-                chat_id=user_id,
-                question=short_q,
-                options=letter_opts,
-                type="quiz",
-                correct_option_id=correct_index,
-                is_anonymous=True,
-            )
-            if poll.explanation:
-                poll_kwargs["explanation"] = poll.explanation[:TELEGRAM_EX_LIMIT]
-            await context.bot.send_poll(**poll_kwargs)
-
-        return
-
-    # ── PDF mode: save poll to buffer ───────────────────────────
+    # Strip any existing A) B) C) prefixes from options to avoid double-labeling
     question      = poll.question
     raw_options   = [strip_leading_letter_prefix(opt.text) for opt in poll.options]
     correct_index = poll.correct_option_id if poll.correct_option_id is not None else 0
+    explanation   = poll.explanation or None
 
-    labeled_options = [
-        f"{string.ascii_uppercase[i]}) {opt}"
-        for i, opt in enumerate(raw_options)
-    ]
+    # An image sent (with no caption / unparseable caption) just before this
+    # forward is paired with it, in either mode.
+    pending_img = PENDING_IMAGE.pop(user_id, None)
 
-    PDF_BUFFER[user_id].append({
-        "type":    "mcq",
-        "q":       question,
-        "options": labeled_options,
-        "correct": correct_index,
-    })
+    # ── PDF mode: save poll (+ any paired image) to buffer ──────
+    if user_id in PDF_BUFFER:
+        labeled_options = [
+            f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
+        ]
+        item = {
+            "type": "mcq", "q": question,
+            "options": labeled_options, "correct": correct_index,
+        }
+        if pending_img:
+            item["image"] = pending_img
 
-    await update_progress(
-        context, user_id, update.effective_chat.id,
-        latest_label=question[:50] + ("…" if len(question) > 50 else ""),
+        PDF_BUFFER[user_id].append(item)
+        await update_progress(
+            context, user_id, update.effective_chat.id,
+            latest_label=("🖼 " if pending_img else "")
+                         + question[:50] + ("…" if len(question) > 50 else ""),
+        )
+        return
+
+    # ── Normal mode: re-create the quiz live, always showing the ─
+    # ── original forwarded question text alongside it ───────────
+    await deliver_quiz(
+        context, user_id, question, raw_options, correct_index,
+        explanation=explanation, image_path=pending_img,
+        always_show_question_text=True, header_label="📋 <b>النص الأصلي للكويز:</b>",
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -758,29 +879,64 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if user_id not in PDF_BUFFER:
-        return   # silently ignore images outside PDF mode
+    in_pdf_mode = user_id in PDF_BUFFER
+    caption     = (update.message.caption or "").strip()
 
-    caption = update.message.caption or ""
-
+    # ── Download the image (works in both PDF and normal mode now) ──
     img_dir = f"/tmp/quizician_imgs/{user_id}"
     os.makedirs(img_dir, exist_ok=True)
-
-    img_count = sum(1 for i in PDF_BUFFER[user_id] if i["type"] == "image")
-    img_path  = os.path.join(img_dir, f"img_{img_count + 1}.jpg")
-
-    tg_file = await context.bot.get_file(photo.file_id)
+    img_path = os.path.join(img_dir, f"img_{photo.file_unique_id}.jpg")
+    tg_file  = await context.bot.get_file(photo.file_id)
     await tg_file.download_to_drive(img_path)
 
-    PDF_BUFFER[user_id].append({
-        "type":    "image",
-        "path":    img_path,
-        "caption": caption,
-    })
+    # ── Case 1: caption already IS a complete quiz question ─────────
+    # Parse and build the question immediately — no need to ask again.
+    parsed = parse_mcq_block(caption) if caption else None
+    if parsed:
+        question, raw_options, correct_index, explanation = parsed
+        if in_pdf_mode:
+            labeled_options = [
+                f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
+            ]
+            PDF_BUFFER[user_id].append({
+                "type": "mcq", "q": question,
+                "options": labeled_options, "correct": correct_index,
+                "image": img_path,
+            })
+            await update_progress(
+                context, user_id, update.effective_chat.id,
+                latest_label=f"🖼 {question[:50]}" + ("…" if len(question) > 50 else ""),
+            )
+        else:
+            await deliver_quiz(
+                context, user_id, question, raw_options, correct_index,
+                explanation=explanation, image_path=img_path,
+            )
+            await react_random(update, context)
+        return
 
-    await update_progress(
-        context, user_id, update.effective_chat.id,
-        latest_label=f"Image{(' — ' + caption) if caption else ''}",
+    # ── Case 2 (PDF mode only): non-empty caption that ISN'T a full
+    # question — keep the old behaviour of saving it as a standalone
+    # image item (e.g. comparison charts / tables with a plain caption).
+    if in_pdf_mode and caption:
+        PDF_BUFFER[user_id].append({
+            "type": "image", "path": img_path, "caption": caption,
+        })
+        await update_progress(
+            context, user_id, update.effective_chat.id,
+            latest_label=f"Image — {caption}",
+        )
+        return
+
+    # ── Case 3: no usable question yet — park the image and ask ─────
+    _clear_pending_image(user_id)  # drop any earlier unclaimed pending image
+    PENDING_IMAGE[user_id] = img_path
+
+    await update.message.reply_text(
+        "🖼 <b>استلمت الصورة!</b>\n"
+        "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
+        "وهيتضاف الصورة تلقائي للسؤال ده.",
+        parse_mode=ParseMode.HTML,
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -802,6 +958,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PDF_NAMES[user_id]  = name
         PDF_BUFFER[user_id] = []
         PROGRESS_MSG_ID.pop(user_id, None)
+        _clear_pending_image(user_id)
         del AWAITING_NAME[user_id]
         await update.message.reply_text(
             f"📥 <b>PDF mode activated</b> — File name: <i>{name}</i>\n\n"
@@ -892,38 +1049,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 continue
 
-            question      = lines[0]
-            options       = []
-            correct_index = None
-            explanation   = None  # from ex: line
+            question, raw_options, correct_index, explanation = parse_mcq_lines(lines)
 
-            for line in lines[1:]:
-                # Check for ex: explanation line
-                ex_match = re.match(r"^ex:\s*(.+)", line, re.IGNORECASE)
-                if ex_match:
-                    explanation = ex_match.group(1).strip()
-                    continue
-
-                opt       = clean_option(line)
-                has_z_end = re.search(r"\s+[zZ]\s*$", opt)
-                has_check = "✅" in opt
-
-                if has_z_end or has_check:
-                    opt           = opt.replace("✅", "")
-                    opt           = re.sub(r"\s+[zZ]\s*$", "", opt).strip()
-                    correct_index = len(options)
-
-                if opt:
-                    options.append(opt)
-
-            raw_options = options[:]  # keep unformatted for text fallback
-
-            options = [
-                f"{string.ascii_uppercase[i]}) {opt}"
-                for i, opt in enumerate(options)
-            ]
-
-            if correct_index is None or correct_index >= len(options):
+            if correct_index is None or correct_index >= len(raw_options):
                 if not in_pdf_mode:
                     await update.message.reply_text(
                         "⚠️ <b>ما فيش إجابة صح!</b>\n\n"
@@ -933,97 +1061,31 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 continue
 
+            # An image sent (with no caption / unparseable caption) just
+            # before this message is paired with this question, in either mode.
+            pending_img = PENDING_IMAGE.pop(user_id, None)
+
             # ── PDF MODE ────────────────────────────────────────
             if in_pdf_mode:
-                PDF_BUFFER[user_id].append({
-                    "type":    "mcq",
-                    "q":       question,
-                    "options": options,
-                    "correct": correct_index,
-                })
+                labeled_options = [
+                    f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
+                ]
+                item = {
+                    "type": "mcq", "q": question,
+                    "options": labeled_options, "correct": correct_index,
+                }
+                if pending_img:
+                    item["image"] = pending_img
+                PDF_BUFFER[user_id].append(item)
                 any_saved  = True
-                last_label = question[:50] + ("…" if len(question) > 50 else "")
+                last_label = ("🖼 " if pending_img else "") + question[:50] + ("…" if len(question) > 50 else "")
                 continue
 
             # ── NORMAL QUIZ MODE ─────────────────────────────────
-            # Determine overflow situation
-            q_fits       = len(question) <= TELEGRAM_Q_LIMIT
-            answers_fit  = not options_too_long(options)
-
-            if q_fits and answers_fit:
-                # ── Case 1: Everything fits — send normally ──────
-                main_q, desc_overflow = split_question_for_telegram(question)
-
-                poll_kwargs = dict(
-                    chat_id=user_id,
-                    question=main_q,
-                    options=options,
-                    type="quiz",
-                    correct_option_id=correct_index,
-                    is_anonymous=True,
-                )
-                if desc_overflow:
-                    poll_kwargs["question_parse_mode"] = None
-                    # Send overflow as a separate message before the poll
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"📋 <b>تكملة السؤال:</b>\n{desc_overflow}",
-                        parse_mode=ParseMode.HTML,
-                    )
-                if explanation:
-                    ex_trimmed = explanation[:TELEGRAM_EX_LIMIT]
-                    poll_kwargs["explanation"] = ex_trimmed
-
-                await context.bot.send_poll(**poll_kwargs)
-
-            elif not q_fits and answers_fit:
-                # ── Case 2: Question too long, answers OK ────────
-                # Send full question as text only (no answers — they'll appear in poll)
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📋 <b>السؤال:</b>\n{question}",
-                    parse_mode=ParseMode.HTML,
-                )
-                # Poll question: just a dot — full question already sent as text
-                poll_kwargs = dict(
-                    chat_id=user_id,
-                    question=".",
-                    options=options,
-                    type="quiz",
-                    correct_option_id=correct_index,
-                    is_anonymous=True,
-                )
-                if explanation:
-                    poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-                await context.bot.send_poll(**poll_kwargs)
-
-            else:
-                # ── Case 3: Both question AND answers too long ───
-                # Send full question + full answers (one per line), poll has A/B/C/D only
-                answer_lines = "\n".join(
-                    f"{'✅ ' if i == correct_index else ''}"
-                    f"{string.ascii_uppercase[i]}) {opt}"
-                    for i, opt in enumerate(raw_options)
-                )
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📋 <b>السؤال:</b>\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}",
-                    parse_mode=ParseMode.HTML,
-                )
-                short_q      = "."
-                letter_opts  = make_letter_only_options(len(raw_options))
-                poll_kwargs  = dict(
-                    chat_id=user_id,
-                    question=short_q,
-                    options=letter_opts,
-                    type="quiz",
-                    correct_option_id=correct_index,
-                    is_anonymous=True,
-                )
-                if explanation:
-                    poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-                await context.bot.send_poll(**poll_kwargs)
-
+            await deliver_quiz(
+                context, user_id, question, raw_options, correct_index,
+                explanation=explanation, image_path=pending_img,
+            )
             await react_random(update, context)
 
         # After all blocks in PDF mode — update the single progress message
@@ -1070,6 +1132,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"📄 {len(items)} سؤال — {name} ❤️",
         )
         _cleanup_images(user_id)
+        _clear_pending_image(user_id)
         PDF_BUFFER.pop(user_id, None)
         PDF_NAMES.pop(user_id, None)
         PROGRESS_MSG_ID.pop(user_id, None)
@@ -1086,6 +1149,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"📝 {len(items)} سؤال — {name} ❤️",
             )
             _cleanup_images(user_id)
+            _clear_pending_image(user_id)
             PDF_BUFFER.pop(user_id, None)
             PDF_NAMES.pop(user_id, None)
             PROGRESS_MSG_ID.pop(user_id, None)
@@ -1098,6 +1162,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "clear_pdf":
         _cleanup_images(user_id)
+        _clear_pending_image(user_id)
         PDF_BUFFER.pop(user_id, None)
         PDF_NAMES.pop(user_id, None)
         AWAITING_NAME.pop(user_id, None)
@@ -1110,6 +1175,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     _cleanup_images(user_id)
+    _clear_pending_image(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
@@ -1135,6 +1201,7 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📄 {len(items)} سؤال — {name} ❤️",
     )
     _cleanup_images(user_id)
+    _clear_pending_image(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
@@ -1142,6 +1209,7 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     _cleanup_images(user_id)
+    _clear_pending_image(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
