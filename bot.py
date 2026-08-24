@@ -60,6 +60,11 @@ else:
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — never hardcode it
 
+# Portable temp dir: tempfile.gettempdir() respects $TMPDIR, so this resolves
+# to a writable path on both Railway (/tmp) and Termux ($PREFIX/tmp) — a
+# hardcoded "/tmp" fails on Android, which has no writable /tmp.
+IMG_BASE_DIR = os.path.join(tempfile.gettempdir(), "quizician_imgs")
+
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
 ADMIN_ID = 123456789   # ← CHANGE THIS
@@ -257,7 +262,7 @@ def make_letter_only_options(count: int) -> list:
 
 def _cleanup_images(user_id: int):
     import shutil
-    img_dir = f"/tmp/quizician_imgs/{user_id}"
+    img_dir = os.path.join(IMG_BASE_DIR, str(user_id))
     if os.path.exists(img_dir):
         shutil.rmtree(img_dir, ignore_errors=True)
 
@@ -893,7 +898,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption     = (update.message.caption or "").strip()
 
     # ── Download the image (works in both PDF and normal mode now) ──
-    img_dir = f"/tmp/quizician_imgs/{user_id}"
+    img_dir = os.path.join(IMG_BASE_DIR, str(user_id))
     os.makedirs(img_dir, exist_ok=True)
     img_path = os.path.join(img_dir, f"img_{photo.file_unique_id}.jpg")
     tg_file  = await context.bot.get_file(photo.file_id)
