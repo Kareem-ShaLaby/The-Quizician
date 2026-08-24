@@ -6,7 +6,7 @@ import os
 import tempfile
 from io import BytesIO
 
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -25,11 +25,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-from docx import Document as DocxDocument
-from docx.shared import Pt, RGBColor, Inches, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+try:
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor, Inches, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    DOCX_AVAILABLE = True
+except ImportError:
+    # python-docx (and its lxml dependency) not installed — DOCX export is
+    # simply disabled until it's installed; everything else works fine.
+    DOCX_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════
 # FONT SETUP
@@ -267,6 +273,25 @@ def _clear_pending_image(user_id: int):
 # ═══════════════════════════════════════════════════════════════
 # QUIZ DELIVERY  (single source of truth for sending a live quiz poll)
 # ═══════════════════════════════════════════════════════════════
+async def _send_quiz_poll(context, poll_kwargs: dict, image_path: str = None):
+    """
+    Sends the poll, attaching image_path as the quiz's native media (Bot API
+    10.0+ InputPollMedia) when provided. Falls back to sending the image as a
+    separate message + a media-less poll if the media attachment is ever
+    rejected — this feature is new enough (May 2026) that we don't want a
+    server-side quirk to silently drop the question entirely.
+    """
+    if image_path:
+        try:
+            with open(image_path, "rb") as f:
+                await context.bot.send_poll(**poll_kwargs, media=InputMediaPhoto(f))
+            return
+        except Exception as e:
+            print("POLL MEDIA ERROR (falling back to separate image message):", e)
+            with open(image_path, "rb") as f:
+                await context.bot.send_photo(chat_id=poll_kwargs["chat_id"], photo=f)
+    await context.bot.send_poll(**poll_kwargs)
+
 async def deliver_quiz(
     context, chat_id: int, question: str, raw_options: list, correct_index: int,
     explanation: str = None, image_path: str = None,
@@ -275,8 +300,8 @@ async def deliver_quiz(
     """
     Sends a single live quiz poll to chat_id, handling Telegram's field-length
     limits consistently (question <=300, options <=100, explanation <=200).
-    Optionally precedes the poll with an image (Telegram polls can't carry
-    media natively, so the image is sent as its own message right before it).
+    If image_path is given, it's attached as the quiz's native photo
+    attachment (Bot API 10.0+), so it shows up inside the quiz itself.
 
     always_show_question_text=True forces the original question text to be
     shown as a message even when it fits inside the poll's question field —
@@ -291,26 +316,13 @@ async def deliver_quiz(
     q_fits      = len(question) <= TELEGRAM_Q_LIMIT
     answers_fit = not options_too_long(labeled_options)
 
-    async def send_image(caption: str = None):
-        with open(image_path, "rb") as f:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=f,
-                caption=(caption[:1024] if caption else None),
-                parse_mode=ParseMode.HTML if caption else None,
-            )
-
     if q_fits and answers_fit:
         main_q, desc_overflow = split_question_for_telegram(question)
 
         if always_show_question_text:
-            text = f"{header_label}\n{question}"
-            if image_path:
-                await send_image(text)
-            else:
-                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-        elif image_path:
-            await send_image()
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"{header_label}\n{question}", parse_mode=ParseMode.HTML,
+            )
 
         if desc_overflow:
             await context.bot.send_message(
@@ -325,14 +337,12 @@ async def deliver_quiz(
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-        await context.bot.send_poll(**poll_kwargs)
+        await _send_quiz_poll(context, poll_kwargs, image_path)
 
     elif not q_fits and answers_fit:
-        text = f"{header_label}\n{question}"
-        if image_path:
-            await send_image(text)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"{header_label}\n{question}", parse_mode=ParseMode.HTML,
+        )
 
         poll_kwargs = dict(
             chat_id=chat_id, question=".", options=labeled_options,
@@ -340,18 +350,18 @@ async def deliver_quiz(
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-        await context.bot.send_poll(**poll_kwargs)
+        await _send_quiz_poll(context, poll_kwargs, image_path)
 
     else:
         answer_lines = "\n".join(
             f"{'✅ ' if i == correct_index else ''}{string.ascii_uppercase[i]}) {opt}"
             for i, opt in enumerate(raw_options)
         )
-        text = f"{header_label}\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}"
-        if image_path:
-            await send_image(text)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{header_label}\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}",
+            parse_mode=ParseMode.HTML,
+        )
 
         letter_opts = make_letter_only_options(len(raw_options))
         poll_kwargs = dict(
@@ -360,7 +370,7 @@ async def deliver_quiz(
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-        await context.bot.send_poll(**poll_kwargs)
+        await _send_quiz_poll(context, poll_kwargs, image_path)
 
 # ═══════════════════════════════════════════════════════════════
 # PROGRESS MESSAGE BUILDER
@@ -428,11 +438,11 @@ async def update_progress(context, user_id: int, chat_id: int, latest_label: str
 # KEYBOARD HELPERS
 # ═══════════════════════════════════════════════════════════════
 def export_keyboard():
+    row = [InlineKeyboardButton("📄 Export as PDF", callback_data="gen_pdf")]
+    if DOCX_AVAILABLE:
+        row.append(InlineKeyboardButton("📝 Export as DOCX", callback_data="gen_docx"))
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📄 Export as PDF",  callback_data="gen_pdf"),
-            InlineKeyboardButton("📝 Export as DOCX", callback_data="gen_docx"),
-        ],
+        row,
         [InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
     ])
 
@@ -841,13 +851,13 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Normal mode: re-create the quiz live, always showing the ─
-    # ── original forwarded question text alongside it ───────────
-    await deliver_quiz(
-        context, user_id, question, raw_options, correct_index,
-        explanation=explanation, image_path=pending_img,
-        always_show_question_text=True, header_label="📋 <b>النص الأصلي للكويز:</b>",
-    )
+    # ── Normal mode: just echo the original question text — no ──
+    # ── header label, no recreated quiz poll, no correct answer ──
+    if pending_img:
+        with open(pending_img, "rb") as f:
+            await context.bot.send_photo(chat_id=user_id, photo=f, caption=question)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=question)
 
 # ═══════════════════════════════════════════════════════════════
 # IMAGE HANDLER (PDF mode only)
@@ -1138,6 +1148,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PROGRESS_MSG_ID.pop(user_id, None)
 
     elif query.data == "gen_docx":
+        if not DOCX_AVAILABLE:
+            await query.message.reply_text(
+                "❌ DOCX export مش متاح دلوقتي (python-docx مش متثبت). "
+                "استخدم PDF Export بدل كده، أو ثبّت python-docx وأعد التشغيل."
+            )
+            return
         if not items:
             await query.message.reply_text("❌ لا يوجد أسئلة محفوظة بعد")
             return
