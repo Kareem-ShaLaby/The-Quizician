@@ -52,11 +52,11 @@ if os.path.exists(_POPPINS_REG) and os.path.exists(_POPPINS_BOLD):
 else:
     print("Poppins not found — using Helvetica")
 
-BOT_TOKEN = "8661732123:AAFm8_cJErw9gibgAxOkZksh38cMJAG1_qo"
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — never hardcode it
 
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
-ADMIN_ID = 940770584  # ← CHANGE THIS
+ADMIN_ID = 123456789   # ← CHANGE THIS
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
@@ -474,8 +474,18 @@ HOW_TO_USE_TEXT = (
 
 LATEST_UPDATES_TEXT = (
     "🆕 <b>Latest Updates — V5.4</b>\n\n"
-    "كلام كتير جدا مش لازم تعرفه وانا مكسل اكتبه"
-    " ❤️  ومتنساش تسوي دعوة حلوه ❤️\n" 
+    "• 📖 <b>ex: explanation support</b> — add <code>ex: your explanation</code> "
+    "after answers to show it after answering the poll\n"
+    "• ✅ <b>Forwarded quiz correct answer</b> — re-sent polls now preserve "
+    "the correct answer and work outside PDF mode too\n"
+    "• ⚠️ <b>Format error messages</b> — bot tells you exactly what's wrong\n"
+    "• 📋 <b>Long question handling</b> — if Q is too long, sends text first then poll; "
+    "if both Q and answers are too long, shows A/B/C/D only in poll\n"
+    "• 🔥 Removed fire self-reaction\n"
+    "• 🎛 Clean start menu with inline buttons\n"
+    "• 📊 Live progress bar in PDF mode\n"
+    "• 📝 PDF + DOCX export both supported"
+    " ❤️ وأدعيلي دعوة حلوه ❤️\n" 
 )
 
 PDF_MODE_GUIDE_TEXT = (
@@ -509,7 +519,7 @@ def build_pdf(items: list, doc_title: str = "questions") -> BytesIO:
         canvas.saveState()
         canvas.setFont(FONT_NAME_BOLD, 9)
         canvas.setFillColor(LEFT_COLOR)
-        canvas.drawString(2 * cm, A4[1] - 1.4 * cm, "Medify44 | Notes & Files")
+        canvas.drawString(2 * cm, A4[1] - 1.4 * cm, "MDM44 | Notes & Files")
         canvas.setFillColor(RIGHT_COLOR)
         canvas.drawRightString(A4[0] - 2 * cm, A4[1] - 1.4 * cm, "Made by The Quizician")
         canvas.setStrokeColor(colors.HexColor("#CFD8DC"))
@@ -785,9 +795,8 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     SLEEPING.add(user_id)
     await update.message.reply_text(
-        "/\_/\ \n"
-        "( -.- ) Zzz \n"
-        "> ^ < \n"
+        "😴 والله لأنا سايبهالك وداخل أنام\n"
+        "لما تحتاجني تاني مش معبرك\n"
     )
 
 # ═══════════════════════════════════════════════════════════════
