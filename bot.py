@@ -12,6 +12,7 @@ from telegram.ext import (
     MessageHandler,
     CommandHandler,
     CallbackQueryHandler,
+    PollHandler,
     filters,
     ContextTypes,
 )
@@ -114,6 +115,8 @@ PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress mess
 GALLERY_SESSION        = {}    # user_id -> next photo index to send (0-based)
 AWAITING_GALLERY_PHOTO = set() # admin is expected to send the next photo to add
 PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
+CLARIFY_QUEUE          = {}    # user_id -> list of PDF_BUFFER indices awaiting a correct-answer tap
+POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive auto-detection
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -274,6 +277,13 @@ def _clear_pending_image(user_id: int):
             os.remove(path)
         except Exception:
             pass
+
+def _clear_clarify_queue(user_id: int):
+    """Drop any pending 'choose the correct answer' queue/watches for this user."""
+    CLARIFY_QUEUE.pop(user_id, None)
+    stale_poll_ids = [pid for pid, (uid, _) in POLL_WATCH.items() if uid == user_id]
+    for pid in stale_poll_ids:
+        POLL_WATCH.pop(pid, None)
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZ DELIVERY  (single source of truth for sending a live quiz poll)
@@ -581,7 +591,8 @@ def build_pdf(items: list, doc_title: str = "questions") -> BytesIO:
     story    = []
 
     for idx, item in enumerate(items, 1):
-        story.append(Paragraph(f"Q{idx}", NUM_STYLE))
+        q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
+        story.append(Paragraph(q_num_label, NUM_STYLE))
 
         if item["type"] == "mcq":
             story.append(Paragraph(item["q"], Q_STYLE))
@@ -717,7 +728,8 @@ def build_docx(items: list, doc_title: str = "questions") -> BytesIO:
     for idx, item in enumerate(items, 1):
 
         # Q-number label
-        _add_paragraph(doc, f"Q{idx}", bold=True, size_pt=8,
+        q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
+        _add_paragraph(doc, q_num_label, bold=True, size_pt=8,
                        color_hex="90A4AE", space_before=10, space_after=2)
 
         if item["type"] == "mcq":
@@ -815,8 +827,83 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ═══════════════════════════════════════════════════════════════
+# PASSIVE ANSWER BACKFILL
+# Telegram pushes a fresh Update.poll (with correct_option_id filled in)
+# to any bot that has previously seen a poll, once that poll is stopped —
+# even for polls the bot didn't create. If the original quiz's creator
+# later ends it, we quietly backfill the answer with no user action needed.
+# ═══════════════════════════════════════════════════════════════
+async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    poll = update.poll
+    if poll is None or poll.correct_option_id is None:
+        return
+
+    watch = POLL_WATCH.pop(poll.id, None)
+    if not watch:
+        return
+    user_id, item_index = watch
+
+    items = PDF_BUFFER.get(user_id)
+    if not items or item_index >= len(items) or items[item_index]["correct"] is not None:
+        return  # buffer changed, or already resolved manually — skip
+
+    item = items[item_index]
+    item["correct"] = poll.correct_option_id
+
+    queue = CLARIFY_QUEUE.get(user_id, [])
+    if item_index in queue:
+        queue.remove(item_index)
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"✅ الكويز الأصلي لسؤال Q{item_index + 1} اتقفل وتليجرام بعت الإجابة الصح تلقائي: "
+                f"{item['options'][poll.correct_option_id]}"
+            ),
+        )
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════════════════════
 # FORWARDED POLL HANDLER
 # ═══════════════════════════════════════════════════════════════
+async def _ask_next_clarification(context, user_id: int, chat_id: int):
+    """Pop-free peek at the front of the clarify queue and ask about it with
+    inline A/B/C… buttons. Skips (and drops) any stale entries whose buffer
+    item no longer exists (e.g. buffer was cleared mid-queue)."""
+    queue = CLARIFY_QUEUE.get(user_id)
+    while queue:
+        item_index = queue[0]
+        items = PDF_BUFFER.get(user_id)
+        if not items or item_index >= len(items) or items[item_index]["correct"] is not None:
+            queue.pop(0)  # stale or already resolved — skip it
+            continue
+
+        item        = items[item_index]
+        q_num       = item_index + 1
+        first_words = " ".join(item["q"].split()[:5])
+        options_txt = "\n".join(item["options"])  # already "A) ..." labeled
+
+        buttons = [
+            InlineKeyboardButton(string.ascii_uppercase[i], callback_data=f"clarify:{item_index}:{i}")
+            for i in range(len(item["options"]))
+        ]
+        rows = [buttons[i:i + 6] for i in range(0, len(buttons), 6)]
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❓ <b>Choose the correct answer</b>\n"
+                f"for Q{q_num}: {first_words}…\n\n{options_txt}"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+    # queue exhausted — nothing left to ask
+    CLARIFY_QUEUE.pop(user_id, None)
+
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.poll:
         return
@@ -829,7 +916,10 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Strip any existing A) B) C) prefixes from options to avoid double-labeling
     question      = poll.question
     raw_options   = [strip_leading_letter_prefix(opt.text) for opt in poll.options]
-    correct_index = poll.correct_option_id if poll.correct_option_id is not None else 0
+    # Telegram only reveals correct_option_id if the quiz is closed, or was
+    # sent by our own bot / directly to it — an open quiz forwarded from
+    # someone else comes back as None. We must NOT guess in that case.
+    correct_index = poll.correct_option_id  # may be None — checked below
     explanation   = poll.explanation or None
 
     # An image sent (with no caption / unparseable caption) just before this
@@ -843,17 +933,27 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         item = {
             "type": "mcq", "q": question,
-            "options": labeled_options, "correct": correct_index,
+            "options": labeled_options, "correct": correct_index,  # None = unknown
+            "poll_id": poll.id,
         }
         if pending_img:
             item["image"] = pending_img
 
         PDF_BUFFER[user_id].append(item)
-        await update_progress(
-            context, user_id, update.effective_chat.id,
-            latest_label=("🖼 " if pending_img else "")
-                         + question[:50] + ("…" if len(question) > 50 else ""),
-        )
+        item_index = len(PDF_BUFFER[user_id]) - 1
+
+        label = ("🖼 " if pending_img else "") + ("~" if correct_index is None else "") \
+                + question[:50] + ("…" if len(question) > 50 else "")
+        await update_progress(context, user_id, update.effective_chat.id, latest_label=label)
+
+        if correct_index is None:
+            # Telegram hid the answer (quiz still open, not ours) — queue it
+            # for a quick button tap instead of silently guessing.
+            POLL_WATCH[poll.id] = (user_id, item_index)
+            queue = CLARIFY_QUEUE.setdefault(user_id, [])
+            queue.append(item_index)
+            if len(queue) == 1:  # nothing else currently being asked
+                await _ask_next_clarification(context, user_id, update.effective_chat.id)
         return
 
     # ── Normal mode: echo the original question text + choices — ─
@@ -979,6 +1079,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PDF_BUFFER[user_id] = []
         PROGRESS_MSG_ID.pop(user_id, None)
         _clear_pending_image(user_id)
+        _clear_clarify_queue(user_id)
         del AWAITING_NAME[user_id]
         await update.message.reply_text(
             f"📥 <b>PDF mode activated</b> — File name: <i>{name}</i>\n\n"
@@ -1123,6 +1224,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
+    # ── CLARIFY: manual correct-answer button tap ────────────────
+    if query.data.startswith("clarify:"):
+        _, item_index_str, choice_str = query.data.split(":")
+        item_index = int(item_index_str)
+        choice     = int(choice_str)
+
+        items = PDF_BUFFER.get(user_id)
+        if not items or item_index >= len(items) or items[item_index]["correct"] is not None:
+            await query.edit_message_text("⚠️ السؤال ده اتحل أو اتشال بالفعل.")
+            return
+
+        item = items[item_index]
+        if not (0 <= choice < len(item["options"])):
+            return
+
+        item["correct"] = choice
+        POLL_WATCH.pop(item.get("poll_id"), None)
+
+        queue = CLARIFY_QUEUE.get(user_id, [])
+        if item_index in queue:
+            queue.remove(item_index)
+
+        await query.edit_message_text(f"✅ Q{item_index + 1}: {item['options'][choice]}")
+
+        if queue:
+            await _ask_next_clarification(context, user_id, query.message.chat_id)
+        else:
+            CLARIFY_QUEUE.pop(user_id, None)
+        return
+
     # ── START MENU BUTTONS ──────────────────────────────────────
     if query.data == "menu_how":
         await query.message.reply_text(HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML)
@@ -1153,6 +1284,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         _cleanup_images(user_id)
         _clear_pending_image(user_id)
+        _clear_clarify_queue(user_id)
         PDF_BUFFER.pop(user_id, None)
         PDF_NAMES.pop(user_id, None)
         PROGRESS_MSG_ID.pop(user_id, None)
@@ -1176,6 +1308,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             _cleanup_images(user_id)
             _clear_pending_image(user_id)
+            _clear_clarify_queue(user_id)
             PDF_BUFFER.pop(user_id, None)
             PDF_NAMES.pop(user_id, None)
             PROGRESS_MSG_ID.pop(user_id, None)
@@ -1189,6 +1322,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "clear_pdf":
         _cleanup_images(user_id)
         _clear_pending_image(user_id)
+        _clear_clarify_queue(user_id)
         PDF_BUFFER.pop(user_id, None)
         PDF_NAMES.pop(user_id, None)
         AWAITING_NAME.pop(user_id, None)
@@ -1202,6 +1336,7 @@ async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
+    _clear_clarify_queue(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
@@ -1228,6 +1363,7 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
+    _clear_clarify_queue(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
@@ -1236,6 +1372,7 @@ async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
+    _clear_clarify_queue(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
@@ -1508,6 +1645,7 @@ app.add_handler(MessageHandler(filters.PHOTO, handle_image))
 
 # Inline buttons
 app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(PollHandler(poll_update_handler))
 
 # Text handler last
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
