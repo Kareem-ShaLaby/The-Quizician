@@ -856,13 +856,18 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Normal mode: just echo the original question text — no ──
-    # ── header label, no recreated quiz poll, no correct answer ──
+    # ── Normal mode: echo the original question text + choices — ─
+    # ── no header label, no recreated quiz poll, no correct answer ──
+    full_text = question + "\n" + "\n".join(raw_options)
     if pending_img:
         with open(pending_img, "rb") as f:
-            await context.bot.send_photo(chat_id=user_id, photo=f, caption=question)
+            if len(full_text) <= 1024:  # Telegram's photo caption limit
+                await context.bot.send_photo(chat_id=user_id, photo=f, caption=full_text)
+            else:
+                await context.bot.send_photo(chat_id=user_id, photo=f)
+                await context.bot.send_message(chat_id=user_id, text=full_text)
     else:
-        await context.bot.send_message(chat_id=user_id, text=question)
+        await context.bot.send_message(chat_id=user_id, text=full_text)
 
 # ═══════════════════════════════════════════════════════════════
 # IMAGE HANDLER (PDF mode only)
