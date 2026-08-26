@@ -77,7 +77,48 @@ ADMIN_ID = 123456789   # ← CHANGE THIS
 # 2. Send any message in the group, then send /storage_id in the SAME
 #    group — the bot will reply with the chat ID (a negative number,
 #    e.g. -1001234567890). Paste it below.
-STORAGE_GROUP_ID = -1001234567890   # ← CHANGE THIS
+STORAGE_GROUP_ID = -1004447646576
+
+# ═══════════════════════════════════════════════════════════════
+# QUIZZY — The Quizician's cat friend 🐾
+# ═══════════════════════════════════════════════════════════════
+QUIZZY_WELCOME_ART = (
+    "  /\\_/\\ \n"
+    "( ⌒.⌒ )\n"
+    "  > ^ <  "
+)
+QUIZZY_SLEEPING_ART = (
+    " /\\_/\\ \n"
+    "(  -.- ) zzz\n"
+    " > ^ <  "
+)
+# No "oops" expression was provided yet — this one's improvised to match
+# the same style. Swap QUIZZY_OOPS_ART for a real one whenever you draw it.
+QUIZZY_OOPS_ART = (
+    " /\\_/\\ \n"
+    "( ×_× )\n"
+    " > ~ <  "
+)
+
+QUIZZY_WELCOME_LINES = [
+    "قوزي هنا، جاهز يساعدك يبيّض وشك في الامتحان 🐾",
+    "الأستاذ القوزيشيان ومعاه مساعده قوزي في الخدمة!",
+    "قوزي فتح عينه وقعد على الكيبورد — يلا نذاكر 😼",
+]
+QUIZZY_SUCCESS_LINES = [
+    "قوزي بيعمل هاي فايف بإيده الصغيرة 🐾✋",
+    "خلصنا! قوزي بيلحس إيده من الرضا 😽",
+    "قوزي فخور بيك دلوقتي، وده مش سهل يحصل 🐾",
+]
+QUIZZY_ERROR_LINES = [
+    "قوزي وقع من على الرف من الصدمة، بس متقلقش هنظبطها 🐾",
+    "قوزي شايف إن المشكلة دي معندهاش داعي، جرب تاني 😼",
+    "احنا مش عارفين إيه اللي حصل، بس قوزي واثق إنها هتتحل 🐾",
+]
+
+def quizzy_block(art: str, line: str) -> str:
+    """Quizzy's ASCII art + one of his lines, wrapped for Telegram HTML."""
+    return f"<pre>{art}</pre>\n<i>{line}</i>"
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
@@ -428,10 +469,19 @@ async def deliver_quiz(
 # PROGRESS MESSAGE BUILDER
 # ═══════════════════════════════════════════════════════════════
 def build_progress_text(items: list, latest_label: str = "") -> str:
-    count    = len(items)
-    bar_len  = 10
-    filled   = min(count, bar_len)
-    bar      = "█" * filled + "░" * (bar_len - filled)
+    count   = len(items)
+    bar_len = 10
+
+    # The old bar filled to 10 blocks and then just sat there full forever —
+    # useless feedback past item #10. Instead, cycle through blocks of 10:
+    # the bar always shows how far into the *current* block of 10 you are,
+    # and the milestone number (10, 20, 30…) climbs alongside it.
+    if count == 0:
+        filled, milestone = 0, bar_len
+    else:
+        filled = count % bar_len or bar_len   # land on a full bar, not an empty one
+        milestone = ((count - 1) // bar_len + 1) * bar_len
+    bar = "█" * filled + "░" * (bar_len - filled)
 
     type_counts = {"mcq": 0, "written": 0, "image": 0}
     for it in items:
@@ -449,7 +499,7 @@ def build_progress_text(items: list, latest_label: str = "") -> str:
 
     text = (
         f"📄 <b>PDF Collection Mode</b>\n"
-        f"<code>{bar}</code>\n"
+        f"<code>{bar}</code> {count}/{milestone}\n"
         f"Collected: <b>{count}</b> item{'s' if count != 1 else ''}"
     )
     if breakdown:
@@ -859,8 +909,9 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     SLEEPING.add(user_id)
     await update.message.reply_text(
-        "😴 والله لأنا سايبهالك وداخل أنام\n"
-        "لما تحتاجني تاني مش معبرك\n"
+        f"{quizzy_block(QUIZZY_SLEEPING_ART, 'قوزي نام، وأنا نايم معاه 😴')}\n\n"
+        "نادينا بـ /start لما تحتاجنا تاني",
+        parse_mode=ParseMode.HTML,
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -1030,6 +1081,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✅ <b>تمت إضافة الصورة للمعرض!</b>\n"
             f"📸 إجمالي الصور: <b>{len(GALLERY)}</b>\n\n"
+            f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>\n\n"
             "ابعت /gallery_add تاني لإضافة صورة أخرى\n"
             "أو /gallery_list لتشوف المعرض",
             parse_mode=ParseMode.HTML,
@@ -1121,7 +1173,8 @@ async def _finalize_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: st
     password = _index_item(caption, buf["ids"])
     await context.bot.send_message(
         STORAGE_GROUP_ID,
-        f"✅ اتخزن ألبوم من {len(buf['ids'])} ملف تحت الكلمة: <code>{password}</code>",
+        f"✅ اتخزن ألبوم من {len(buf['ids'])} ملف تحت الكلمة: <code>{password}</code>\n"
+        f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1148,7 +1201,11 @@ async def handle_storage_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     password = _index_item(caption, [msg.message_id])
-    await msg.reply_text(f"✅ اتخزن تحت الكلمة: <code>{password}</code>", parse_mode=ParseMode.HTML)
+    await msg.reply_text(
+        f"✅ اتخزن تحت الكلمة: <code>{password}</code>\n"
+        f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+        parse_mode=ParseMode.HTML,
+    )
 
 async def storage_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Utility: run inside the storage group to get its chat ID for STORAGE_GROUP_ID."""
@@ -1222,7 +1279,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception as e:
                     print(f"Storage delivery failed for password lookup: {e}")
-                    await update.message.reply_text("❌ حصلت مشكلة وأنا بجيب الملف، جرب تاني كمان شوية.")
+                    await update.message.reply_text(
+                        quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES)),
+                        parse_mode=ParseMode.HTML,
+                    )
             return
 
     in_pdf_mode = user_id in PDF_BUFFER
@@ -1393,7 +1453,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf = build_pdf(items, name)
         await query.message.reply_document(
             document=pdf, filename=f"{safe}.pdf",
-            caption=f"📄 {len(items)} سؤال — {name} ❤️",
+            caption=f"📄 {len(items)} سؤال — {name} ❤️\n\n🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+            parse_mode=ParseMode.HTML,
         )
         _cleanup_images(user_id)
         _clear_pending_image(user_id)
@@ -1417,7 +1478,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             docx_buf = build_docx(items, name)
             await query.message.reply_document(
                 document=docx_buf, filename=f"{safe}.docx",
-                caption=f"📝 {len(items)} سؤال — {name} ❤️",
+                caption=f"📝 {len(items)} سؤال — {name} ❤️\n\n🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+                parse_mode=ParseMode.HTML,
             )
             _cleanup_images(user_id)
             _clear_pending_image(user_id)
@@ -1428,7 +1490,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print("DOCX ERROR:", e)
             await query.message.reply_text(
-                f"❌ خطأ في توليد الـ DOCX:\n<code>{e}</code>",
+                f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n"
+                f"<code>{e}</code>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -1472,7 +1535,8 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pdf = build_pdf(items, name)
     await update.message.reply_document(
         document=pdf, filename=f"{safe}.pdf",
-        caption=f"📄 {len(items)} سؤال — {name} ❤️",
+        caption=f"📄 {len(items)} سؤال — {name} ❤️\n\n🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+        parse_mode=ParseMode.HTML,
     )
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
@@ -1506,6 +1570,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "❤️<b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b>\n"
         "<b>منور يا كويزاوي 🌹</b>\n\n"
+        f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
         "Choose an option below to get started:",
         parse_mode=ParseMode.HTML,
         reply_markup=start_menu_keyboard(),
