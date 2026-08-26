@@ -4,6 +4,7 @@ import random
 import json
 import os
 import asyncio
+import html
 import tempfile
 from io import BytesIO
 
@@ -117,8 +118,10 @@ QUIZZY_ERROR_LINES = [
 ]
 
 def quizzy_block(art: str, line: str) -> str:
-    """Quizzy's ASCII art + one of his lines, wrapped for Telegram HTML."""
-    return f"<pre>{art}</pre>\n<i>{line}</i>"
+    """Quizzy's ASCII art + one of his lines, wrapped for Telegram HTML.
+    The art contains literal < > characters (whiskers/paws) which Telegram's
+    HTML parser would otherwise choke on as broken tags — escape them."""
+    return f"<pre>{html.escape(art)}</pre>\n<i>{html.escape(line)}</i>"
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
