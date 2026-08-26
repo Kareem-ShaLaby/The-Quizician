@@ -3,6 +3,7 @@ import string
 import random
 import json
 import os
+import asyncio
 import tempfile
 from io import BytesIO
 
@@ -70,6 +71,14 @@ IMG_BASE_DIR = os.path.join(tempfile.gettempdir(), "quizician_imgs")
 # To find it: message @userinfobot on Telegram → it replies with your ID
 ADMIN_ID = 123456789   # ← CHANGE THIS
 
+# ── Replace with your private GROUP's chat ID ────────────────────
+# 1. Create the group, add this bot to it as a member (admin not required
+#    unless you want it to survive being demoted/re-added later).
+# 2. Send any message in the group, then send /storage_id in the SAME
+#    group — the bot will reply with the chat ID (a negative number,
+#    e.g. -1001234567890). Paste it below.
+STORAGE_GROUP_ID = -1001234567890   # ← CHANGE THIS
+
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
 # ═══════════════════════════════════════════════════════════════
@@ -103,6 +112,34 @@ def save_gallery():
         json.dump(GALLERY, f)
 
 GALLERY: list = load_gallery()   # [{"file_id": "...", "caption": "..."}, ...]
+
+# ═══════════════════════════════════════════════════════════════
+# PASSWORD-GATED STORAGE (private group)
+# ═══════════════════════════════════════════════════════════════
+# STORAGE_GROUP_ID is the vault: post any photo/video/document/album there
+# with a caption starting with a password word, and the bot indexes it.
+# A DM containing that exact word gets the item(s) copied to the user.
+STORAGE_INDEX_FILE = "storage_index.json"
+
+def load_storage_index():
+    if os.path.exists(STORAGE_INDEX_FILE):
+        with open(STORAGE_INDEX_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_storage_index():
+    with open(STORAGE_INDEX_FILE, "w") as f:
+        json.dump(STORAGE_INDEX, f)
+
+# password (lowercased) -> list of items; each item is a list of message_ids
+# (a single-message item is [id], an album is [id1, id2, ...]). Reusing the
+# same password just appends another item — both get delivered on unlock.
+STORAGE_INDEX: dict = load_storage_index()
+
+# media_group_id -> {"ids": [...], "caption": str|None, "task": asyncio.Task}
+# Albums arrive as several separate updates; we debounce them so the whole
+# album gets filed as one item under one password.
+ALBUM_BUFFER: dict = {}
 
 # ═══════════════════════════════════════════════════════════════
 # STATE
@@ -1060,6 +1097,66 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ═══════════════════════════════════════════════════════════════
+# STORAGE GROUP — AUTO-INDEXING
+# ═══════════════════════════════════════════════════════════════
+def _index_item(caption: str, message_ids: list):
+    password = caption.strip().split(maxsplit=1)[0].lower()
+    STORAGE_INDEX.setdefault(password, []).append(sorted(message_ids))
+    save_storage_index()
+    return password
+
+async def _finalize_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
+    # Wait for the album's parts to stop arriving before filing it as one item.
+    await asyncio.sleep(1.5)
+    buf = ALBUM_BUFFER.pop(media_group_id, None)
+    if not buf:
+        return
+    caption = buf["caption"]
+    if not caption:
+        await context.bot.send_message(
+            STORAGE_GROUP_ID,
+            "⚠️ ألبوم اتبعت من غير كابشن (كلمة سر) — اتجاهله ومحدش هيقدر يفتحه.",
+        )
+        return
+    password = _index_item(caption, buf["ids"])
+    await context.bot.send_message(
+        STORAGE_GROUP_ID,
+        f"✅ اتخزن ألبوم من {len(buf['ids'])} ملف تحت الكلمة: <code>{password}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def handle_storage_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Indexes media posted in STORAGE_GROUP_ID. First caption word = password."""
+    msg = update.message
+    if not msg:
+        return
+    caption = (msg.caption or "").strip()
+
+    if msg.media_group_id:
+        buf = ALBUM_BUFFER.setdefault(msg.media_group_id, {"ids": [], "caption": None})
+        buf["ids"].append(msg.message_id)
+        if caption:
+            buf["caption"] = caption  # usually only one part of the album carries it
+        existing_task = buf.get("task")
+        if existing_task:
+            existing_task.cancel()
+        buf["task"] = asyncio.create_task(_finalize_album(context, msg.media_group_id))
+        return
+
+    if not caption:
+        await msg.reply_text("⚠️ الملف ده اتبعت من غير كابشن — محتاج كلمة سر في الكابشن عشان يتخزن.")
+        return
+
+    password = _index_item(caption, [msg.message_id])
+    await msg.reply_text(f"✅ اتخزن تحت الكلمة: <code>{password}</code>", parse_mode=ParseMode.HTML)
+
+async def storage_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Utility: run inside the storage group to get its chat ID for STORAGE_GROUP_ID."""
+    await update.message.reply_text(
+        f"🆔 Chat ID: <code>{update.effective_chat.id}</code>", parse_mode=ParseMode.HTML
+    )
+
+# ═══════════════════════════════════════════════════════════════
 # TEXT MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1111,6 +1208,22 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption="\n".join(parts),
         )
         return
+
+    # ── STORAGE PASSWORD LOOKUP ──────────────────────────────────
+    if update.effective_chat.type == "private":
+        items = STORAGE_INDEX.get(text.lower())
+        if items:
+            for message_ids in items:
+                try:
+                    await context.bot.copy_messages(
+                        chat_id=user_id,
+                        from_chat_id=STORAGE_GROUP_ID,
+                        message_ids=message_ids,
+                    )
+                except Exception as e:
+                    print(f"Storage delivery failed for password lookup: {e}")
+                    await update.message.reply_text("❌ حصلت مشكلة وأنا بجيب الملف، جرب تاني كمان شوية.")
+            return
 
     in_pdf_mode = user_id in PDF_BUFFER
 
@@ -1636,19 +1749,36 @@ app.add_handler(CommandHandler("gallery_move",   gallery_move_cmd))
 app.add_handler(CommandHandler("gallery_clear",  gallery_clear_cmd))
 # User navigation
 app.add_handler(CommandHandler("next",           next_cmd))
+# Storage group setup helper
+app.add_handler(CommandHandler("storage_id",     storage_id_cmd))
 
 # Poll handler before text handler (forwarded OR own quiz polls)
 app.add_handler(MessageHandler(filters.POLL, handle_poll))
 
-# Image handler (photos in PDF mode)
-app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+# Storage group indexing — anything posted in the vault group gets filed by
+# its caption's password word. Must be checked before the generic photo
+# handler below so vault posts don't get mistaken for quiz images.
+STORAGE_MEDIA_FILTER = (
+    filters.PHOTO | filters.VIDEO | filters.Document.ALL
+    | filters.AUDIO | filters.VOICE | filters.ANIMATION | filters.Sticker.ALL
+)
+app.add_handler(MessageHandler(
+    filters.Chat(STORAGE_GROUP_ID) & STORAGE_MEDIA_FILTER, handle_storage_message
+))
+
+# Image handler (photos in PDF mode) — excludes the storage group
+app.add_handler(MessageHandler(
+    filters.PHOTO & ~filters.Chat(STORAGE_GROUP_ID), handle_image
+))
 
 # Inline buttons
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(PollHandler(poll_update_handler))
 
-# Text handler last
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+# Text handler last — excludes the storage group
+app.add_handler(MessageHandler(
+    filters.TEXT & ~filters.COMMAND & ~filters.Chat(STORAGE_GROUP_ID), handle
+))
 
 print("Bot running... V5.5")
 app.run_polling()
