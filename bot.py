@@ -80,6 +80,13 @@ ADMIN_ID = 123456789   # ← CHANGE THIS
 #    e.g. -1001234567890). Paste it below.
 STORAGE_GROUP_ID = -1004447646576
 
+# ── Replace with your quiz CHANNEL's chat ID ─────────────────────
+# 1. Create a channel, add this bot as an ADMIN (channels require admin
+#    rights for the bot to receive posts at all).
+# 2. Forward any message from that channel to the bot in a private DM,
+#    then send /quiz_channel_id right after — the bot replies with the ID.
+QUIZ_CHANNEL_ID = -1004447646577   # ← CHANGE THIS
+
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — The Quizician's cat friend 🐾
 # ═══════════════════════════════════════════════════════════════
@@ -184,6 +191,43 @@ STORAGE_INDEX: dict = load_storage_index()
 # Albums arrive as several separate updates; we debounce them so the whole
 # album gets filed as one item under one password.
 ALBUM_BUFFER: dict = {}
+
+# ═══════════════════════════════════════════════════════════════
+# QUIZ CHANNEL (interactive quiz storage, organized by lecture)
+# ═══════════════════════════════════════════════════════════════
+# Post plain text in QUIZ_CHANNEL_ID to open/resume a lecture (that text
+# becomes the lecture's name), then post quiz polls one by one — each gets
+# filed under the currently-open lecture, in posting order. Post "-END" to
+# close the lecture. Users pick a closed lecture via /quiz and the bot
+# delivers the ORIGINAL polls via copy_messages (fresh, unattributed,
+# independently answerable — no send_poll(), no need to know the answer).
+QUIZ_INDEX_FILE = "quiz_index.json"
+
+def load_quiz_index():
+    if os.path.exists(QUIZ_INDEX_FILE):
+        with open(QUIZ_INDEX_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_quiz_index():
+    with open(QUIZ_INDEX_FILE, "w") as f:
+        json.dump(QUIZ_INDEX, f)
+
+QUIZ_INDEX: dict = load_quiz_index()  # lecture_name -> {"ids": [...], "closed": bool}
+
+QUIZ_STATE_FILE = "quiz_state.json"
+
+def load_quiz_state():
+    if os.path.exists(QUIZ_STATE_FILE):
+        with open(QUIZ_STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"current_lecture": None}
+
+def save_quiz_state():
+    with open(QUIZ_STATE_FILE, "w") as f:
+        json.dump(QUIZ_STATE, f)
+
+QUIZ_STATE: dict = load_quiz_state()  # survives restarts mid-lecture
 
 # ═══════════════════════════════════════════════════════════════
 # STATE
@@ -473,17 +517,12 @@ async def deliver_quiz(
 # ═══════════════════════════════════════════════════════════════
 def build_progress_text(items: list, latest_label: str = "") -> str:
     count   = len(items)
-    bar_len = 10
+    bar_len = 4   # smaller block = the bar fills up faster (2 items = 50% full)
 
-    # The old bar filled to 10 blocks and then just sat there full forever —
-    # useless feedback past item #10. Instead, cycle through blocks of 10:
-    # the bar always shows how far into the *current* block of 10 you are,
-    # and the milestone number (10, 20, 30…) climbs alongside it.
     if count == 0:
-        filled, milestone = 0, bar_len
+        filled = 0
     else:
         filled = count % bar_len or bar_len   # land on a full bar, not an empty one
-        milestone = ((count - 1) // bar_len + 1) * bar_len
     bar = "█" * filled + "░" * (bar_len - filled)
 
     type_counts = {"mcq": 0, "written": 0, "image": 0}
@@ -502,13 +541,11 @@ def build_progress_text(items: list, latest_label: str = "") -> str:
 
     text = (
         f"📄 <b>PDF Collection Mode</b>\n"
-        f"<code>{bar}</code> {count}/{milestone}\n"
+        f"<code>{bar}</code>\n"
         f"Collected: <b>{count}</b> item{'s' if count != 1 else ''}"
     )
     if breakdown:
         text += f"\n{' · '.join(breakdown)}"
-    if latest_label:
-        text += f"\n<i>Latest: {latest_label}</i>"
     return text
 
 async def update_progress(context, user_id: int, chat_id: int, latest_label: str = ""):
@@ -554,11 +591,7 @@ def export_keyboard():
 def start_menu_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📚 How To Use",     callback_data="menu_how"),
-            InlineKeyboardButton("🆕 Latest Updates", callback_data="menu_updates"),
-        ],
-        [
-            InlineKeyboardButton("📄 PDF Mode Guide", callback_data="menu_pdf"),
+            InlineKeyboardButton("📚 How To Use", callback_data="menu_how"),
         ],
     ])
 
@@ -585,40 +618,6 @@ HOW_TO_USE_TEXT = (
     "<b>5) PDF / DOCX Mode</b>\n"
     "Use /pdf_start, collect items, then export.\n\n"
     "😴 /sleep — mute the bot until /start"
-)
-
-LATEST_UPDATES_TEXT = (
-    "🆕 <b>Latest Updates — V5.4</b>\n\n"
-    "• 📖 <b>ex: explanation support</b> — add <code>ex: your explanation</code> "
-    "after answers to show it after answering the poll\n"
-    "• ✅ <b>Forwarded quiz correct answer</b> — re-sent polls now preserve "
-    "the correct answer and work outside PDF mode too\n"
-    "• ⚠️ <b>Format error messages</b> — bot tells you exactly what's wrong\n"
-    "• 📋 <b>Long question handling</b> — if Q is too long, sends text first then poll; "
-    "if both Q and answers are too long, shows A/B/C/D only in poll\n"
-    "• 🔥 Removed fire self-reaction\n"
-    "• 🎛 Clean start menu with inline buttons\n"
-    "• 📊 Live progress bar in PDF mode\n"
-    "• 📝 PDF + DOCX export both supported"
-    " ❤️ وأدعيلي دعوة حلوه ❤️\n" 
-)
-
-PDF_MODE_GUIDE_TEXT = (
-    "📄 <b>PDF Mode Guide</b>\n\n"
-    "<b>Step 1:</b> Send /pdf_start\n"
-    "<b>Step 2:</b> Type a file name when asked\n"
-    "<b>Step 3:</b> Send any of the following:\n\n"
-    "  ❓ MCQ questions (text format)\n"
-    "  📝 Written flashcards (dot format)\n"
-    "  📊 Forwarded Telegram quizzes/polls\n"
-    "  🖼 Images or comparison photos\n"
-    "  💬 Messages with spoiler text (||hidden||)\n\n"
-    "<b>Step 4:</b> Press <b>Export as PDF</b> or <b>Export as DOCX</b>\n\n"
-    "<b>Commands:</b>\n"
-    "• /pdf_start — start a new collection\n"
-    "• /pdf_clear — cancel and clear\n\n"
-    "<i>A live progress bar shows how many items are collected. "
-    "It updates in-place — no spam.</i>"
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -1217,6 +1216,89 @@ async def storage_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ═══════════════════════════════════════════════════════════════
+# QUIZ CHANNEL — AUTO-INDEXING
+# ═══════════════════════════════════════════════════════════════
+async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Indexes lectures + quiz polls posted in QUIZ_CHANNEL_ID."""
+    msg = update.channel_post or update.message
+    if not msg:
+        return
+
+    # ── A quiz poll — file it under the currently-open lecture ──
+    if msg.poll:
+        current = QUIZ_STATE.get("current_lecture")
+        if not current or current not in QUIZ_INDEX:
+            await context.bot.send_message(
+                QUIZ_CHANNEL_ID,
+                "⚠️ محتاج تبعت اسم المحاضرة الأول (أي رسالة نصية) قبل ما تبعت أسئلة."
+            )
+            return
+        QUIZ_INDEX[current]["ids"].append(msg.message_id)
+        save_quiz_index()
+        return
+
+    # ── Plain text: either "-END" or a new/resumed lecture name ─
+    if not msg.text:
+        return
+    text = msg.text.strip()
+
+    if text.upper() == "-END":
+        current = QUIZ_STATE.get("current_lecture")
+        if not current or current not in QUIZ_INDEX:
+            await context.bot.send_message(QUIZ_CHANNEL_ID, "⚠️ مفيش محاضرة مفتوحة دلوقتي.")
+            return
+        QUIZ_INDEX[current]["closed"] = True
+        save_quiz_index()
+        QUIZ_STATE["current_lecture"] = None
+        save_quiz_state()
+        count = len(QUIZ_INDEX[current]["ids"])
+        await context.bot.send_message(
+            QUIZ_CHANNEL_ID, f"✅ اتقفلت محاضرة <b>{current}</b> — {count} سؤال.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # New lecture name (or resuming one that already exists)
+    entry = QUIZ_INDEX.setdefault(text, {"ids": [], "closed": False})
+    entry["closed"] = False
+    save_quiz_index()
+    QUIZ_STATE["current_lecture"] = text
+    save_quiz_state()
+    await context.bot.send_message(
+        QUIZ_CHANNEL_ID,
+        f"🆕 <b>محاضرة: {text}</b>\nابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> لما تخلص.",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def quiz_channel_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Utility: forward any message from the quiz channel here first, then
+    run this command in the same DM — it reads the forward's source chat ID."""
+    fwd = update.message.forward_from_chat if update.message else None
+    if not fwd:
+        await update.message.reply_text(
+            "⚠️ فورورد أي رسالة من قناة الكويزات هنا الأول، وبعدين ابعت /quiz_channel_id تاني."
+        )
+        return
+    await update.message.reply_text(
+        f"🆔 Quiz channel ID: <code>{fwd.id}</code>", parse_mode=ParseMode.HTML
+    )
+
+async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User-facing: pick a closed lecture and get its quizzes as fresh polls."""
+    closed = sorted(name for name, v in QUIZ_INDEX.items() if v["closed"] and v["ids"])
+    if not closed:
+        await update.message.reply_text("📭 مفيش محاضرات متاحة دلوقتي.")
+        return
+    buttons = [
+        [InlineKeyboardButton(f"{name} ({len(QUIZ_INDEX[name]['ids'])})", callback_data=f"lecture:{i}")]
+        for i, name in enumerate(closed)
+    ]
+    await update.message.reply_text(
+        "🎓 <b>اختار المحاضرة:</b>", parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+# ═══════════════════════════════════════════════════════════════
 # TEXT MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1400,6 +1482,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
+    # ── LECTURE: deliver a closed lecture's quizzes as fresh polls ──
+    if query.data.startswith("lecture:"):
+        idx = int(query.data.split(":")[1])
+        closed = sorted(name for name, v in QUIZ_INDEX.items() if v["closed"] and v["ids"])
+        if idx >= len(closed):
+            await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
+            return
+        name = closed[idx]
+        ids  = QUIZ_INDEX[name]["ids"]
+
+        await query.edit_message_text(f"🎓 <b>{name}</b> — {len(ids)} سؤال جاري الإرسال...", parse_mode=ParseMode.HTML)
+        try:
+            for i in range(0, len(ids), 100):  # copy_messages caps at 100 per call
+                await context.bot.copy_messages(
+                    chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_ids=ids[i:i + 100],
+                )
+        except Exception as e:
+            print(f"Quiz delivery failed for lecture '{name}': {e}")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES)),
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
     # ── CLARIFY: manual correct-answer button tap ────────────────
     if query.data.startswith("clarify:"):
         _, item_index_str, choice_str = query.data.split(":")
@@ -1433,14 +1540,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── START MENU BUTTONS ──────────────────────────────────────
     if query.data == "menu_how":
         await query.message.reply_text(HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML)
-        return
-
-    if query.data == "menu_updates":
-        await query.message.reply_text(LATEST_UPDATES_TEXT, parse_mode=ParseMode.HTML)
-        return
-
-    if query.data == "menu_pdf":
-        await query.message.reply_text(PDF_MODE_GUIDE_TEXT, parse_mode=ParseMode.HTML)
         return
 
     # ── EXPORT BUTTONS ──────────────────────────────────────────
@@ -1819,9 +1918,21 @@ app.add_handler(CommandHandler("gallery_clear",  gallery_clear_cmd))
 app.add_handler(CommandHandler("next",           next_cmd))
 # Storage group setup helper
 app.add_handler(CommandHandler("storage_id",     storage_id_cmd))
+# Quiz channel
+app.add_handler(CommandHandler("quiz_channel_id", quiz_channel_id_cmd))
+app.add_handler(CommandHandler("quiz",            quiz_lectures_cmd))
 
-# Poll handler before text handler (forwarded OR own quiz polls)
-app.add_handler(MessageHandler(filters.POLL, handle_poll))
+# Poll handler before text handler (forwarded OR own quiz polls) —
+# excludes the quiz channel, which has its own dedicated handler below.
+app.add_handler(MessageHandler(filters.POLL & ~filters.Chat(QUIZ_CHANNEL_ID), handle_poll))
+
+# Quiz channel indexing — lecture titles, "-END", and quiz polls posted
+# there get filed by handle_quiz_channel_message, not treated as a user's
+# own quiz-building activity. Must be registered before the generic
+# text/poll handlers below.
+app.add_handler(MessageHandler(
+    filters.Chat(QUIZ_CHANNEL_ID) & (filters.POLL | filters.TEXT), handle_quiz_channel_message
+))
 
 # Storage group indexing — anything posted in the vault group gets filed by
 # its caption's password word. Must be checked before the generic photo
@@ -1843,9 +1954,9 @@ app.add_handler(MessageHandler(
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(PollHandler(poll_update_handler))
 
-# Text handler last — excludes the storage group
+# Text handler last — excludes the storage group and the quiz channel
 app.add_handler(MessageHandler(
-    filters.TEXT & ~filters.COMMAND & ~filters.Chat(STORAGE_GROUP_ID), handle
+    filters.TEXT & ~filters.COMMAND & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_ID), handle
 ))
 
 print("Bot running... V5.5")
