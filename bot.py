@@ -192,6 +192,72 @@ STORAGE_INDEX: dict = load_storage_index()
 # album gets filed as one item under one password.
 ALBUM_BUFFER: dict = {}
 
+# ── Durable backup: the local JSON files above are only a same-host cache.
+# A bot can't scan a channel's history, but it CAN always read a chat's
+# currently pinned message on demand — restart, redeploy, or host switch
+# doesn't matter. So we mirror USERS + STORAGE_INDEX into one pinned
+# message in the storage group itself, and rebuild the local cache from
+# it on startup if the local files are ever missing/wiped.
+STORAGE_BACKUP_MARKER     = "🗄 QUIZICIAN_STORAGE_BACKUP"
+STORAGE_BACKUP_STATE_FILE = "storage_backup_state.json"
+
+def load_storage_backup_state():
+    if os.path.exists(STORAGE_BACKUP_STATE_FILE):
+        with open(STORAGE_BACKUP_STATE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_storage_backup_state():
+    with open(STORAGE_BACKUP_STATE_FILE, "w") as f:
+        json.dump(STORAGE_BACKUP_STATE, f)
+
+STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
+
+async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
+    if not STORAGE_GROUP_ID:
+        return
+    payload = {"users": list(USERS), "storage_index": STORAGE_INDEX}
+    text    = STORAGE_BACKUP_MARKER + "\n" + json.dumps(payload)
+    if len(text) > 4000:
+        print("STORAGE BACKUP: payload too large for one message — skipped this round")
+        return
+
+    msg_id = STORAGE_BACKUP_STATE.get("backup_msg_id")
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(chat_id=STORAGE_GROUP_ID, message_id=msg_id, text=text)
+            return
+        except Exception:
+            pass  # backup message gone — fall through and resend
+
+    try:
+        sent = await context.bot.send_message(chat_id=STORAGE_GROUP_ID, text=text)
+        await context.bot.pin_chat_message(chat_id=STORAGE_GROUP_ID, message_id=sent.message_id, disable_notification=True)
+        STORAGE_BACKUP_STATE["backup_msg_id"] = sent.message_id
+        save_storage_backup_state()
+    except Exception as e:
+        print("STORAGE BACKUP ERROR:", e)
+
+async def restore_storage_from_channel(app):
+    """Runs once on startup — rebuilds USERS + STORAGE_INDEX from the
+    storage group's pinned backup if the local cache is missing/stale."""
+    if not STORAGE_GROUP_ID:
+        return
+    try:
+        chat   = await app.bot.get_chat(STORAGE_GROUP_ID)
+        pinned = chat.pinned_message
+        if pinned and pinned.text and pinned.text.startswith(STORAGE_BACKUP_MARKER):
+            payload = json.loads(pinned.text.split("\n", 1)[1])
+            USERS.update(payload.get("users", []))
+            STORAGE_INDEX.update(payload.get("storage_index", {}))
+            save_users()
+            save_storage_index()
+            STORAGE_BACKUP_STATE["backup_msg_id"] = pinned.message_id
+            save_storage_backup_state()
+            print(f"Restored storage backup: {len(USERS)} user(s), {len(STORAGE_INDEX)} password(s).")
+    except Exception as e:
+        print("STORAGE RESTORE ERROR:", e)
+
 # ═══════════════════════════════════════════════════════════════
 # QUIZ CHANNEL (interactive quiz storage, organized by lecture)
 # ═══════════════════════════════════════════════════════════════
@@ -246,6 +312,72 @@ def save_quiz_poll_status():
 # only allows copying a quiz poll once its correct answer is known, i.e.
 # once it's been stopped, so this is what /quiz delivery checks against.
 QUIZ_POLL_STATUS: dict = load_quiz_poll_status()
+
+# ── Durable backup: same pinned-message trick as the storage group, so
+# the lecture/quiz index survives a host switch or wiped local disk —
+# only the local JSON cache is fragile, the channel content itself never
+# was.
+QUIZ_BACKUP_MARKER     = "🗄 QUIZICIAN_QUIZ_BACKUP"
+QUIZ_BACKUP_STATE_FILE = "quiz_backup_state.json"
+
+def load_quiz_backup_state():
+    if os.path.exists(QUIZ_BACKUP_STATE_FILE):
+        with open(QUIZ_BACKUP_STATE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_quiz_backup_state():
+    with open(QUIZ_BACKUP_STATE_FILE, "w") as f:
+        json.dump(QUIZ_BACKUP_STATE, f)
+
+QUIZ_BACKUP_STATE: dict = load_quiz_backup_state()  # {"backup_msg_id": int}
+
+async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE):
+    if not QUIZ_CHANNEL_ID:
+        return
+    payload = {"quiz_index": QUIZ_INDEX, "quiz_state": QUIZ_STATE, "quiz_poll_status": QUIZ_POLL_STATUS}
+    text    = QUIZ_BACKUP_MARKER + "\n" + json.dumps(payload)
+    if len(text) > 4000:
+        print("QUIZ BACKUP: payload too large for one message — skipped this round")
+        return
+
+    msg_id = QUIZ_BACKUP_STATE.get("backup_msg_id")
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(chat_id=QUIZ_CHANNEL_ID, message_id=msg_id, text=text)
+            return
+        except Exception:
+            pass  # backup message gone — fall through and resend
+
+    try:
+        sent = await context.bot.send_message(chat_id=QUIZ_CHANNEL_ID, text=text)
+        await context.bot.pin_chat_message(chat_id=QUIZ_CHANNEL_ID, message_id=sent.message_id, disable_notification=True)
+        QUIZ_BACKUP_STATE["backup_msg_id"] = sent.message_id
+        save_quiz_backup_state()
+    except Exception as e:
+        print("QUIZ BACKUP ERROR:", e)
+
+async def restore_quiz_from_channel(app):
+    """Runs once on startup — rebuilds the lecture/quiz index from the quiz
+    channel's pinned backup if the local cache is missing/stale."""
+    if not QUIZ_CHANNEL_ID:
+        return
+    try:
+        chat   = await app.bot.get_chat(QUIZ_CHANNEL_ID)
+        pinned = chat.pinned_message
+        if pinned and pinned.text and pinned.text.startswith(QUIZ_BACKUP_MARKER):
+            payload = json.loads(pinned.text.split("\n", 1)[1])
+            QUIZ_INDEX.update(payload.get("quiz_index", {}))
+            QUIZ_STATE.update(payload.get("quiz_state", {}))
+            QUIZ_POLL_STATUS.update(payload.get("quiz_poll_status", {}))
+            save_quiz_index()
+            save_quiz_state()
+            save_quiz_poll_status()
+            QUIZ_BACKUP_STATE["backup_msg_id"] = pinned.message_id
+            save_quiz_backup_state()
+            print(f"Restored quiz backup: {len(QUIZ_INDEX)} lecture(s).")
+    except Exception as e:
+        print("QUIZ RESTORE ERROR:", e)
 
 # ═══════════════════════════════════════════════════════════════
 # STATE
@@ -1206,6 +1338,7 @@ async def _finalize_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: st
         )
         return
     password = _index_item(caption, buf["ids"])
+    await backup_storage_to_channel(context)
     await context.bot.send_message(
         STORAGE_GROUP_ID,
         f"✅ اتخزن ألبوم من {len(buf['ids'])} ملف تحت الكلمة: <code>{password}</code>\n"
@@ -1236,6 +1369,7 @@ async def handle_storage_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     password = _index_item(caption, [msg.message_id])
+    await backup_storage_to_channel(context)
     await msg.reply_text(
         f"✅ اتخزن تحت الكلمة: <code>{password}</code>\n"
         f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
@@ -1273,6 +1407,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         # known before a quiz poll can be copied at all).
         QUIZ_POLL_STATUS[msg.poll.id] = {"lecture": current, "message_id": msg.message_id, "closed": msg.poll.is_closed}
         save_quiz_poll_status()
+        await backup_quiz_to_channel(context)
 
         if not msg.poll.is_closed:
             try:
@@ -1298,6 +1433,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         save_quiz_index()
         QUIZ_STATE["current_lecture"] = None
         save_quiz_state()
+        await backup_quiz_to_channel(context)
         count = len(QUIZ_INDEX[current]["ids"])
         open_count = sum(
             1 for p in QUIZ_POLL_STATUS.values()
@@ -1330,6 +1466,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
     save_quiz_index()
     QUIZ_STATE["current_lecture"] = text
     save_quiz_state()
+    await backup_quiz_to_channel(context)
     await context.bot.send_message(
         QUIZ_CHANNEL_ID,
         f"🆕 <b>{subject}: {name}</b>\nابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> لما تخلص.\n"
@@ -1401,6 +1538,7 @@ async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for pid in stale_polls:
         QUIZ_POLL_STATUS.pop(pid, None)
     save_quiz_poll_status()
+    await backup_quiz_to_channel(context)
     await update.message.reply_text(
         f"🗑 اتشالت محاضرة: {removed['subject']}: {removed['name']}\n"
         "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)"
@@ -1686,6 +1824,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 QUIZ_INDEX.pop(lecture_key, None)  # whole lecture was deleted — drop it
             save_quiz_index()
             save_quiz_poll_status()
+            await backup_quiz_to_channel(context)
 
         if delivered == 0 and not_ready_cnt == 0:
             await context.bot.send_message(
@@ -1865,6 +2004,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in USERS:
         USERS.add(chat_id)
         save_users()
+        await backup_storage_to_channel(context)
 
     await update.message.reply_text(
         "❤️<b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b>\n"
@@ -1952,6 +2092,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for uid in blocked:
             USERS.discard(uid)
         save_users()
+        await backup_storage_to_channel(context)
 
     summary = (
         f"✅ <b>Broadcast اتبعت!</b>\n\n"
@@ -2096,7 +2237,15 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+async def _post_init(app):
+    """Runs once after the bot connects, before polling starts — restores
+    the storage-group and quiz-channel indexes from their pinned backup
+    messages, so a wiped/switched local disk doesn't orphan content that's
+    still sitting safely in the channels themselves."""
+    await restore_storage_from_channel(app)
+    await restore_quiz_from_channel(app)
+
+app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
 app.add_handler(CommandHandler("start",          start))
 app.add_handler(CommandHandler("sleep",          sleep_cmd))
