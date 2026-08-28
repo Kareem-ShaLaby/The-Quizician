@@ -8,7 +8,7 @@ import html
 import tempfile
 from io import BytesIO
 
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile, InputMediaDocument
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -59,7 +59,7 @@ if os.path.exists(_POPPINS_REG) and os.path.exists(_POPPINS_BOLD):
     except Exception as e:
         print(f"Poppins load error: {e} — using Helvetica")
 else:
-    print("goodluck idiot Poppins not found — using Helvetica")
+    print("Poppins not found — using Helvetica")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — never hardcode it
 
@@ -217,21 +217,32 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
     if not STORAGE_GROUP_ID:
         return
     payload = {"users": list(USERS), "storage_index": STORAGE_INDEX}
-    text    = STORAGE_BACKUP_MARKER + "\n" + json.dumps(payload)
-    if len(text) > 4000:
-        print("STORAGE BACKUP: payload too large for one message — skipped this round")
-        return
+    data    = json.dumps(payload).encode("utf-8")
+    # A pinned document instead of a pinned text message: Bot API caps
+    # documents at 50MB vs ~4KB for a text message — effectively removes
+    # the size ceiling for any realistic amount of data this bot handles.
+    filename = "quizician_storage_backup.json"
 
     msg_id = STORAGE_BACKUP_STATE.get("backup_msg_id")
     if msg_id:
         try:
-            await context.bot.edit_message_text(chat_id=STORAGE_GROUP_ID, message_id=msg_id, text=text)
+            await context.bot.edit_message_media(
+                chat_id=STORAGE_GROUP_ID, message_id=msg_id,
+                media=InputMediaDocument(
+                    media=InputFile(BytesIO(data), filename=filename),
+                    caption=STORAGE_BACKUP_MARKER,
+                ),
+            )
             return
         except Exception:
             pass  # backup message gone — fall through and resend
 
     try:
-        sent = await context.bot.send_message(chat_id=STORAGE_GROUP_ID, text=text)
+        sent = await context.bot.send_document(
+            chat_id=STORAGE_GROUP_ID,
+            document=InputFile(BytesIO(data), filename=filename),
+            caption=STORAGE_BACKUP_MARKER,
+        )
         await context.bot.pin_chat_message(chat_id=STORAGE_GROUP_ID, message_id=sent.message_id, disable_notification=True)
         STORAGE_BACKUP_STATE["backup_msg_id"] = sent.message_id
         save_storage_backup_state()
@@ -246,8 +257,10 @@ async def restore_storage_from_channel(app):
     try:
         chat   = await app.bot.get_chat(STORAGE_GROUP_ID)
         pinned = chat.pinned_message
-        if pinned and pinned.text and pinned.text.startswith(STORAGE_BACKUP_MARKER):
-            payload = json.loads(pinned.text.split("\n", 1)[1])
+        if pinned and pinned.document and (pinned.caption or "") == STORAGE_BACKUP_MARKER:
+            tg_file = await app.bot.get_file(pinned.document.file_id)
+            raw     = await tg_file.download_as_bytearray()
+            payload = json.loads(bytes(raw).decode("utf-8"))
             USERS.update(payload.get("users", []))
             STORAGE_INDEX.update(payload.get("storage_index", {}))
             save_users()
@@ -335,22 +348,30 @@ QUIZ_BACKUP_STATE: dict = load_quiz_backup_state()  # {"backup_msg_id": int}
 async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE):
     if not QUIZ_CHANNEL_ID:
         return
-    payload = {"quiz_index": QUIZ_INDEX, "quiz_state": QUIZ_STATE, "quiz_poll_status": QUIZ_POLL_STATUS}
-    text    = QUIZ_BACKUP_MARKER + "\n" + json.dumps(payload)
-    if len(text) > 4000:
-        print("QUIZ BACKUP: payload too large for one message — skipped this round")
-        return
+    payload  = {"quiz_index": QUIZ_INDEX, "quiz_state": QUIZ_STATE, "quiz_poll_status": QUIZ_POLL_STATUS}
+    data     = json.dumps(payload).encode("utf-8")
+    filename = "quizician_quiz_backup.json"
 
     msg_id = QUIZ_BACKUP_STATE.get("backup_msg_id")
     if msg_id:
         try:
-            await context.bot.edit_message_text(chat_id=QUIZ_CHANNEL_ID, message_id=msg_id, text=text)
+            await context.bot.edit_message_media(
+                chat_id=QUIZ_CHANNEL_ID, message_id=msg_id,
+                media=InputMediaDocument(
+                    media=InputFile(BytesIO(data), filename=filename),
+                    caption=QUIZ_BACKUP_MARKER,
+                ),
+            )
             return
         except Exception:
             pass  # backup message gone — fall through and resend
 
     try:
-        sent = await context.bot.send_message(chat_id=QUIZ_CHANNEL_ID, text=text)
+        sent = await context.bot.send_document(
+            chat_id=QUIZ_CHANNEL_ID,
+            document=InputFile(BytesIO(data), filename=filename),
+            caption=QUIZ_BACKUP_MARKER,
+        )
         await context.bot.pin_chat_message(chat_id=QUIZ_CHANNEL_ID, message_id=sent.message_id, disable_notification=True)
         QUIZ_BACKUP_STATE["backup_msg_id"] = sent.message_id
         save_quiz_backup_state()
@@ -365,8 +386,10 @@ async def restore_quiz_from_channel(app):
     try:
         chat   = await app.bot.get_chat(QUIZ_CHANNEL_ID)
         pinned = chat.pinned_message
-        if pinned and pinned.text and pinned.text.startswith(QUIZ_BACKUP_MARKER):
-            payload = json.loads(pinned.text.split("\n", 1)[1])
+        if pinned and pinned.document and (pinned.caption or "") == QUIZ_BACKUP_MARKER:
+            tg_file = await app.bot.get_file(pinned.document.file_id)
+            raw     = await tg_file.download_as_bytearray()
+            payload = json.loads(bytes(raw).decode("utf-8"))
             QUIZ_INDEX.update(payload.get("quiz_index", {}))
             QUIZ_STATE.update(payload.get("quiz_state", {}))
             QUIZ_POLL_STATUS.update(payload.get("quiz_poll_status", {}))
@@ -1382,6 +1405,20 @@ async def storage_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 Chat ID: <code>{update.effective_chat.id}</code>", parse_mode=ParseMode.HTML
     )
 
+async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: force-create/refresh both pinned backups right now, instead of
+    waiting for the next real change."""
+    if not is_admin(update):
+        await update.message.reply_text("🚫 للأدمن فقط")
+        return
+    await backup_storage_to_channel(context)
+    await backup_quiz_to_channel(context)
+    await update.message.reply_text(
+        "✅ اتعمل باك أب دلوقتي.\n"
+        f"📌 Storage group: {'تم' if STORAGE_BACKUP_STATE.get('backup_msg_id') else 'مش متظبط STORAGE_GROUP_ID'}\n"
+        f"📌 Quiz channel: {'تم' if QUIZ_BACKUP_STATE.get('backup_msg_id') else 'مش متظبط QUIZ_CHANNEL_ID'}"
+    )
+
 # ═══════════════════════════════════════════════════════════════
 # QUIZ CHANNEL — AUTO-INDEXING
 # ═══════════════════════════════════════════════════════════════
@@ -2264,6 +2301,7 @@ app.add_handler(CommandHandler("gallery_clear",  gallery_clear_cmd))
 app.add_handler(CommandHandler("next",           next_cmd))
 # Storage group setup helper
 app.add_handler(CommandHandler("storage_id",     storage_id_cmd))
+app.add_handler(CommandHandler("backup_now",     backup_now_cmd))
 # Quiz channel
 app.add_handler(CommandHandler("quiz_channel_id", quiz_channel_id_cmd))
 app.add_handler(CommandHandler("quiz",            quiz_lectures_cmd))
