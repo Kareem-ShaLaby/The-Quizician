@@ -87,6 +87,18 @@ STORAGE_GROUP_ID = -1004447646576
 #    then send /quiz_channel_id right after — the bot replies with the ID.
 QUIZ_CHANNEL_ID = -1004447646577   # ← CHANGE THIS
 
+# ── Curriculum structure for the quiz channel ─────────────────────
+# Add new modules/subjects here as they come up. Lecture titles posted in
+# the quiz channel must be formatted as:
+#   "<Module> - <Subject> Lecture <number>: <name>"
+#   e.g. "Endocrine - Physio Lecture 3: Insulin Signaling"
+# Matching against this dict is case-insensitive; the canonical spelling
+# below is what gets stored/displayed.
+MODULES = {
+    "Endocrine":      ["Bio", "Physio", "Patho", "Histo", "Pharma"],
+    "Genitourinary":  ["Anatomy", "Physio", "Histo", "Patho", "Micro"],
+}
+
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — The Quizician's cat friend 🐾
 # ═══════════════════════════════════════════════════════════════
@@ -305,16 +317,24 @@ def save_quiz_index():
     with open(QUIZ_INDEX_FILE, "w") as f:
         json.dump(QUIZ_INDEX, f)
 
-QUIZ_INDEX: dict = load_quiz_index()  # lecture_name -> {"ids": [...], "closed": bool, "subject": str, "name": str}
+QUIZ_INDEX: dict = load_quiz_index()  # lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}
 
 def normalize_quiz_index():
-    """Backfill 'subject'/'name' on entries created before those fields
-    existed (old local quiz_index.json, or an old pinned backup) — without
-    this, any code reading v["subject"] KeyErrors on legacy entries."""
+    """Backfill fields on entries created before this module/subject/lecture
+    structure existed (old local quiz_index.json, or an old pinned backup) —
+    without this, any code reading v["module"]/v["subject"] KeyErrors on
+    legacy entries. Old entries get filed under a "Legacy" module so they
+    still show up in /quiz instead of silently vanishing."""
     changed = False
     for key, v in QUIZ_INDEX.items():
+        if "module" not in v:
+            v["module"] = "Legacy"
+            changed = True
         if "subject" not in v:
             v["subject"] = "General"
+            changed = True
+        if "lecture_number" not in v:
+            v["lecture_number"] = ""
             changed = True
         if "name" not in v:
             v["name"] = key
@@ -323,6 +343,59 @@ def normalize_quiz_index():
         save_quiz_index()
 
 normalize_quiz_index()
+
+# Matches "<Subject> Lecture <number>", e.g. "Physio Lecture 3"
+_LECTURE_TITLE_RE = re.compile(r"^(.*?)\s+Lecture\s+(\d+)\s*$", re.IGNORECASE)
+
+def parse_lecture_title(text: str):
+    """Parses "<Module> - <Subject> Lecture <number>: <name>" against the
+    MODULES curriculum. Returns (module, subject, lecture_number, name) on
+    success, or (None, None, None, error_message) on failure — matching is
+    case-insensitive but the canonical spelling from MODULES is returned."""
+    if " - " not in text or ":" not in text:
+        return None, None, None, (
+            "⚠️ الصيغة غلط. لازم تكون:\n"
+            "<code>Module - Subject Lecture Number: Name</code>\n"
+            "مثال: <code>Endocrine - Physio Lecture 3: Insulin Signaling</code>"
+        )
+    module_part, rest = text.split(" - ", 1)
+    subj_lec_part, name = rest.split(":", 1)
+    module_part, subj_lec_part, name = module_part.strip(), subj_lec_part.strip(), name.strip()
+
+    module_match = next((m for m in MODULES if m.lower() == module_part.lower()), None)
+    if not module_match:
+        valid = ", ".join(MODULES.keys())
+        return None, None, None, f"⚠️ الموديول \"{module_part}\" مش معروف. الموديولات المتاحة: {valid}"
+
+    m = _LECTURE_TITLE_RE.match(subj_lec_part)
+    if not m:
+        return None, None, None, (
+            "⚠️ الصيغة غلط بعد اسم الموديول. لازم تكون:\n"
+            "<code>Subject Lecture Number</code>\n"
+            "مثال: <code>Physio Lecture 3</code>"
+        )
+    subject_part, lecture_number = m.group(1).strip(), m.group(2).strip()
+    subject_match = next((s for s in MODULES[module_match] if s.lower() == subject_part.lower()), None)
+    if not subject_match:
+        valid = ", ".join(MODULES[module_match])
+        return None, None, None, f"⚠️ المادة \"{subject_part}\" مش من موديول {module_match}. المواد المتاحة: {valid}"
+
+    return module_match, subject_match, lecture_number, name
+
+def ready_modules():
+    return sorted({v["module"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
+
+def ready_subjects(module: str):
+    return sorted({
+        v["subject"] for v in QUIZ_INDEX.values()
+        if v["closed"] and v["ids"] and v["module"] == module
+    })
+
+def ready_lecture_keys(module: str, subject: str):
+    return [
+        name for name, v in QUIZ_INDEX.items()
+        if v["closed"] and v["ids"] and v["module"] == module and v["subject"] == subject
+    ]  # insertion order = numbering order
 
 QUIZ_STATE_FILE = "quiz_state.json"
 
@@ -1529,24 +1602,30 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         return
 
     # New lecture name (or resuming one that already exists).
-    # Format: "Subject: Name" — no colon means subject defaults to "General".
-    if ":" in text:
-        subject, name = text.split(":", 1)
-        subject, name = subject.strip(), name.strip()
-    else:
-        subject, name = "General", text
+    # Format: "<Module> - <Subject> Lecture <number>: <name>"
+    module, subject, lecture_number, name_or_error = parse_lecture_title(text)
+    if module is None:
+        await context.bot.send_message(QUIZ_CHANNEL_ID, name_or_error, parse_mode=ParseMode.HTML)
+        return
+    name = name_or_error
 
-    entry = QUIZ_INDEX.setdefault(text, {"ids": [], "closed": False, "subject": subject, "name": name})
-    entry["closed"]  = False
-    entry["subject"] = subject
-    entry["name"]    = name
+    entry = QUIZ_INDEX.setdefault(text, {
+        "ids": [], "closed": False,
+        "module": module, "subject": subject, "lecture_number": lecture_number, "name": name,
+    })
+    entry["closed"]         = False
+    entry["module"]         = module
+    entry["subject"]        = subject
+    entry["lecture_number"] = lecture_number
+    entry["name"]           = name
     save_quiz_index()
     QUIZ_STATE["current_lecture"] = text
     save_quiz_state()
     await backup_quiz_to_channel(context)
     await context.bot.send_message(
         QUIZ_CHANNEL_ID,
-        f"🆕 <b>{subject}: {name}</b>\nابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> لما تخلص.\n"
+        f"🆕 <b>{module} - {subject} Lecture {lecture_number}: {name}</b>\n"
+        f"ابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> لما تخلص.\n"
         f"⚠️ لازم توقف كل سؤال (Stop Poll) قبل الـ -END عشان يبقى قابل للإرسال.",
         parse_mode=ParseMode.HTML,
     )
@@ -1565,14 +1644,14 @@ async def quiz_channel_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User-facing: pick a subject, then a lecture, and get its ready quizzes."""
-    subjects = sorted({v["subject"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
-    if not subjects:
+    """User-facing: pick a module, then a subject, then a lecture."""
+    modules = ready_modules()
+    if not modules:
         await update.message.reply_text("📭 مفيش محاضرات متاحة دلوقتي.")
         return
-    buttons = [[InlineKeyboardButton(s, callback_data=f"subject:{i}")] for i, s in enumerate(subjects)]
+    buttons = [[InlineKeyboardButton(m, callback_data=f"module:{i}")] for i, m in enumerate(modules)]
     await update.message.reply_text(
-        "📚 <b>اختار المادة:</b>", parse_mode=ParseMode.HTML,
+        "📚 <b>اختار الموديول:</b>", parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -1587,7 +1666,8 @@ async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 <b>كل المحاضرات:</b>"]
     for i, (key, v) in enumerate(QUIZ_INDEX.items(), 1):
         status = "✅ مقفولة" if v["closed"] else "🟡 لسه مفتوحة"
-        lines.append(f"{i}. {v['subject']}: {v['name']} — {len(v['ids'])} سؤال — {status}")
+        lecnum = f" {v['lecture_number']}" if v.get("lecture_number") else ""
+        lines.append(f"{i}. {v['module']} - {v['subject']} Lecture{lecnum}: {v['name']} — {len(v['ids'])} سؤال — {status}")
     lines.append("\nاستخدم /quiz_delete &lt;رقم&gt; للحذف")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -1617,7 +1697,7 @@ async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_quiz_poll_status()
     await backup_quiz_to_channel(context)
     await update.message.reply_text(
-        f"🗑 اتشالت محاضرة: {removed['subject']}: {removed['name']}\n"
+        f"🗑 اتشالت محاضرة: {removed['module']} - {removed['subject']}: {removed['name']}\n"
         "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)"
     )
 
@@ -1805,59 +1885,84 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
-    # ── QUIZ SUBJECTS: top-level list ─────────────────────────────
-    if query.data == "quiz_subjects":
-        subjects = sorted({v["subject"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
-        if not subjects:
+    # ── QUIZ MODULES: top-level list ──────────────────────────────
+    if query.data == "quiz_modules":
+        modules = ready_modules()
+        if not modules:
             await query.edit_message_text("📭 مفيش محاضرات متاحة دلوقتي.")
             return
-        buttons = [[InlineKeyboardButton(s, callback_data=f"subject:{i}")] for i, s in enumerate(subjects)]
+        buttons = [[InlineKeyboardButton(m, callback_data=f"module:{i}")] for i, m in enumerate(modules)]
         await query.edit_message_text(
-            "📚 <b>اختار المادة:</b>", parse_mode=ParseMode.HTML,
+            "📚 <b>اختار الموديول:</b>", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
 
-    # ── QUIZ SUBJECT: list lectures within one subject ────────────
+    # ── QUIZ MODULE: list subjects within one module ───────────────
+    if query.data.startswith("module:") and query.data.count(":") == 1:
+        mod_idx = int(query.data.split(":")[1])
+        modules = ready_modules()
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(module)
+        buttons = [
+            [InlineKeyboardButton(s, callback_data=f"subject:{mod_idx}:{i}")]
+            for i, s in enumerate(subjects)
+        ]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data="quiz_modules")])
+        await query.edit_message_text(
+            f"🎓 <b>{module}</b> — اختار المادة:", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── QUIZ SUBJECT: list lectures within one module + subject ────
     if query.data.startswith("subject:"):
-        subj_idx = int(query.data.split(":")[1])
-        subjects = sorted({v["subject"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
+        _, mod_idx_str, subj_idx_str = query.data.split(":")
+        mod_idx, subj_idx = int(mod_idx_str), int(subj_idx_str)
+        modules = ready_modules()
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(module)
         if subj_idx >= len(subjects):
             await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
             return
         subject = subjects[subj_idx]
-        names = [
-            name for name, v in QUIZ_INDEX.items()
-            if v["closed"] and v["ids"] and v["subject"] == subject
-        ]  # insertion order = numbering order
+        names = ready_lecture_keys(module, subject)
         buttons = [
             [InlineKeyboardButton(
-                f"Lecture {i + 1} - {subject}: {QUIZ_INDEX[name]['name']}",
-                callback_data=f"lecture:{subj_idx}:{i}",
+                f"Lecture {QUIZ_INDEX[name]['lecture_number'] or (i + 1)}: {QUIZ_INDEX[name]['name']}",
+                callback_data=f"lecture:{mod_idx}:{subj_idx}:{i}",
             )]
             for i, name in enumerate(names)
         ]
-        buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data="quiz_subjects")])
+        buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"module:{mod_idx}")])
         await query.edit_message_text(
-            f"🎓 <b>{subject}</b>", parse_mode=ParseMode.HTML,
+            f"🎓 <b>{module} - {subject}</b>", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
 
     # ── LECTURE: deliver a closed lecture's ready quizzes ─────────
     if query.data.startswith("lecture:"):
-        _, subj_idx_str, lec_idx_str = query.data.split(":")
-        subj_idx, lec_idx = int(subj_idx_str), int(lec_idx_str)
+        _, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
 
-        subjects = sorted({v["subject"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
+        modules = ready_modules()
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(module)
         if subj_idx >= len(subjects):
             await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
             return
         subject = subjects[subj_idx]
-        names = [
-            name for name, v in QUIZ_INDEX.items()
-            if v["closed"] and v["ids"] and v["subject"] == subject
-        ]
+        names = ready_lecture_keys(module, subject)
         if lec_idx >= len(names):
             await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
             return
@@ -1873,7 +1978,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         not_ready_cnt = len(ids) - len(ready_ids)
 
         await query.edit_message_text(
-            f"🎓 <b>{subject}: {entry['name']}</b> — جاري إرسال {len(ready_ids)} سؤال...",
+            f"🎓 <b>{module} - {subject}: {entry['name']}</b> — جاري إرسال {len(ready_ids)} سؤال...",
             parse_mode=ParseMode.HTML,
         )
 
