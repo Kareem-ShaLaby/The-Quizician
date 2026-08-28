@@ -70,7 +70,7 @@ IMG_BASE_DIR = os.path.join(tempfile.gettempdir(), "quizician_imgs")
 
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
-ADMIN_ID = 123456789   # ← CHANGE THIS
+ADMIN_ID = 940770584
 
 # ── Replace with your private GROUP's chat ID ────────────────────
 # 1. Create the group, add this bot to it as a member (admin not required
@@ -243,11 +243,21 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
             document=InputFile(BytesIO(data), filename=filename),
             caption=STORAGE_BACKUP_MARKER,
         )
-        await context.bot.pin_chat_message(chat_id=STORAGE_GROUP_ID, message_id=sent.message_id, disable_notification=True)
-        STORAGE_BACKUP_STATE["backup_msg_id"] = sent.message_id
-        save_storage_backup_state()
     except Exception as e:
         print("STORAGE BACKUP ERROR:", e)
+        return
+
+    # Save the message id immediately — pinning is a nice-to-have on top,
+    # and its failure (e.g. bot isn't admin / lacks pin rights) must NOT
+    # stop us from remembering this message so future calls can edit it
+    # instead of sending a new document every time.
+    STORAGE_BACKUP_STATE["backup_msg_id"] = sent.message_id
+    save_storage_backup_state()
+
+    try:
+        await context.bot.pin_chat_message(chat_id=STORAGE_GROUP_ID, message_id=sent.message_id, disable_notification=True)
+    except Exception as e:
+        print("STORAGE BACKUP PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
 
 async def restore_storage_from_channel(app):
     """Runs once on startup — rebuilds USERS + STORAGE_INDEX from the
@@ -372,11 +382,20 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE):
             document=InputFile(BytesIO(data), filename=filename),
             caption=QUIZ_BACKUP_MARKER,
         )
-        await context.bot.pin_chat_message(chat_id=QUIZ_CHANNEL_ID, message_id=sent.message_id, disable_notification=True)
-        QUIZ_BACKUP_STATE["backup_msg_id"] = sent.message_id
-        save_quiz_backup_state()
     except Exception as e:
         print("QUIZ BACKUP ERROR:", e)
+        return
+
+    # Same fix as storage backup: persist the message id regardless of
+    # whether pinning succeeds, so we don't resend a fresh document on
+    # every single addition.
+    QUIZ_BACKUP_STATE["backup_msg_id"] = sent.message_id
+    save_quiz_backup_state()
+
+    try:
+        await context.bot.pin_chat_message(chat_id=QUIZ_CHANNEL_ID, message_id=sent.message_id, disable_notification=True)
+    except Exception as e:
+        print("QUIZ BACKUP PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
 
 async def restore_quiz_from_channel(app):
     """Runs once on startup — rebuilds the lecture/quiz index from the quiz
