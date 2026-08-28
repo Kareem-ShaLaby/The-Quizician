@@ -59,7 +59,7 @@ if os.path.exists(_POPPINS_REG) and os.path.exists(_POPPINS_BOLD):
     except Exception as e:
         print(f"Poppins load error: {e} — using Helvetica")
 else:
-    print("Poppins not found — using Helvetica")
+    print("goodluck idiot Poppins not found — using Helvetica")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — never hardcode it
 
