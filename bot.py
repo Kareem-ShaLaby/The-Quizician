@@ -234,8 +234,11 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
                 ),
             )
             return
-        except Exception:
-            pass  # backup message gone — fall through and resend
+        except Exception as e:
+            # Don't silently assume "message gone" — log it. If this keeps
+            # firing every time, the printed error is the actual reason
+            # (permissions, stale id, etc.) instead of a guess.
+            print("STORAGE BACKUP EDIT FAILED — falling back to resend:", repr(e))
 
     try:
         sent = await context.bot.send_document(
@@ -302,7 +305,24 @@ def save_quiz_index():
     with open(QUIZ_INDEX_FILE, "w") as f:
         json.dump(QUIZ_INDEX, f)
 
-QUIZ_INDEX: dict = load_quiz_index()  # lecture_name -> {"ids": [...], "closed": bool}
+QUIZ_INDEX: dict = load_quiz_index()  # lecture_name -> {"ids": [...], "closed": bool, "subject": str, "name": str}
+
+def normalize_quiz_index():
+    """Backfill 'subject'/'name' on entries created before those fields
+    existed (old local quiz_index.json, or an old pinned backup) — without
+    this, any code reading v["subject"] KeyErrors on legacy entries."""
+    changed = False
+    for key, v in QUIZ_INDEX.items():
+        if "subject" not in v:
+            v["subject"] = "General"
+            changed = True
+        if "name" not in v:
+            v["name"] = key
+            changed = True
+    if changed:
+        save_quiz_index()
+
+normalize_quiz_index()
 
 QUIZ_STATE_FILE = "quiz_state.json"
 
@@ -373,8 +393,8 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE):
                 ),
             )
             return
-        except Exception:
-            pass  # backup message gone — fall through and resend
+        except Exception as e:
+            print("QUIZ BACKUP EDIT FAILED — falling back to resend:", repr(e))
 
     try:
         sent = await context.bot.send_document(
@@ -412,6 +432,7 @@ async def restore_quiz_from_channel(app):
             QUIZ_INDEX.update(payload.get("quiz_index", {}))
             QUIZ_STATE.update(payload.get("quiz_state", {}))
             QUIZ_POLL_STATUS.update(payload.get("quiz_poll_status", {}))
+            normalize_quiz_index()
             save_quiz_index()
             save_quiz_state()
             save_quiz_poll_status()
