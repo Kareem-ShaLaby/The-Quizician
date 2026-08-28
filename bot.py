@@ -85,7 +85,7 @@ STORAGE_GROUP_ID = -1004447646576
 #    rights for the bot to receive posts at all).
 # 2. Forward any message from that channel to the bot in a private DM,
 #    then send /quiz_channel_id right after — the bot replies with the ID.
-QUIZ_CHANNEL_ID = -1004402622263   # ← CHANGE THIS
+QUIZ_CHANNEL_ID = -1004447646577   # ← CHANGE THIS
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — The Quizician's cat friend 🐾
@@ -228,6 +228,24 @@ def save_quiz_state():
         json.dump(QUIZ_STATE, f)
 
 QUIZ_STATE: dict = load_quiz_state()  # survives restarts mid-lecture
+
+QUIZ_POLL_STATUS_FILE = "quiz_poll_status.json"
+
+def load_quiz_poll_status():
+    if os.path.exists(QUIZ_POLL_STATUS_FILE):
+        with open(QUIZ_POLL_STATUS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_quiz_poll_status():
+    with open(QUIZ_POLL_STATUS_FILE, "w") as f:
+        json.dump(QUIZ_POLL_STATUS, f)
+
+# poll_id -> {"lecture": str, "message_id": int, "closed": bool}
+# Tracks whether each quiz-channel poll has been stopped yet — Telegram
+# only allows copying a quiz poll once its correct answer is known, i.e.
+# once it's been stopped, so this is what /quiz delivery checks against.
+QUIZ_POLL_STATUS: dict = load_quiz_poll_status()
 
 # ═══════════════════════════════════════════════════════════════
 # STATE
@@ -925,6 +943,21 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll = update.poll
+
+    # ── Quiz-channel poll tracking: mark it closed once stopped ──
+    if poll is not None and poll.id in QUIZ_POLL_STATUS and poll.is_closed:
+        entry = QUIZ_POLL_STATUS[poll.id]
+        if not entry["closed"]:
+            entry["closed"] = True
+            save_quiz_poll_status()
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=QUIZ_CHANNEL_ID, message_id=entry["message_id"],
+                    reaction=[ReactionTypeEmoji("✅")], is_big=False,
+                )
+            except Exception:
+                pass
+
     if poll is None or poll.correct_option_id is None:
         return
 
@@ -1235,6 +1268,20 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             return
         QUIZ_INDEX[current]["ids"].append(msg.message_id)
         save_quiz_index()
+        # Track this poll so we know once it's stopped (only then is it
+        # actually copyable — Telegram requires the correct answer to be
+        # known before a quiz poll can be copied at all).
+        QUIZ_POLL_STATUS[msg.poll.id] = {"lecture": current, "message_id": msg.message_id, "closed": msg.poll.is_closed}
+        save_quiz_poll_status()
+
+        if not msg.poll.is_closed:
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=QUIZ_CHANNEL_ID, message_id=msg.message_id,
+                    reaction=[ReactionTypeEmoji("😢")], is_big=False,
+                )
+            except Exception:
+                pass
         return
 
     # ── Plain text: either "-END" or a new/resumed lecture name ─
@@ -1252,21 +1299,41 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         QUIZ_STATE["current_lecture"] = None
         save_quiz_state()
         count = len(QUIZ_INDEX[current]["ids"])
+        open_count = sum(
+            1 for p in QUIZ_POLL_STATUS.values()
+            if p["lecture"] == current and not p["closed"]
+        )
+        note = (
+            f"\n⚠️ {open_count} سؤال لسه مفتوح — لازم توقف التصويت عليه (Stop Poll) "
+            f"قبل ما يبقى ممكن يتبعت للطلاب."
+            if open_count else "\n✅ كل الأسئلة جاهزة للإرسال."
+        )
         await context.bot.send_message(
-            QUIZ_CHANNEL_ID, f"✅ اتقفلت محاضرة <b>{current}</b> — {count} سؤال.",
+            QUIZ_CHANNEL_ID,
+            f"✅ اتقفلت محاضرة <b>{current}</b> — {count} سؤال.{note}",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # New lecture name (or resuming one that already exists)
-    entry = QUIZ_INDEX.setdefault(text, {"ids": [], "closed": False})
-    entry["closed"] = False
+    # New lecture name (or resuming one that already exists).
+    # Format: "Subject: Name" — no colon means subject defaults to "General".
+    if ":" in text:
+        subject, name = text.split(":", 1)
+        subject, name = subject.strip(), name.strip()
+    else:
+        subject, name = "General", text
+
+    entry = QUIZ_INDEX.setdefault(text, {"ids": [], "closed": False, "subject": subject, "name": name})
+    entry["closed"]  = False
+    entry["subject"] = subject
+    entry["name"]    = name
     save_quiz_index()
     QUIZ_STATE["current_lecture"] = text
     save_quiz_state()
     await context.bot.send_message(
         QUIZ_CHANNEL_ID,
-        f"🆕 <b>محاضرة: {text}</b>\nابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> لما تخلص.",
+        f"🆕 <b>{subject}: {name}</b>\nابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> لما تخلص.\n"
+        f"⚠️ لازم توقف كل سؤال (Stop Poll) قبل الـ -END عشان يبقى قابل للإرسال.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1284,18 +1351,59 @@ async def quiz_channel_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User-facing: pick a closed lecture and get its quizzes as fresh polls."""
-    closed = sorted(name for name, v in QUIZ_INDEX.items() if v["closed"] and v["ids"])
-    if not closed:
+    """User-facing: pick a subject, then a lecture, and get its ready quizzes."""
+    subjects = sorted({v["subject"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
+    if not subjects:
         await update.message.reply_text("📭 مفيش محاضرات متاحة دلوقتي.")
         return
-    buttons = [
-        [InlineKeyboardButton(f"{name} ({len(QUIZ_INDEX[name]['ids'])})", callback_data=f"lecture:{i}")]
-        for i, name in enumerate(closed)
-    ]
+    buttons = [[InlineKeyboardButton(s, callback_data=f"subject:{i}")] for i, s in enumerate(subjects)]
     await update.message.reply_text(
-        "🎓 <b>اختار المحاضرة:</b>", parse_mode=ParseMode.HTML,
+        "📚 <b>اختار المادة:</b>", parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: numbered list of ALL lectures (open + closed) for /quiz_delete."""
+    if not is_admin(update):
+        await update.message.reply_text("🚫 للأدمن فقط")
+        return
+    if not QUIZ_INDEX:
+        await update.message.reply_text("📭 مفيش محاضرات مسجلة لسه.")
+        return
+    lines = ["📋 <b>كل المحاضرات:</b>"]
+    for i, (key, v) in enumerate(QUIZ_INDEX.items(), 1):
+        status = "✅ مقفولة" if v["closed"] else "🟡 لسه مفتوحة"
+        lines.append(f"{i}. {v['subject']}: {v['name']} — {len(v['ids'])} سؤال — {status}")
+    lines.append("\nاستخدم /quiz_delete &lt;رقم&gt; للحذف")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /quiz_delete <n> — removes a lecture from the index (does not
+    delete the actual channel messages; only stops it showing up in /quiz)."""
+    if not is_admin(update):
+        await update.message.reply_text("🚫 للأدمن فقط")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("استخدام: /quiz_delete <رقم>\nشوف الأرقام في /quiz_list")
+        return
+    n = int(context.args[0])
+    keys = list(QUIZ_INDEX.keys())
+    if n < 1 or n > len(keys):
+        await update.message.reply_text(f"❌ رقم غلط — فيه {len(keys)} محاضرة بس")
+        return
+    key = keys[n - 1]
+    removed = QUIZ_INDEX.pop(key)
+    save_quiz_index()
+    if QUIZ_STATE.get("current_lecture") == key:
+        QUIZ_STATE["current_lecture"] = None
+        save_quiz_state()
+    stale_polls = [pid for pid, v in QUIZ_POLL_STATUS.items() if v["lecture"] == key]
+    for pid in stale_polls:
+        QUIZ_POLL_STATUS.pop(pid, None)
+    save_quiz_poll_status()
+    await update.message.reply_text(
+        f"🗑 اتشالت محاضرة: {removed['subject']}: {removed['name']}\n"
+        "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)"
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -1482,28 +1590,117 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
-    # ── LECTURE: deliver a closed lecture's quizzes as fresh polls ──
+    # ── QUIZ SUBJECTS: top-level list ─────────────────────────────
+    if query.data == "quiz_subjects":
+        subjects = sorted({v["subject"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
+        if not subjects:
+            await query.edit_message_text("📭 مفيش محاضرات متاحة دلوقتي.")
+            return
+        buttons = [[InlineKeyboardButton(s, callback_data=f"subject:{i}")] for i, s in enumerate(subjects)]
+        await query.edit_message_text(
+            "📚 <b>اختار المادة:</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── QUIZ SUBJECT: list lectures within one subject ────────────
+    if query.data.startswith("subject:"):
+        subj_idx = int(query.data.split(":")[1])
+        subjects = sorted({v["subject"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+        names = [
+            name for name, v in QUIZ_INDEX.items()
+            if v["closed"] and v["ids"] and v["subject"] == subject
+        ]  # insertion order = numbering order
+        buttons = [
+            [InlineKeyboardButton(
+                f"Lecture {i + 1} - {subject}: {QUIZ_INDEX[name]['name']}",
+                callback_data=f"lecture:{subj_idx}:{i}",
+            )]
+            for i, name in enumerate(names)
+        ]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data="quiz_subjects")])
+        await query.edit_message_text(
+            f"🎓 <b>{subject}</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── LECTURE: deliver a closed lecture's ready quizzes ─────────
     if query.data.startswith("lecture:"):
-        idx = int(query.data.split(":")[1])
-        closed = sorted(name for name, v in QUIZ_INDEX.items() if v["closed"] and v["ids"])
-        if idx >= len(closed):
+        _, subj_idx_str, lec_idx_str = query.data.split(":")
+        subj_idx, lec_idx = int(subj_idx_str), int(lec_idx_str)
+
+        subjects = sorted({v["subject"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+        names = [
+            name for name, v in QUIZ_INDEX.items()
+            if v["closed"] and v["ids"] and v["subject"] == subject
+        ]
+        if lec_idx >= len(names):
             await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
             return
-        name = closed[idx]
-        ids  = QUIZ_INDEX[name]["ids"]
+        lecture_key = names[lec_idx]
+        entry = QUIZ_INDEX[lecture_key]
+        ids   = entry["ids"]
 
-        await query.edit_message_text(f"🎓 <b>{name}</b> — {len(ids)} سؤال جاري الإرسال...", parse_mode=ParseMode.HTML)
-        try:
-            for i in range(0, len(ids), 100):  # copy_messages caps at 100 per call
-                await context.bot.copy_messages(
-                    chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_ids=ids[i:i + 100],
-                )
-        except Exception as e:
-            print(f"Quiz delivery failed for lecture '{name}': {e}")
+        # Only polls Telegram has confirmed as stopped are actually
+        # copyable — a quiz poll can't be copied while its correct
+        # answer is still unknown, so filter to those first.
+        closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS.values() if v["closed"]}
+        ready_ids     = [mid for mid in ids if mid in closed_message_ids]
+        not_ready_cnt = len(ids) - len(ready_ids)
+
+        await query.edit_message_text(
+            f"🎓 <b>{subject}: {entry['name']}</b> — جاري إرسال {len(ready_ids)} سؤال...",
+            parse_mode=ParseMode.HTML,
+        )
+
+        # Deliver one at a time (not bulk) so a single deleted question
+        # doesn't sink the whole lecture — we also use this pass to prune
+        # dead message_ids from the index, since Telegram never tells the
+        # bot when something gets deleted; this is the only moment we can
+        # actually find out.
+        delivered, dead_ids = 0, []
+        for mid in ready_ids:
+            try:
+                await context.bot.copy_message(chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_id=mid)
+                delivered += 1
+            except Exception as e:
+                print(f"Quiz question {mid} in lecture '{lecture_key}' unreachable (likely deleted): {e}")
+                dead_ids.append(mid)
+
+        if dead_ids:
+            entry["ids"] = [mid for mid in entry["ids"] if mid not in dead_ids]
+            for mid in dead_ids:
+                stale_poll_ids = [pid for pid, v in QUIZ_POLL_STATUS.items() if v["message_id"] == mid]
+                for pid in stale_poll_ids:
+                    QUIZ_POLL_STATUS.pop(pid, None)
+            if not entry["ids"]:
+                QUIZ_INDEX.pop(lecture_key, None)  # whole lecture was deleted — drop it
+            save_quiz_index()
+            save_quiz_poll_status()
+
+        if delivered == 0 and not_ready_cnt == 0:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES)),
-                parse_mode=ParseMode.HTML,
+                text="⚠️ المحاضرة دي اتحذفت من القناة، فاتشالت من القايمة.",
+            )
+            return
+
+        if not_ready_cnt:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"⚠️ {not_ready_cnt} سؤال لسه مش جاهز (التصويت عليه لسه مفتوح في القناة) "
+                    "— هيتبعت لما الأدمن يوقفه."
+                ),
             )
         return
 
@@ -1921,6 +2118,8 @@ app.add_handler(CommandHandler("storage_id",     storage_id_cmd))
 # Quiz channel
 app.add_handler(CommandHandler("quiz_channel_id", quiz_channel_id_cmd))
 app.add_handler(CommandHandler("quiz",            quiz_lectures_cmd))
+app.add_handler(CommandHandler("quiz_list",       quiz_list_cmd))
+app.add_handler(CommandHandler("quiz_delete",     quiz_delete_cmd))
 
 # Poll handler before text handler (forwarded OR own quiz polls) —
 # excludes the quiz channel, which has its own dedicated handler below.
