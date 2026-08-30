@@ -85,7 +85,7 @@ STORAGE_GROUP_ID = -1004447646576
 #    rights for the bot to receive posts at all).
 # 2. Forward any message from that channel to the bot in a private DM,
 #    then send /quiz_channel_id right after — the bot replies with the ID.
-QUIZ_CHANNEL_ID = -1004402622263   # ← CHANGE THIS
+QUIZ_CHANNEL_ID = -1004447646577   # ← CHANGE THIS
 
 # ── Curriculum structure for the quiz channel ─────────────────────
 # Add new modules/subjects here as they come up. Lecture titles posted in
@@ -327,20 +327,6 @@ def save_quiz_index():
 
 QUIZ_INDEX: dict = load_quiz_index()  # lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}
 
-def normalize_quiz_index():
-    """Drops any entries created before this module/subject/lecture structure
-    existed (old local quiz_index.json, or an old pinned backup) — without
-    this, any code reading v["module"]/v["subject"] KeyErrors on them.
-    They're just discarded rather than kept around under a fake module."""
-    stale = [key for key, v in QUIZ_INDEX.items() if "module" not in v or "subject" not in v]
-    for key in stale:
-        QUIZ_INDEX.pop(key, None)
-        if QUIZ_STATE.get("current_lecture") == key:
-            QUIZ_STATE["current_lecture"] = None
-            save_quiz_state()
-    if stale:
-        save_quiz_index()
-
 # Matches "<Subject> Lecture <number>", e.g. "Physio Lecture 3"
 _LECTURE_TITLE_RE = re.compile(r"^(.*?)\s+Lecture\s+(\d+)\s*$", re.IGNORECASE)
 
@@ -407,8 +393,6 @@ def save_quiz_state():
         json.dump(QUIZ_STATE, f)
 
 QUIZ_STATE: dict = load_quiz_state()  # survives restarts mid-lecture
-
-normalize_quiz_index()  # needs QUIZ_STATE to exist, so runs after it's loaded
 
 QUIZ_POLL_STATUS_FILE = "quiz_poll_status.json"
 
@@ -504,7 +488,6 @@ async def restore_quiz_from_channel(app):
             QUIZ_INDEX.update(payload.get("quiz_index", {}))
             QUIZ_STATE.update(payload.get("quiz_state", {}))
             QUIZ_POLL_STATUS.update(payload.get("quiz_poll_status", {}))
-            normalize_quiz_index()
             save_quiz_index()
             save_quiz_state()
             save_quiz_poll_status()
@@ -1565,16 +1548,10 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         # known before a quiz poll can be copied at all).
         QUIZ_POLL_STATUS[msg.poll.id] = {"lecture": current, "message_id": msg.message_id, "closed": msg.poll.is_closed}
         save_quiz_poll_status()
-        await backup_quiz_to_channel(context)
-
-        if not msg.poll.is_closed:
-            try:
-                await context.bot.set_message_reaction(
-                    chat_id=QUIZ_CHANNEL_ID, message_id=msg.message_id,
-                    reaction=[ReactionTypeEmoji("😢")], is_big=False,
-                )
-            except Exception:
-                pass
+        # NOTE: the channel backup document + the "still open" reaction are
+        # both deliberately deferred to -END (below) instead of happening
+        # here per-question — doing them per-question was sending/pinning
+        # a fresh backup document for every single poll.
         return
 
     # ── Plain text: either "-END" or a new/resumed lecture name ─
@@ -1591,12 +1568,28 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         save_quiz_index()
         QUIZ_STATE["current_lecture"] = None
         save_quiz_state()
-        await backup_quiz_to_channel(context)
-        count = len(QUIZ_INDEX[current]["ids"])
-        open_count = sum(
-            1 for p in QUIZ_POLL_STATUS.values()
+
+        # Batched now, once, instead of one reaction call per question:
+        # mark every still-open (forgot to Stop Poll) question in this
+        # lecture with 😢.
+        open_message_ids = [
+            p["message_id"] for p in QUIZ_POLL_STATUS.values()
             if p["lecture"] == current and not p["closed"]
-        )
+        ]
+        for mid in open_message_ids:
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=QUIZ_CHANNEL_ID, message_id=mid,
+                    reaction=[ReactionTypeEmoji("😢")], is_big=False,
+                )
+            except Exception:
+                pass
+
+        # Single backup for the whole lecture, once it's actually closed.
+        await backup_quiz_to_channel(context)
+
+        count = len(QUIZ_INDEX[current]["ids"])
+        open_count = len(open_message_ids)
         note = (
             f"\n⚠️ {open_count} سؤال لسه مفتوح — لازم توقف التصويت عليه (Stop Poll) "
             f"قبل ما يبقى ممكن يتبعت للطلاب."
@@ -2205,6 +2198,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=start_menu_keyboard(),
     )
 
+async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/c — lists every command, admin-only ones only shown to the admin."""
+    lines = ["📖 <b>الأوامر المتاحة:</b>\n"]
+    lines.append("👤 <b>للجميع</b>")
+    lines.append("/start — القائمة الرئيسية")
+    lines.append("/sleep — يوقف البوت مؤقتًا في المحادثة دي")
+    lines.append("/pdf_start — يبدأ سيشن تجميع صور لملف PDF")
+    lines.append("/pdf_generate — يطلع PDF من الصور اللي جمعتها")
+    lines.append("/pdf_clear — يمسح سيشن الـ PDF الحالي")
+    lines.append("/next — الصورة/الخطوة الجاية في سيشن الجاليري")
+    lines.append("/quiz — تصفح المحاضرات (موديول ← مادة ← محاضرة) وسحب أسئلتها")
+    lines.append("/storage_id — يجيب chat ID بتاع المكان ده (لضبط STORAGE_GROUP_ID)")
+    lines.append("/quiz_channel_id — يجيب chat ID لقناة الكويز (فوروارد رسالة منها الأول)")
+    lines.append("/c — القائمة دي")
+
+    if is_admin(update):
+        lines.append("\n🔐 <b>للأدمن بس</b>")
+        lines.append("/admincheck — يتأكد إنك أدمن")
+        lines.append("/broadcast &lt;رسالة&gt; — يبعت رسالة لكل المستخدمين")
+        lines.append("/backup_now — يعمل ريفريش فوري للباك أب المثبّت (ستوريدج + كويز)")
+        lines.append("/quiz_list — ليستة مرقّمة بكل المحاضرات (مفتوحة ومقفولة)")
+        lines.append("/quiz_delete &lt;رقم&gt; — يشيل محاضرة من الفهرس")
+        lines.append("/gallery_add — يدخل وضع إضافة صور للجاليري")
+        lines.append("/gallery_list — يعرض كل صور الجاليري بأرقامها")
+        lines.append("/gallery_delete &lt;رقم&gt; — يمسح صورة من الجاليري")
+        lines.append("/gallery_move &lt;من&gt; &lt;إلى&gt; — يغيّر ترتيب صورة")
+        lines.append("/gallery_clear — يمسح الجاليري بالكامل")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
 # ═══════════════════════════════════════════════════════════════
 # ADMIN HELPERS
 # ═══════════════════════════════════════════════════════════════
@@ -2438,6 +2461,7 @@ async def _post_init(app):
 app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
 app.add_handler(CommandHandler("start",          start))
+app.add_handler(CommandHandler("c",              commands_cmd))
 app.add_handler(CommandHandler("sleep",          sleep_cmd))
 app.add_handler(CommandHandler("admincheck",     admincheck_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
