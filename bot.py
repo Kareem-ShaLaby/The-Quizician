@@ -104,7 +104,7 @@ MODULES = {
 # QUIZZY — The Quizician's cat friend 🐾
 # ═══════════════════════════════════════════════════════════════
 QUIZZY_WELCOME_ART = (
-    "  /\\_/\\ \n"
+    " /\\_/\\ \n"
     "( ⌒.⌒ )\n"
     "  > ^ <  "
 )
@@ -122,19 +122,20 @@ QUIZZY_OOPS_ART = (
 )
 
 QUIZZY_WELCOME_LINES = [
-    "قوزي هنا، جاهز يساعدك يبيّض وشك في الامتحان 🐾",
-    "الأستاذ القوزيشيان ومعاه مساعده قوزي في الخدمة!",
-    "قوزي فتح عينه وقعد على الكيبورد — يلا نذاكر 😼",
+    "صباح (أو مساء) الورد 🌹",
+    "باشا البلد",
+    "الله أكبر أخيرا قررت تذاكر",
 ]
 QUIZZY_SUCCESS_LINES = [
-    "قوزي بيعمل هاي فايف بإيده الصغيرة 🐾✋",
-    "خلصنا! قوزي بيلحس إيده من الرضا 😽",
-    "قوزي فخور بيك دلوقتي، وده مش سهل يحصل 🐾",
+    "تحياتي 🫡",
+    "مش بقول باشا 😎",
+    "قدوة 😌🙌",
 ]
 QUIZZY_ERROR_LINES = [
-    "قوزي وقع من على الرف من الصدمة، بس متقلقش هنظبطها 🐾",
-    "قوزي شايف إن المشكلة دي معندهاش داعي، جرب تاني 😼",
-    "احنا مش عارفين إيه اللي حصل، بس قوزي واثق إنها هتتحل 🐾",
+    "كويزي وقع على دماغه من الصدمة، بس متقلقش هنظبطها 😓",
+    "كويزي شايف إن المشكلة دي معندهاش داعي، جرب تاني 😓",
+    "احنا مش عارفين إيه اللي حصل، بس كويزي واثق إنها هتتحل 😓",
+    "كله بسبب قسم الفسيو 😓",
 ]
 
 def quizzy_block(art: str, line: str) -> str:
@@ -156,23 +157,23 @@ MSG_ADMIN_ONLY = "🚫 للأدمن فقط"
 
 # ── PDF collection flow ───────────────────────────────────────
 MSG_PDF_ASK_NAME = (
-    "✏️ <b>اكتب اسم الملف اللي عايزه:</b>\n"
+    "✏️ <b>اكتب اسم التوحفة الفنية (الملف) اللي عايزه:</b>\n"
     "<i>Lecture 1 Anatomy Questions</i>"
 )
 MSG_PDF_EMPTY = "❌ لا يوجد أسئلة محفوظة"
 MSG_EXPORT_EMPTY = "❌ لا يوجد أسئلة محفوظة بعد"
 MSG_EXPORT_GENERATING = "⏳ جاري توليد {kind} لـ {count} عنصر..."
 MSG_PDF_GENERATING = "⏳ جاري توليد PDF لـ {count} عنصر..."
-MSG_PDF_CAPTION = "📄 {count} سؤال — {name} ❤️\n\n🐾 <i>{quizzy_line}</i>"
-MSG_DOCX_CAPTION = "📝 {count} سؤال — {name} ❤️\n\n🐾 <i>{quizzy_line}</i>"
+MSG_PDF_CAPTION = "📄 {count} سؤال — {name} ❤️\n\n <i>{quizzy_line}</i>"
+MSG_DOCX_CAPTION = "📝 {count} سؤال — {name} ❤️\n\n <i>{quizzy_line}</i>"
 MSG_DOCX_UNAVAILABLE = (
     "❌ DOCX export مش متاح دلوقتي (python-docx مش متثبت). "
     "استخدم PDF Export بدل كده، أو ثبّت python-docx وأعد التشغيل."
 )
-MSG_PDF_CLEARED = "🗑 تم قرار إزالة"
-MSG_EXPORT_CLEARED_ALL = "🗑 تم مسح كل الأسئلة المحفوظة"
-MSG_CANCEL_DONE = "❌ اتلغى اللي كنت بتعمله."
-MSG_CANCEL_NOTHING = "مفيش حاجة شغالة دلوقتي عشان تتلغي 🤷"
+MSG_PDF_CLEARED = "🗑 تم قرار إزالة يا دولي"
+MSG_EXPORT_CLEARED_ALL = "🗑 تم قرار إزاله يا دولي"
+MSG_CANCEL_DONE = "❌ تم نطر أبلكاش"
+MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
@@ -2257,10 +2258,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_storage_to_channel(context)
 
     await update.message.reply_text(
-        "❤️<b>بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ</b>\n"
-        "<b>منور يا كويزاوي 🌹</b>\n\n"
         f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
-        "Choose an option below to get started:",
+        "تحب تعمل أي؟!:",
         parse_mode=ParseMode.HTML,
         reply_markup=start_menu_keyboard(),
     )
