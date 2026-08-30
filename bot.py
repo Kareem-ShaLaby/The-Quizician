@@ -8,7 +8,8 @@ import html
 import tempfile
 from io import BytesIO
 
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile, InputMediaDocument
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile
+from telegram.error import Forbidden
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -85,7 +86,7 @@ STORAGE_GROUP_ID = -1004447646576
 #    rights for the bot to receive posts at all).
 # 2. Forward any message from that channel to the bot in a private DM,
 #    then send /quiz_channel_id right after — the bot replies with the ID.
-QUIZ_CHANNEL_ID = -1004402622263   # ← CHANGE THIS
+QUIZ_CHANNEL_ID = -1004402622263
 
 # ── Curriculum structure for the quiz channel ─────────────────────
 # Add new modules/subjects here as they come up. Lecture titles posted in
@@ -141,6 +142,37 @@ def quizzy_block(art: str, line: str) -> str:
     The art contains literal < > characters (whiskers/paws) which Telegram's
     HTML parser would otherwise choke on as broken tags — escape them."""
     return f"<pre>{html.escape(art)}</pre>\n<i>{html.escape(line)}</i>"
+
+# ═══════════════════════════════════════════════════════════════
+# BOT MESSAGES — every user-facing string the bot sends, in one place.
+# Grouped by feature. Dynamic ones use {placeholders} filled with .format().
+# (Content generated in a loop — like /c's command list, /quiz_list's
+# lecture rows, or gallery listings — stays where it's built, since there's
+# nothing fixed to centralize there; only their static labels live here.)
+# ═══════════════════════════════════════════════════════════════
+
+# ── Generic / shared ──────────────────────────────────────────
+MSG_ADMIN_ONLY = "🚫 للأدمن فقط"
+
+# ── PDF collection flow ───────────────────────────────────────
+MSG_PDF_ASK_NAME = (
+    "✏️ <b>اكتب اسم الملف اللي عايزه:</b>\n"
+    "<i>Lecture 1 Anatomy Questions</i>"
+)
+MSG_PDF_EMPTY = "❌ لا يوجد أسئلة محفوظة"
+MSG_EXPORT_EMPTY = "❌ لا يوجد أسئلة محفوظة بعد"
+MSG_EXPORT_GENERATING = "⏳ جاري توليد {kind} لـ {count} عنصر..."
+MSG_PDF_GENERATING = "⏳ جاري توليد PDF لـ {count} عنصر..."
+MSG_PDF_CAPTION = "📄 {count} سؤال — {name} ❤️\n\n🐾 <i>{quizzy_line}</i>"
+MSG_DOCX_CAPTION = "📝 {count} سؤال — {name} ❤️\n\n🐾 <i>{quizzy_line}</i>"
+MSG_DOCX_UNAVAILABLE = (
+    "❌ DOCX export مش متاح دلوقتي (python-docx مش متثبت). "
+    "استخدم PDF Export بدل كده، أو ثبّت python-docx وأعد التشغيل."
+)
+MSG_PDF_CLEARED = "🗑 تم قرار إزالة"
+MSG_EXPORT_CLEARED_ALL = "🗑 تم مسح كل الأسئلة المحفوظة"
+MSG_CANCEL_DONE = "❌ اتلغى اللي كنت بتعمله."
+MSG_CANCEL_NOTHING = "مفيش حاجة شغالة دلوقتي عشان تتلغي 🤷"
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
@@ -235,22 +267,12 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
     # the size ceiling for any realistic amount of data this bot handles.
     filename = "quizician_storage_backup.json"
 
-    msg_id = STORAGE_BACKUP_STATE.get("backup_msg_id")
-    if msg_id:
-        try:
-            await context.bot.edit_message_media(
-                chat_id=STORAGE_GROUP_ID, message_id=msg_id,
-                media=InputMediaDocument(
-                    media=InputFile(BytesIO(data), filename=filename),
-                    caption=STORAGE_BACKUP_MARKER,
-                ),
-            )
-            return
-        except Exception as e:
-            # Don't silently assume "message gone" — log it. If this keeps
-            # firing every time, the printed error is the actual reason
-            # (permissions, stale id, etc.) instead of a guess.
-            print("STORAGE BACKUP EDIT FAILED — falling back to resend:", repr(e))
+    # We tried editing the existing pinned document in place, but Telegram
+    # reliably rejected it with "Can't parse inputmedia: media not found".
+    # Simpler and just as effective: send a new document, pin it, then
+    # delete the previous one — net result is still exactly one backup
+    # document sitting in the chat at all times.
+    old_msg_id = STORAGE_BACKUP_STATE.get("backup_msg_id")
 
     try:
         sent = await context.bot.send_document(
@@ -262,10 +284,9 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
         print("STORAGE BACKUP ERROR:", e)
         return
 
-    # Save the message id immediately — pinning is a nice-to-have on top,
-    # and its failure (e.g. bot isn't admin / lacks pin rights) must NOT
-    # stop us from remembering this message so future calls can edit it
-    # instead of sending a new document every time.
+    # Save the message id immediately — pinning/deleting-old are nice-to-
+    # haves on top, and their failure (e.g. bot isn't admin / lacks rights)
+    # must NOT stop us from remembering this new message id.
     STORAGE_BACKUP_STATE["backup_msg_id"] = sent.message_id
     save_storage_backup_state()
 
@@ -273,6 +294,12 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.pin_chat_message(chat_id=STORAGE_GROUP_ID, message_id=sent.message_id, disable_notification=True)
     except Exception as e:
         print("STORAGE BACKUP PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
+
+    if old_msg_id and old_msg_id != sent.message_id:
+        try:
+            await context.bot.delete_message(chat_id=STORAGE_GROUP_ID, message_id=old_msg_id)
+        except Exception as e:
+            print("STORAGE BACKUP OLD-MESSAGE DELETE ERROR (probably already gone, harmless):", e)
 
 async def restore_storage_from_channel(app):
     """Runs once on startup — rebuilds USERS + STORAGE_INDEX from the
@@ -438,19 +465,11 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE):
     data     = json.dumps(payload).encode("utf-8")
     filename = "quizician_quiz_backup.json"
 
-    msg_id = QUIZ_BACKUP_STATE.get("backup_msg_id")
-    if msg_id:
-        try:
-            await context.bot.edit_message_media(
-                chat_id=QUIZ_CHANNEL_ID, message_id=msg_id,
-                media=InputMediaDocument(
-                    media=InputFile(BytesIO(data), filename=filename),
-                    caption=QUIZ_BACKUP_MARKER,
-                ),
-            )
-            return
-        except Exception as e:
-            print("QUIZ BACKUP EDIT FAILED — falling back to resend:", repr(e))
+    # Same approach as storage backup: editing the existing pinned document
+    # in place reliably failed with "Can't parse inputmedia: media not
+    # found", so instead we send a new one, pin it, then delete the old —
+    # still exactly one backup document in the channel at any time.
+    old_msg_id = QUIZ_BACKUP_STATE.get("backup_msg_id")
 
     try:
         sent = await context.bot.send_document(
@@ -463,8 +482,8 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Same fix as storage backup: persist the message id regardless of
-    # whether pinning succeeds, so we don't resend a fresh document on
-    # every single addition.
+    # whether pinning/deleting-old succeed, so we don't resend a fresh
+    # document on every single addition.
     QUIZ_BACKUP_STATE["backup_msg_id"] = sent.message_id
     save_quiz_backup_state()
 
@@ -472,6 +491,12 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.pin_chat_message(chat_id=QUIZ_CHANNEL_ID, message_id=sent.message_id, disable_notification=True)
     except Exception as e:
         print("QUIZ BACKUP PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
+
+    if old_msg_id and old_msg_id != sent.message_id:
+        try:
+            await context.bot.delete_message(chat_id=QUIZ_CHANNEL_ID, message_id=old_msg_id)
+        except Exception as e:
+            print("QUIZ BACKUP OLD-MESSAGE DELETE ERROR (probably already gone, harmless):", e)
 
 async def restore_quiz_from_channel(app):
     """Runs once on startup — rebuilds the lecture/quiz index from the quiz
@@ -867,7 +892,8 @@ def export_keyboard():
 def start_menu_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📚 How To Use", callback_data="menu_how"),
+            InlineKeyboardButton("🦦 How To Use", callback_data="menu_how"),
+            InlineKeyboardButton("Quizzes ⁉️",    callback_data="menu_quizzes"),
         ],
     ])
 
@@ -1513,7 +1539,7 @@ async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: force-create/refresh both pinned backups right now, instead of
     waiting for the next real change."""
     if not is_admin(update):
-        await update.message.reply_text("🚫 للأدمن فقط")
+        await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     await backup_storage_to_channel(context)
     await backup_quiz_to_channel(context)
@@ -1659,7 +1685,7 @@ async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: numbered list of ALL lectures (open + closed) for /quiz_delete."""
     if not is_admin(update):
-        await update.message.reply_text("🚫 للأدمن فقط")
+        await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     if not QUIZ_INDEX:
         await update.message.reply_text("📭 مفيش محاضرات مسجلة لسه.")
@@ -1676,7 +1702,7 @@ async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /quiz_delete <n> — removes a lecture from the index (does not
     delete the actual channel messages; only stops it showing up in /quiz)."""
     if not is_admin(update):
-        await update.message.reply_text("🚫 للأدمن فقط")
+        await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("استخدام: /quiz_delete <رقم>\nشوف الأرقام في /quiz_list")
@@ -1983,19 +2009,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
-        # Deliver one at a time (not bulk) so a single deleted question
-        # doesn't sink the whole lecture — we also use this pass to prune
-        # dead message_ids from the index, since Telegram never tells the
-        # bot when something gets deleted; this is the only moment we can
-        # actually find out.
+        progress_msg_id = query.message.message_id
+        total = len(ready_ids)
+        # For small lectures this fires almost every question anyway; for
+        # large ones, throttle to roughly 10 edits total to stay well clear
+        # of Telegram's rate limits.
+        update_every = max(1, total // 10)
+
         delivered, dead_ids = 0, []
-        for mid in ready_ids:
+        for i, mid in enumerate(ready_ids, 1):
             try:
                 await context.bot.copy_message(chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_id=mid)
                 delivered += 1
             except Exception as e:
                 print(f"Quiz question {mid} in lecture '{lecture_key}' unreachable (likely deleted): {e}")
                 dead_ids.append(mid)
+
+            if total > 5 and (i % update_every == 0 or i == total):
+                try:
+                    label = "✅ اتبعت" if i == total else "⏳ جاري إرسال"
+                    await context.bot.edit_message_text(
+                        chat_id=user_id, message_id=progress_msg_id,
+                        text=f"🎓 <b>{module} - {subject}: {entry['name']}</b> — {label} {i}/{total}...",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass  # e.g. "message not modified" if delivered==0 questions failed — harmless
 
         if dead_ids:
             entry["ids"] = [mid for mid in entry["ids"] if mid not in dead_ids]
@@ -2061,6 +2100,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML)
         return
 
+    if query.data == "menu_quizzes":
+        # Same as typing /quiz — sends a fresh message (not an edit) so the
+        # welcome message with its buttons stays intact above it.
+        modules = ready_modules()
+        if not modules:
+            await query.message.reply_text("📭 مفيش محاضرات متاحة دلوقتي.")
+            return
+        buttons = [[InlineKeyboardButton(m, callback_data=f"module:{i}")] for i, m in enumerate(modules)]
+        await query.message.reply_text(
+            "📚 <b>اختار الموديول:</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
     # ── EXPORT BUTTONS ──────────────────────────────────────────
     items = PDF_BUFFER.get(user_id, [])
     name  = PDF_NAMES.get(user_id, "questions")
@@ -2068,13 +2121,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "gen_pdf":
         if not items:
-            await query.message.reply_text("❌ لا يوجد أسئلة محفوظة بعد")
+            await query.message.reply_text(MSG_EXPORT_EMPTY)
             return
-        await query.message.reply_text(f"⏳ جاري توليد PDF لـ {len(items)} عنصر...")
+        await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind="PDF", count=len(items)))
         pdf = build_pdf(items, name)
         await query.message.reply_document(
             document=pdf, filename=f"{safe}.pdf",
-            caption=f"📄 {len(items)} سؤال — {name} ❤️\n\n🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+            caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
             parse_mode=ParseMode.HTML,
         )
         _cleanup_images(user_id)
@@ -2086,20 +2139,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "gen_docx":
         if not DOCX_AVAILABLE:
-            await query.message.reply_text(
-                "❌ DOCX export مش متاح دلوقتي (python-docx مش متثبت). "
-                "استخدم PDF Export بدل كده، أو ثبّت python-docx وأعد التشغيل."
-            )
+            await query.message.reply_text(MSG_DOCX_UNAVAILABLE)
             return
         if not items:
-            await query.message.reply_text("❌ لا يوجد أسئلة محفوظة بعد")
+            await query.message.reply_text(MSG_EXPORT_EMPTY)
             return
-        await query.message.reply_text(f"⏳ جاري توليد DOCX لـ {len(items)} عنصر...")
+        await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind="DOCX", count=len(items)))
         try:
             docx_buf = build_docx(items, name)
             await query.message.reply_document(
                 document=docx_buf, filename=f"{safe}.docx",
-                caption=f"📝 {len(items)} سؤال — {name} ❤️\n\n🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+                caption=MSG_DOCX_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
                 parse_mode=ParseMode.HTML,
             )
             _cleanup_images(user_id)
@@ -2124,7 +2174,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PDF_NAMES.pop(user_id, None)
         AWAITING_NAME.pop(user_id, None)
         PROGRESS_MSG_ID.pop(user_id, None)
-        await query.message.reply_text("🗑 تم مسح كل الأسئلة المحفوظة")
+        await query.message.reply_text(MSG_EXPORT_CLEARED_ALL)
 
 # ═══════════════════════════════════════════════════════════════
 # PDF COMMANDS
@@ -2138,25 +2188,21 @@ async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PDF_NAMES.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
     AWAITING_NAME[user_id] = True
-    await update.message.reply_text(
-        "✏️ <b>اكتب اسم الملف اللي عايزه:</b>\n"
-        "<i>Lecture 1 Anatomy Questions</i>",
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text(MSG_PDF_ASK_NAME, parse_mode=ParseMode.HTML)
 
 async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     items   = PDF_BUFFER.get(user_id, [])
     if not items:
-        await update.message.reply_text("❌ لا يوجد أسئلة محفوظة")
+        await update.message.reply_text(MSG_PDF_EMPTY)
         return
     name = PDF_NAMES.get(user_id, "questions")
     safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
-    await update.message.reply_text(f"⏳ جاري توليد PDF لـ {len(items)} عنصر...")
+    await update.message.reply_text(MSG_PDF_GENERATING.format(count=len(items)))
     pdf = build_pdf(items, name)
     await update.message.reply_document(
         document=pdf, filename=f"{safe}.pdf",
-        caption=f"📄 {len(items)} سؤال — {name} ❤️\n\n🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+        caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
         parse_mode=ParseMode.HTML,
     )
     _cleanup_images(user_id)
@@ -2175,7 +2221,28 @@ async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
-    await update.message.reply_text("🗑 تم قرار إزالة")
+    await update.message.reply_text(MSG_PDF_CLEARED)
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bails out of whatever's in progress: PDF collection session, a
+    pending image waiting for its question, or (admin) gallery-add mode."""
+    user_id = update.effective_chat.id
+    was_doing_something = bool(
+        PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
+        or PENDING_IMAGE.get(user_id) or user_id in AWAITING_GALLERY_PHOTO
+    )
+    _cleanup_images(user_id)
+    _clear_pending_image(user_id)
+    _clear_clarify_queue(user_id)
+    PDF_BUFFER.pop(user_id, None)
+    PDF_NAMES.pop(user_id, None)
+    AWAITING_NAME.pop(user_id, None)
+    PROGRESS_MSG_ID.pop(user_id, None)
+    AWAITING_GALLERY_PHOTO.discard(user_id)
+    if was_doing_something:
+        await update.message.reply_text(MSG_CANCEL_DONE)
+    else:
+        await update.message.reply_text(MSG_CANCEL_NOTHING)
 
 # ═══════════════════════════════════════════════════════════════
 # START  (also wakes bot from sleep)
@@ -2207,6 +2274,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("/pdf_start — يبدأ سيشن تجميع صور لملف PDF")
     lines.append("/pdf_generate — يطلع PDF من الصور اللي جمعتها")
     lines.append("/pdf_clear — يمسح سيشن الـ PDF الحالي")
+    lines.append("/cancel — يلغي أي حاجة شغالة دلوقتي (PDF، صورة معلّقة، إلخ)")
     lines.append("/next — الصورة/الخطوة الجاية في سيشن الجاليري")
     lines.append("/quiz — تصفح المحاضرات (موديول ← مادة ← محاضرة) وسحب أسئلتها")
     lines.append("/storage_id — يجيب chat ID بتاع المكان ده (لضبط STORAGE_GROUP_ID)")
@@ -2254,7 +2322,7 @@ async def admincheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
-        await update.message.reply_text("🚫 هذا الأمر للأدمن فقط")
+        await update.message.reply_text(MSG_ADMIN_ONLY)
         return
 
     # Message text comes after /broadcast, or from a replied-to message
@@ -2295,10 +2363,18 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
             )
             success += 1
-        except Exception as e:
+        except Forbidden:
+            # The user actually blocked the bot (or deleted their account) —
+            # this is the only case where removing them from USERS is safe.
             failed += 1
             blocked.append(uid)
-            print(f"Broadcast failed for {uid}: {e}")
+        except Exception as e:
+            # Any other error (network blip, rate limit, Telegram hiccup) is
+            # NOT proof the user blocked us — keep them in USERS so a
+            # transient failure doesn't silently and permanently unsubscribe
+            # a real, still-active user.
+            failed += 1
+            print(f"Broadcast failed for {uid} (not removed — not a block):", e)
 
     # Remove users who blocked the bot
     if blocked:
@@ -2324,7 +2400,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def gallery_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: enter add-photo mode."""
     if not is_admin(update):
-        await update.message.reply_text("🚫 للأدمن فقط")
+        await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     AWAITING_GALLERY_PHOTO.add(update.effective_chat.id)
     await update.message.reply_text(
@@ -2336,7 +2412,7 @@ async def gallery_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def gallery_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: view all gallery photos with index numbers."""
     if not is_admin(update):
-        await update.message.reply_text("🚫 للأدمن فقط")
+        await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     if not GALLERY:
         await update.message.reply_text("📭 المعرض فاضي حالياً. استخدم /gallery_add لإضافة صور.")
@@ -2361,7 +2437,7 @@ async def gallery_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def gallery_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /gallery_delete <n>"""
     if not is_admin(update):
-        await update.message.reply_text("🚫 للأدمن فقط")
+        await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("استخدام: /gallery_delete <رقم>\nمثال: /gallery_delete 2")
@@ -2381,7 +2457,7 @@ async def gallery_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def gallery_move_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /gallery_move <from> <to>"""
     if not is_admin(update):
-        await update.message.reply_text("🚫 للأدمن فقط")
+        await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     if (not context.args or len(context.args) < 2
             or not context.args[0].isdigit() or not context.args[1].isdigit()):
@@ -2405,7 +2481,7 @@ async def gallery_move_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def gallery_clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: wipe the entire gallery."""
     if not is_admin(update):
-        await update.message.reply_text("🚫 للأدمن فقط")
+        await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     count = len(GALLERY)
     GALLERY.clear()
@@ -2462,6 +2538,7 @@ app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
 app.add_handler(CommandHandler("start",          start))
 app.add_handler(CommandHandler("c",              commands_cmd))
+app.add_handler(CommandHandler("cancel",         cancel_cmd))
 app.add_handler(CommandHandler("sleep",          sleep_cmd))
 app.add_handler(CommandHandler("admincheck",     admincheck_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
