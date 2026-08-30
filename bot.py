@@ -85,7 +85,7 @@ STORAGE_GROUP_ID = -1004447646576
 #    rights for the bot to receive posts at all).
 # 2. Forward any message from that channel to the bot in a private DM,
 #    then send /quiz_channel_id right after — the bot replies with the ID.
-QUIZ_CHANNEL_ID = -1004447646577   # ← CHANGE THIS
+QUIZ_CHANNEL_ID = -1004402622263   # ← CHANGE THIS
 
 # ── Curriculum structure for the quiz channel ─────────────────────
 # Add new modules/subjects here as they come up. Lecture titles posted in
