@@ -13,9 +13,18 @@ try:
     import requests
     REQUESTS_AVAILABLE = True
 except ImportError:
-    # requests not installed — AI question extraction (Gemini) is simply
+    # requests not installed — AI question extraction (Groq) is simply
     # disabled until it's installed; everything else works fine.
     REQUESTS_AVAILABLE = False
+
+try:
+    import fitz  # PyMuPDF — rasterizes PDF pages to images for Groq's
+    # vision models, which (unlike Gemini) can't take raw PDF bytes.
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    # PyMuPDF not installed — AI extraction from PDFs is disabled until
+    # it's installed; AI extraction from images still works fine.
+    PYMUPDF_AVAILABLE = False
 
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile
 from telegram.error import Forbidden
@@ -109,13 +118,17 @@ MODULES = {
     "Genitourinary":  ["Anatomy", "Physio", "Histo", "Patho", "Micro"],
 }
 
-# ── Gemini AI (question extraction from images/PDFs) ─────────────
-# 1. Get a free key at https://aistudio.google.com/apikey
-# 2. Paste it below. Leave empty ("") to keep this feature off — every
-#    other part of the bot works fine without it.
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")   # ← CHANGE THIS
-GEMINI_MODEL   = "gemini-2.5-flash"   # fast + cheap + vision-capable; change if you prefer another Gemini model
-GEMINI_MAX_FILE_BYTES = 15 * 1024 * 1024   # 15MB cap on inline uploads (images/PDFs) sent to Gemini
+# ── Groq AI (question extraction from images/PDFs) ────────────────
+# 1. Get a free key at https://console.groq.com/keys
+# 2. Set it as GROQ_API_KEY in Railway's Variables tab. Leave unset to
+#    keep this feature off — every other part of the bot works fine
+#    without it.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")   # ← set in Railway env vars
+GROQ_MODEL   = "qwen/qwen3.6-27b"   # Groq's current vision-capable model (preview); check
+                                     # https://console.groq.com/docs/vision if this gets deprecated
+GROQ_MAX_FILE_BYTES  = 15 * 1024 * 1024   # 15MB cap on the raw PDF/image upload before processing
+GROQ_PDF_MAX_PAGES   = 20                 # PDFs are rasterized page-by-page for the vision model —
+                                           # cap pages so one huge PDF can't take forever / cost a fortune
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — The Quizician's cat friend 🐾
@@ -192,13 +205,14 @@ MSG_EXPORT_CLEARED_ALL = "🗑 تم قرار إزاله يا دولي"
 MSG_CANCEL_DONE = "❌ تم نطر أبلكاش"
 MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
 
-# ── AI question extraction (Gemini) ───────────────────────────
+# ── AI question extraction (Groq) ─────────────────────────────
 MSG_AI_IMAGE_PARKED = (
     "🖼 <b>استلمت الصورة!</b>\n"
     "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة)، "
     "أو خلي الـ AI يقراها ويستخرج الأسئلة تلقائي 👇"
 )
-MSG_AI_NOT_CONFIGURED = "⚠️ ميزة الاستخراج بالـ AI مش متفعّلة دلوقتي. كلم الأدمن يضيف GEMINI_API_KEY في الكود."
+MSG_AI_NOT_CONFIGURED = "⚠️ ميزة الاستخراج بالـ AI مش متفعّلة دلوقتي. كلم الأدمن يضيف GROQ_API_KEY في متغيرات البيئة."
+MSG_AI_PDF_NOT_AVAILABLE = "⚠️ استخراج الـ PDF مش متاح دلوقتي (مكتبة PyMuPDF مش متثبتة). ابعت صورة بدل كده."
 MSG_AI_REQUESTS_MISSING = "⚠️ مكتبة requests مش متثبتة. ثبّتها بـ: pip install requests"
 MSG_AI_ANALYZING = "🤖 جاري التحليل بالـ AI... ⏳"
 MSG_AI_ERROR = "⚠️ حصل خطأ أثناء الاستخراج بالـ AI:\n<code>{error}</code>"
@@ -1427,40 +1441,21 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text=full_text)
 
 # ═══════════════════════════════════════════════════════════════
-# GEMINI AI — extracts MCQs straight out of a screenshot/PDF, so nobody
-# has to retype a question by hand. Off entirely if GEMINI_API_KEY is
+# GROQ AI — extracts MCQs straight out of a screenshot/PDF, so nobody
+# has to retype a question by hand. Off entirely if GROQ_API_KEY is
 # empty or `requests` isn't installed — every other feature still works.
+# Groq's chat-completions endpoint is OpenAI-compatible and, unlike
+# Gemini, only accepts images (not raw PDF bytes) — PDFs are rasterized
+# page-by-page with PyMuPDF and sent through the same image path below.
 # ═══════════════════════════════════════════════════════════════
-GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
-GEMINI_QUESTION_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "questions": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "question":           {"type": "STRING"},
-                    "options":            {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "correct_index":      {"type": "INTEGER"},
-                    "answer_source":      {"type": "STRING", "enum": ["marked_in_source", "ai_determined", "unclear"]},
-                    "explanation":        {"type": "STRING"},
-                    "explanation_source": {"type": "STRING", "enum": ["from_source", "ai_generated", "none"]},
-                },
-                "required": ["question", "options", "correct_index", "answer_source"],
-            },
-        },
-    },
-    "required": ["questions"],
-}
-
-GEMINI_EXTRACT_PROMPT = (
-    "You are extracting multiple-choice exam questions from the attached file "
-    "(a photo/screenshot or a PDF of exam questions, likely medical). Extract "
-    "EVERY distinct MCQ you can find, preserving the exact original wording of "
-    "the question and its options — same language as the source, do not translate "
-    "and do not paraphrase.\n\n"
+GROQ_EXTRACT_PROMPT = (
+    "You are extracting multiple-choice exam questions from the attached image "
+    "(a photo/screenshot, or a scanned page of exam questions, likely medical). "
+    "Extract EVERY distinct MCQ you can find, preserving the exact original "
+    "wording of the question and its options — same language as the source, do "
+    "not translate and do not paraphrase.\n\n"
     "For each question:\n"
     "- If the source visibly marks the correct answer (checkmark, bold, highlight, "
     "circle, different color, star, answer key, etc.), use that and set "
@@ -1474,44 +1469,49 @@ GEMINI_EXTRACT_PROMPT = (
     "(1–2 sentence) explanation yourself and set explanation_source to "
     "'ai_generated'. If you can't produce a reliable one, leave explanation empty "
     "and set explanation_source to 'none'.\n\n"
-    "If the file contains no MCQs at all, return an empty questions array. Do not "
-    "invent questions that aren't actually present."
+    "If the image contains no MCQs at all, return an empty questions array. Do not "
+    "invent questions that aren't actually present.\n\n"
+    "Respond with ONLY a JSON object (no markdown fences, no commentary) matching "
+    "exactly this shape:\n"
+    '{"questions": [{"question": "...", "options": ["...", "..."], '
+    '"correct_index": 0, "answer_source": "marked_in_source|ai_determined|unclear", '
+    '"explanation": "...", "explanation_source": "from_source|ai_generated|none"}]}'
 )
 
-async def gemini_extract_questions(file_bytes: bytes, mime_type: str):
-    """Calls Gemini to extract MCQs from an image or PDF's raw bytes.
-    Returns (questions, error) — questions is a list of dicts (possibly empty)
-    on success; error is a ready-to-send Arabic string (or None) on failure."""
-    if not GEMINI_API_KEY:
+async def groq_extract_questions(image_bytes: bytes, mime_type: str = "image/jpeg"):
+    """Calls Groq's vision model to extract MCQs from a single image's raw
+    bytes. Returns (questions, error) — questions is a list of dicts
+    (possibly empty) on success; error is a ready-to-send Arabic string (or
+    None) on failure."""
+    if not GROQ_API_KEY:
         return [], MSG_AI_NOT_CONFIGURED
     if not REQUESTS_AVAILABLE:
         return [], MSG_AI_REQUESTS_MISSING
 
+    data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": GEMINI_EXTRACT_PROMPT},
-                {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(file_bytes).decode("ascii")}},
+        "model": GROQ_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": GROQ_EXTRACT_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_url}},
             ],
         }],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": GEMINI_QUESTION_SCHEMA,
-        },
+        "response_format": {"type": "json_object"},
     }
-    url = GEMINI_ENDPOINT.format(model=GEMINI_MODEL)
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
     try:
         # requests is sync — run it off the event loop so we don't block
-        # every other chat the bot is handling while Gemini thinks.
-        resp = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=90)
+        # every other chat the bot is handling while Groq thinks.
+        resp = await asyncio.to_thread(requests.post, GROQ_ENDPOINT, headers=headers, json=payload, timeout=90)
         resp.raise_for_status()
         data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = data["choices"][0]["message"]["content"]
         questions = json.loads(text).get("questions", [])
     except Exception as e:
-        print("GEMINI EXTRACT ERROR:", repr(e))
+        print("GROQ EXTRACT ERROR:", repr(e))
         return [], MSG_AI_ERROR.format(error=e)
 
     # Sanity-filter: drop anything malformed rather than trust the model
@@ -1524,6 +1524,54 @@ async def gemini_extract_questions(file_bytes: bytes, mime_type: str):
             continue
         clean.append(q)
     return clean, None
+
+def pdf_bytes_to_page_jpegs(pdf_bytes: bytes, max_pages: int = GROQ_PDF_MAX_PAGES) -> list:
+    """Rasterizes a PDF's pages to JPEG bytes using PyMuPDF, capped at
+    max_pages. Returns a list of JPEG byte strings, one per page."""
+    images = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page_count = min(len(doc), max_pages)
+        for i in range(page_count):
+            page = doc.load_page(i)
+            # 2x zoom keeps text legible for the vision model without
+            # blowing past Groq's per-image size limit.
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            images.append(pix.tobytes("jpeg"))
+    finally:
+        doc.close()
+    return images
+
+async def groq_extract_questions_from_pdf(pdf_bytes: bytes):
+    """Rasterizes a PDF page-by-page and runs groq_extract_questions on each
+    page, merging the results in page order. Returns (questions, error) with
+    the same contract as groq_extract_questions; a single page's failure
+    doesn't abort the rest."""
+    if not GROQ_API_KEY:
+        return [], MSG_AI_NOT_CONFIGURED
+    if not REQUESTS_AVAILABLE:
+        return [], MSG_AI_REQUESTS_MISSING
+    if not PYMUPDF_AVAILABLE:
+        return [], MSG_AI_PDF_NOT_AVAILABLE
+
+    try:
+        pages = pdf_bytes_to_page_jpegs(pdf_bytes)
+    except Exception as e:
+        print("PDF RASTERIZE ERROR:", repr(e))
+        return [], MSG_AI_ERROR.format(error=e)
+
+    all_questions = []
+    last_error = None
+    for page_bytes in pages:
+        questions, error = await groq_extract_questions(page_bytes, "image/jpeg")
+        if error:
+            last_error = error
+            continue
+        all_questions.extend(questions)
+
+    if not all_questions and last_error:
+        return [], last_error
+    return all_questions, None
 
 def build_ai_extraction_preview(questions: list) -> str:
     lines = [MSG_AI_PREVIEW_HEADER.format(count=len(questions))]
@@ -1582,14 +1630,14 @@ async def _present_ai_extraction(context, user_id: int, questions: list, image_p
 
 async def _run_ai_extraction_for_image(context, user_id: int, img_path: str):
     """Shared by the auto-triggered (uncaptioned image) and button-triggered
-    (manual retry) AI extraction paths, so the Gemini call only lives once."""
+    (manual retry) AI extraction paths, so the Groq call only lives once."""
     if not os.path.exists(img_path):
         await context.bot.send_message(chat_id=user_id, text=MSG_AI_IMAGE_MISSING)
         return
     await context.bot.send_message(chat_id=user_id, text=MSG_AI_ANALYZING)
     with open(img_path, "rb") as f:
         img_bytes = f.read()
-    questions, error = await gemini_extract_questions(img_bytes, "image/jpeg")
+    questions, error = await groq_extract_questions(img_bytes, "image/jpeg")
     if error:
         await context.bot.send_message(chat_id=user_id, text=error, parse_mode=ParseMode.HTML)
         return
@@ -1687,7 +1735,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _clear_pending_image(user_id)  # drop any earlier unclaimed pending image
     PENDING_IMAGE[user_id] = img_path
 
-    if GEMINI_API_KEY and REQUESTS_AVAILABLE:
+    if GROQ_API_KEY and REQUESTS_AVAILABLE:
         await _run_ai_extraction_for_image(context, user_id, img_path)
     else:
         await update.message.reply_text(
@@ -1700,8 +1748,8 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """PDFs sent in a private DM: captioned = treated as a manual question
     (caption parsed as the MCQ text — no attachment, since Telegram polls
-    can only carry a photo, not a PDF); uncaptioned = handed to Gemini for
-    AI extraction, same as an uncaptioned image."""
+    can only carry a photo, not a PDF); uncaptioned = handed to Groq for
+    AI extraction, same as an uncaptioned image (rasterized page-by-page)."""
     if not update.message or not update.message.document:
         return
     user_id = update.effective_chat.id
@@ -1735,18 +1783,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── No caption: AI extraction ────────────────────────────────
-    if not (GEMINI_API_KEY and REQUESTS_AVAILABLE):
+    if not (GROQ_API_KEY and REQUESTS_AVAILABLE and PYMUPDF_AVAILABLE):
         return  # feature's off — stay silent rather than nag on every PDF
 
-    if doc.file_size and doc.file_size > GEMINI_MAX_FILE_BYTES:
-        await update.message.reply_text(MSG_AI_PDF_TOO_BIG.format(mb=GEMINI_MAX_FILE_BYTES // (1024 * 1024)))
+    if doc.file_size and doc.file_size > GROQ_MAX_FILE_BYTES:
+        await update.message.reply_text(MSG_AI_PDF_TOO_BIG.format(mb=GROQ_MAX_FILE_BYTES // (1024 * 1024)))
         return
 
     await update.message.reply_text(MSG_AI_PDF_ANALYZING)
     tg_file   = await context.bot.get_file(doc.file_id)
     pdf_bytes = bytes(await tg_file.download_as_bytearray())
 
-    questions, error = await gemini_extract_questions(pdf_bytes, "application/pdf")
+    questions, error = await groq_extract_questions_from_pdf(pdf_bytes)
     if error:
         await update.message.reply_text(error, parse_mode=ParseMode.HTML)
         return
@@ -2199,7 +2247,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
-    # ── AI EXTRACTION (Gemini) — manual retry, e.g. if auto-run failed ──
+    # ── AI EXTRACTION (Groq) — manual retry, e.g. if auto-run failed ──
     if query.data == "ai_extract_image":
         img_path = PENDING_IMAGE.get(user_id)
         if not img_path:
@@ -2924,7 +2972,7 @@ app.add_handler(MessageHandler(
     filters.PHOTO & ~filters.Chat(STORAGE_GROUP_ID), handle_image
 ))
 
-# AI PDF ingestion — a PDF sent in a private DM gets Gemini extraction;
+# AI PDF ingestion — a PDF sent in a private DM gets Groq extraction;
 # excludes the storage group (which indexes documents by password caption)
 # and the quiz channel (which only reads text/polls).
 app.add_handler(MessageHandler(
