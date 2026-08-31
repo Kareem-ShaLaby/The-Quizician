@@ -1579,6 +1579,27 @@ async def _present_ai_extraction(context, user_id: int, questions: list, image_p
     ]])
     await _send_chunked_html(context, user_id, preview, reply_markup=keyboard)
 
+async def _run_ai_extraction_for_image(context, user_id: int, img_path: str):
+    """Shared by the auto-triggered (uncaptioned image) and button-triggered
+    (manual retry) AI extraction paths, so the Gemini call only lives once."""
+    if not os.path.exists(img_path):
+        await context.bot.send_message(chat_id=user_id, text=MSG_AI_IMAGE_MISSING)
+        return
+    await context.bot.send_message(chat_id=user_id, text=MSG_AI_ANALYZING)
+    with open(img_path, "rb") as f:
+        img_bytes = f.read()
+    questions, error = await gemini_extract_questions(img_bytes, "image/jpeg")
+    if error:
+        await context.bot.send_message(chat_id=user_id, text=error, parse_mode=ParseMode.HTML)
+        return
+    if not questions:
+        await context.bot.send_message(chat_id=user_id, text=MSG_AI_NO_QUESTIONS)
+        return
+    # Only pair the original image back onto the question(s) when there's
+    # exactly one — attaching one screenshot to every question in a
+    # multi-question batch would just duplicate the same image N times.
+    await _present_ai_extraction(context, user_id, questions, image_path=img_path if len(questions) == 1 else None)
+
 # ═══════════════════════════════════════════════════════════════
 # IMAGE HANDLER (PDF mode only)
 # ═══════════════════════════════════════════════════════════════
@@ -1659,29 +1680,27 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Case 3: no usable question yet — park the image and ask ─────
+    # ── Case 3: no caption — auto-start AI extraction right away if it's
+    # configured; otherwise fall back to the manual "send your question
+    # next" pairing flow.
     _clear_pending_image(user_id)  # drop any earlier unclaimed pending image
     PENDING_IMAGE[user_id] = img_path
 
-    ai_button = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🤖 استخرج بالـ AI", callback_data="ai_extract_image"),
-    ]]) if (GEMINI_API_KEY and REQUESTS_AVAILABLE) else None
-
-    await update.message.reply_text(
-        MSG_AI_IMAGE_PARKED if ai_button else (
+    if GEMINI_API_KEY and REQUESTS_AVAILABLE:
+        await _run_ai_extraction_for_image(context, user_id, img_path)
+    else:
+        await update.message.reply_text(
             "🖼 <b>استلمت الصورة!</b>\n"
             "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
-            "وهيتضاف الصورة تلقائي للسؤال ده."
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=ai_button,
-    )
+            "وهيتضاف الصورة تلقائي للسؤال ده.",
+            parse_mode=ParseMode.HTML,
+        )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """PDFs sent in a private DM get the same AI extraction treatment as
-    images — lets someone hand over a whole scanned exam instead of one
-    screenshot at a time. Non-PDF documents are left untouched (the storage
-    group handles its own document indexing separately)."""
+    """PDFs sent in a private DM: captioned = treated as a manual question
+    (caption parsed as the MCQ text — no attachment, since Telegram polls
+    can only carry a photo, not a PDF); uncaptioned = handed to Gemini for
+    AI extraction, same as an uncaptioned image."""
     if not update.message or not update.message.document:
         return
     user_id = update.effective_chat.id
@@ -1690,6 +1709,31 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if doc.mime_type != "application/pdf":
         return
+
+    caption = (update.message.caption or "").strip()
+    if caption:
+        in_pdf_mode = user_id in PDF_BUFFER
+        parsed = parse_mcq_block(caption)
+        if not parsed:
+            await update.message.reply_text(
+                "⚠️ الكابشن مش صيغة سؤال كاملة (لازم سؤال + اختيارات + إجابة صح متعلّم عليها بـ z).\n"
+                "ابعت الملف تاني من غير كابشن لو عايز تستخدم استخراج الـ AI بدل كده."
+            )
+            return
+        question, raw_options, correct_index, explanation = parsed
+        if in_pdf_mode:
+            labeled_options = [f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)]
+            PDF_BUFFER[user_id].append({"type": "mcq", "q": question, "options": labeled_options, "correct": correct_index})
+            await update_progress(
+                context, user_id, update.effective_chat.id,
+                latest_label=f"📄 {question[:50]}" + ("…" if len(question) > 50 else ""),
+            )
+        else:
+            await deliver_quiz(context, user_id, question, raw_options, correct_index, explanation=explanation)
+            await react_random(update, context)
+        return
+
+    # ── No caption: AI extraction ────────────────────────────────
     if not (GEMINI_API_KEY and REQUESTS_AVAILABLE):
         return  # feature's off — stay silent rather than nag on every PDF
 
@@ -2154,26 +2198,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
-    # ── AI EXTRACTION (Gemini) ──────────────────────────────────
+    # ── AI EXTRACTION (Gemini) — manual retry, e.g. if auto-run failed ──
     if query.data == "ai_extract_image":
         img_path = PENDING_IMAGE.get(user_id)
-        if not img_path or not os.path.exists(img_path):
+        if not img_path:
             await query.edit_message_text(MSG_AI_IMAGE_MISSING)
             return
-        await query.edit_message_text(MSG_AI_ANALYZING)
-        with open(img_path, "rb") as f:
-            img_bytes = f.read()
-        questions, error = await gemini_extract_questions(img_bytes, "image/jpeg")
-        if error:
-            await context.bot.send_message(chat_id=user_id, text=error, parse_mode=ParseMode.HTML)
-            return
-        if not questions:
-            await context.bot.send_message(chat_id=user_id, text=MSG_AI_NO_QUESTIONS)
-            return
-        # Only pair the original image back onto the question(s) when there's
-        # exactly one — attaching one screenshot to every question in a
-        # multi-question batch would just duplicate the same image N times.
-        await _present_ai_extraction(context, user_id, questions, image_path=img_path if len(questions) == 1 else None)
+        await _run_ai_extraction_for_image(context, user_id, img_path)
         return
 
     if query.data == "ai_confirm_add":
