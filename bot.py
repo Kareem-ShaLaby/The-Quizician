@@ -113,7 +113,7 @@ MODULES = {
 # 1. Get a free key at https://aistudio.google.com/apikey
 # 2. Paste it below. Leave empty ("") to keep this feature off — every
 #    other part of the bot works fine without it.
-api_key = os.environ["GEMINI_API_KEY"]   # ← CHANGE THIS
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")   # ← CHANGE THIS
 GEMINI_MODEL   = "gemini-2.5-flash"   # fast + cheap + vision-capable; change if you prefer another Gemini model
 GEMINI_MAX_FILE_BYTES = 15 * 1024 * 1024   # 15MB cap on inline uploads (images/PDFs) sent to Gemini
 
