@@ -6,7 +6,16 @@ import os
 import asyncio
 import html
 import tempfile
+import base64
 from io import BytesIO
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    # requests not installed — AI question extraction (Gemini) is simply
+    # disabled until it's installed; everything else works fine.
+    REQUESTS_AVAILABLE = False
 
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile
 from telegram.error import Forbidden
@@ -100,6 +109,14 @@ MODULES = {
     "Genitourinary":  ["Anatomy", "Physio", "Histo", "Patho", "Micro"],
 }
 
+# ── Gemini AI (question extraction from images/PDFs) ─────────────
+# 1. Get a free key at https://aistudio.google.com/apikey
+# 2. Paste it below. Leave empty ("") to keep this feature off — every
+#    other part of the bot works fine without it.
+GEMINI_API_KEY = ""   # ← CHANGE THIS
+GEMINI_MODEL   = "gemini-2.5-flash"   # fast + cheap + vision-capable; change if you prefer another Gemini model
+GEMINI_MAX_FILE_BYTES = 15 * 1024 * 1024   # 15MB cap on inline uploads (images/PDFs) sent to Gemini
+
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — The Quizician's cat friend 🐾
 # ═══════════════════════════════════════════════════════════════
@@ -174,6 +191,32 @@ MSG_PDF_CLEARED = "🗑 تم قرار إزالة يا دولي"
 MSG_EXPORT_CLEARED_ALL = "🗑 تم قرار إزاله يا دولي"
 MSG_CANCEL_DONE = "❌ تم نطر أبلكاش"
 MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
+
+# ── AI question extraction (Gemini) ───────────────────────────
+MSG_AI_IMAGE_PARKED = (
+    "🖼 <b>استلمت الصورة!</b>\n"
+    "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة)، "
+    "أو خلي الـ AI يقراها ويستخرج الأسئلة تلقائي 👇"
+)
+MSG_AI_NOT_CONFIGURED = "⚠️ ميزة الاستخراج بالـ AI مش متفعّلة دلوقتي. كلم الأدمن يضيف GEMINI_API_KEY في الكود."
+MSG_AI_REQUESTS_MISSING = "⚠️ مكتبة requests مش متثبتة. ثبّتها بـ: pip install requests"
+MSG_AI_ANALYZING = "🤖 جاري التحليل بالـ AI... ⏳"
+MSG_AI_ERROR = "⚠️ حصل خطأ أثناء الاستخراج بالـ AI:\n<code>{error}</code>"
+MSG_AI_NO_QUESTIONS = "🤖 معرفتش ألاقي أي أسئلة اختيار من متعدد في الملف ده. جرب صورة أوضح، أو اكتب السؤال يدوي."
+MSG_AI_IMAGE_MISSING = "⚠️ الصورة دي مش متاحة دلوقتي، ابعتها تاني."
+MSG_AI_PREVIEW_HEADER = "🤖 <b>لقيت {count} سؤال:</b>\n"
+MSG_AI_PREVIEW_QUESTION = "<b>Q{i}: {question}</b>"
+MSG_AI_ANSWER_MARKED = "<i>الإجابة: معلّمة في المصدر ✅</i>"
+MSG_AI_ANSWER_AI = "<i>الإجابة: تحديد الـ AI 🤖 (راجعها!)</i>"
+MSG_AI_ANSWER_UNCLEAR = "<i>الإجابة: مش متأكد منها الـ AI ⚠️ (راجعها كويس!)</i>"
+MSG_AI_EXPLANATION_SOURCE = "<i>الشرح ({source}): {text}</i>"
+MSG_AI_PREVIEW_FOOTER = "\n⚠️ راجع الأسئلة (خصوصاً المعلّم عليها 🤖) قبل ما تضيفها."
+MSG_AI_NOTHING_PENDING = "⚠️ مفيش نتيجة استخراج معلّقة."
+MSG_AI_DISCARDED = "❌ اتجاهلت النتيجة."
+MSG_AI_ADDED_PDF = "✅ اتضافوا {count} سؤال لملف الـ PDF!\nابعت /pdf_generate لما تخلص."
+MSG_AI_SENDING_QUIZZES = "✅ هبعتلك {count} كويز دلوقتي..."
+MSG_AI_PDF_TOO_BIG = "⚠️ الملف كبير أوي (الحد الأقصى {mb}MB)."
+MSG_AI_PDF_ANALYZING = "🤖 جاري تحليل الـ PDF بالـ AI... ده ممكن ياخد شوية وقت ⏳"
 
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
@@ -544,6 +587,7 @@ AWAITING_GALLERY_PHOTO = set() # admin is expected to send the next photo to add
 PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
 CLARIFY_QUEUE          = {}    # user_id -> list of PDF_BUFFER indices awaiting a correct-answer tap
 POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive auto-detection
+PENDING_AI_EXTRACTION  = {}    # user_id -> {"questions": [...], "image_path": str or None}
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -920,6 +964,10 @@ HOW_TO_USE_TEXT = (
     "Forward any Telegram quiz — the bot re-sends it with the correct answer preserved.\n\n"
     "<b>5) PDF / DOCX Mode</b>\n"
     "Use /pdf_start, collect items, then export.\n\n"
+    "<b>6) 🤖 AI Extraction</b>\n"
+    "Send a screenshot or PDF of MCQs with no caption — Quizzy reads it with AI, "
+    "pulls out every question (even several at once), and shows you a preview "
+    "to approve before anything's added. Always double-check the answers it picks!\n\n"
     "😴 /sleep — mute the bot until /start"
 )
 
@@ -1379,6 +1427,159 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text=full_text)
 
 # ═══════════════════════════════════════════════════════════════
+# GEMINI AI — extracts MCQs straight out of a screenshot/PDF, so nobody
+# has to retype a question by hand. Off entirely if GEMINI_API_KEY is
+# empty or `requests` isn't installed — every other feature still works.
+# ═══════════════════════════════════════════════════════════════
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+
+GEMINI_QUESTION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "questions": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "question":           {"type": "STRING"},
+                    "options":            {"type": "ARRAY", "items": {"type": "STRING"}},
+                    "correct_index":      {"type": "INTEGER"},
+                    "answer_source":      {"type": "STRING", "enum": ["marked_in_source", "ai_determined", "unclear"]},
+                    "explanation":        {"type": "STRING"},
+                    "explanation_source": {"type": "STRING", "enum": ["from_source", "ai_generated", "none"]},
+                },
+                "required": ["question", "options", "correct_index", "answer_source"],
+            },
+        },
+    },
+    "required": ["questions"],
+}
+
+GEMINI_EXTRACT_PROMPT = (
+    "You are extracting multiple-choice exam questions from the attached file "
+    "(a photo/screenshot or a PDF of exam questions, likely medical). Extract "
+    "EVERY distinct MCQ you can find, preserving the exact original wording of "
+    "the question and its options — same language as the source, do not translate "
+    "and do not paraphrase.\n\n"
+    "For each question:\n"
+    "- If the source visibly marks the correct answer (checkmark, bold, highlight, "
+    "circle, different color, star, answer key, etc.), use that and set "
+    "answer_source to 'marked_in_source'.\n"
+    "- If no answer is marked anywhere, use your own subject-matter knowledge to "
+    "determine the most likely correct answer and set answer_source to "
+    "'ai_determined'. If you are genuinely unsure, still give your best guess but "
+    "set answer_source to 'unclear'.\n"
+    "- If the source includes an explanation/rationale for the answer, extract it "
+    "verbatim and set explanation_source to 'from_source'. Otherwise write a short "
+    "(1–2 sentence) explanation yourself and set explanation_source to "
+    "'ai_generated'. If you can't produce a reliable one, leave explanation empty "
+    "and set explanation_source to 'none'.\n\n"
+    "If the file contains no MCQs at all, return an empty questions array. Do not "
+    "invent questions that aren't actually present."
+)
+
+async def gemini_extract_questions(file_bytes: bytes, mime_type: str):
+    """Calls Gemini to extract MCQs from an image or PDF's raw bytes.
+    Returns (questions, error) — questions is a list of dicts (possibly empty)
+    on success; error is a ready-to-send Arabic string (or None) on failure."""
+    if not GEMINI_API_KEY:
+        return [], MSG_AI_NOT_CONFIGURED
+    if not REQUESTS_AVAILABLE:
+        return [], MSG_AI_REQUESTS_MISSING
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": GEMINI_EXTRACT_PROMPT},
+                {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(file_bytes).decode("ascii")}},
+            ],
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": GEMINI_QUESTION_SCHEMA,
+        },
+    }
+    url = GEMINI_ENDPOINT.format(model=GEMINI_MODEL, key=GEMINI_API_KEY)
+
+    try:
+        # requests is sync — run it off the event loop so we don't block
+        # every other chat the bot is handling while Gemini thinks.
+        resp = await asyncio.to_thread(requests.post, url, json=payload, timeout=90)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        questions = json.loads(text).get("questions", [])
+    except Exception as e:
+        print("GEMINI EXTRACT ERROR:", repr(e))
+        return [], MSG_AI_ERROR.format(error=e)
+
+    # Sanity-filter: drop anything malformed rather than trust the model
+    # blindly — a bad correct_index would silently ship a wrong answer.
+    clean = []
+    for q in questions:
+        opts = q.get("options") or []
+        ci   = q.get("correct_index")
+        if not q.get("question") or len(opts) < 2 or not isinstance(ci, int) or not (0 <= ci < len(opts)):
+            continue
+        clean.append(q)
+    return clean, None
+
+def build_ai_extraction_preview(questions: list) -> str:
+    lines = [MSG_AI_PREVIEW_HEADER.format(count=len(questions))]
+    for i, q in enumerate(questions, 1):
+        lines.append(MSG_AI_PREVIEW_QUESTION.format(i=i, question=q["question"]))
+        for j, opt in enumerate(q["options"]):
+            lines.append(("✅ " if j == q["correct_index"] else "◻️ ") + opt)
+        src = q.get("answer_source")
+        lines.append(
+            MSG_AI_ANSWER_MARKED if src == "marked_in_source"
+            else MSG_AI_ANSWER_UNCLEAR if src == "unclear"
+            else MSG_AI_ANSWER_AI
+        )
+        expl = (q.get("explanation") or "").strip()
+        if expl:
+            source_label = "من المصدر" if q.get("explanation_source") == "from_source" else "🤖 مولّد بالـ AI"
+            lines.append(MSG_AI_EXPLANATION_SOURCE.format(source=source_label, text=expl))
+        lines.append("")
+    lines.append(MSG_AI_PREVIEW_FOOTER)
+    return "\n".join(lines)
+
+async def _send_chunked_html(context, chat_id: int, text: str, reply_markup=None, chunk_size: int = 3500):
+    """Sends long HTML text as multiple messages if needed (Telegram caps
+    messages at 4096 chars) — splits on blank lines so a question is never
+    cut in half. Only the LAST chunk gets the reply_markup buttons."""
+    paragraphs = text.split("\n\n")
+    chunks, current = [], ""
+    for p in paragraphs:
+        candidate = (current + "\n\n" + p) if current else p
+        if len(candidate) > chunk_size and current:
+            chunks.append(current)
+            current = p
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    if not chunks:
+        chunks = [text]
+
+    for i, chunk in enumerate(chunks):
+        await context.bot.send_message(
+            chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup if i == len(chunks) - 1 else None,
+        )
+
+async def _present_ai_extraction(context, user_id: int, questions: list, image_path: str = None):
+    """Shared by both the image flow and the PDF flow: stashes the
+    extracted questions and shows the review card with Add/Discard buttons."""
+    PENDING_AI_EXTRACTION[user_id] = {"questions": questions, "image_path": image_path}
+    preview = build_ai_extraction_preview(questions)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ ضيف الكل ({len(questions)})", callback_data="ai_confirm_add"),
+        InlineKeyboardButton("❌ تجاهل", callback_data="ai_discard"),
+    ]])
+    await _send_chunked_html(context, user_id, preview, reply_markup=keyboard)
+
+# ═══════════════════════════════════════════════════════════════
 # IMAGE HANDLER (PDF mode only)
 # ═══════════════════════════════════════════════════════════════
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1462,12 +1663,52 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _clear_pending_image(user_id)  # drop any earlier unclaimed pending image
     PENDING_IMAGE[user_id] = img_path
 
+    ai_button = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🤖 استخرج بالـ AI", callback_data="ai_extract_image"),
+    ]]) if (GEMINI_API_KEY and REQUESTS_AVAILABLE) else None
+
     await update.message.reply_text(
-        "🖼 <b>استلمت الصورة!</b>\n"
-        "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
-        "وهيتضاف الصورة تلقائي للسؤال ده.",
+        MSG_AI_IMAGE_PARKED if ai_button else (
+            "🖼 <b>استلمت الصورة!</b>\n"
+            "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
+            "وهيتضاف الصورة تلقائي للسؤال ده."
+        ),
         parse_mode=ParseMode.HTML,
+        reply_markup=ai_button,
     )
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PDFs sent in a private DM get the same AI extraction treatment as
+    images — lets someone hand over a whole scanned exam instead of one
+    screenshot at a time. Non-PDF documents are left untouched (the storage
+    group handles its own document indexing separately)."""
+    if not update.message or not update.message.document:
+        return
+    user_id = update.effective_chat.id
+    if user_id in SLEEPING:
+        return
+    doc = update.message.document
+    if doc.mime_type != "application/pdf":
+        return
+    if not (GEMINI_API_KEY and REQUESTS_AVAILABLE):
+        return  # feature's off — stay silent rather than nag on every PDF
+
+    if doc.file_size and doc.file_size > GEMINI_MAX_FILE_BYTES:
+        await update.message.reply_text(MSG_AI_PDF_TOO_BIG.format(mb=GEMINI_MAX_FILE_BYTES // (1024 * 1024)))
+        return
+
+    await update.message.reply_text(MSG_AI_PDF_ANALYZING)
+    tg_file   = await context.bot.get_file(doc.file_id)
+    pdf_bytes = bytes(await tg_file.download_as_bytearray())
+
+    questions, error = await gemini_extract_questions(pdf_bytes, "application/pdf")
+    if error:
+        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
+        return
+    if not questions:
+        await update.message.reply_text(MSG_AI_NO_QUESTIONS)
+        return
+    await _present_ai_extraction(context, user_id, questions, image_path=None)
 
 # ═══════════════════════════════════════════════════════════════
 # STORAGE GROUP — AUTO-INDEXING
@@ -1913,6 +2154,65 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
+    # ── AI EXTRACTION (Gemini) ──────────────────────────────────
+    if query.data == "ai_extract_image":
+        img_path = PENDING_IMAGE.get(user_id)
+        if not img_path or not os.path.exists(img_path):
+            await query.edit_message_text(MSG_AI_IMAGE_MISSING)
+            return
+        await query.edit_message_text(MSG_AI_ANALYZING)
+        with open(img_path, "rb") as f:
+            img_bytes = f.read()
+        questions, error = await gemini_extract_questions(img_bytes, "image/jpeg")
+        if error:
+            await context.bot.send_message(chat_id=user_id, text=error, parse_mode=ParseMode.HTML)
+            return
+        if not questions:
+            await context.bot.send_message(chat_id=user_id, text=MSG_AI_NO_QUESTIONS)
+            return
+        # Only pair the original image back onto the question(s) when there's
+        # exactly one — attaching one screenshot to every question in a
+        # multi-question batch would just duplicate the same image N times.
+        await _present_ai_extraction(context, user_id, questions, image_path=img_path if len(questions) == 1 else None)
+        return
+
+    if query.data == "ai_confirm_add":
+        pending = PENDING_AI_EXTRACTION.pop(user_id, None)
+        if not pending:
+            await query.edit_message_text(MSG_AI_NOTHING_PENDING)
+            return
+        questions  = pending["questions"]
+        image_path = pending["image_path"]
+        in_pdf_mode = user_id in PDF_BUFFER
+
+        if in_pdf_mode:
+            for q in questions:
+                labeled_options = [f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(q["options"])]
+                item = {"type": "mcq", "q": q["question"], "options": labeled_options, "correct": q["correct_index"]}
+                if image_path:
+                    item["image"] = image_path
+                PDF_BUFFER[user_id].append(item)
+            await update_progress(context, user_id, user_id, latest_label=f"🤖 AI × {len(questions)}")
+            await query.edit_message_text(MSG_AI_ADDED_PDF.format(count=len(questions)))
+        else:
+            await query.edit_message_text(MSG_AI_SENDING_QUIZZES.format(count=len(questions)))
+            for i, q in enumerate(questions):
+                explanation = q.get("explanation") if q.get("explanation_source") == "from_source" else None
+                await deliver_quiz(
+                    context, user_id, q["question"], q["options"], q["correct_index"],
+                    explanation=explanation, image_path=image_path if i == 0 else None,
+                )
+
+        # The image is now either attached to the item or intentionally
+        # skipped — either way it's "used", so stop treating it as pending.
+        PENDING_IMAGE.pop(user_id, None)
+        return
+
+    if query.data == "ai_discard":
+        PENDING_AI_EXTRACTION.pop(user_id, None)
+        await query.edit_message_text(MSG_AI_DISCARDED)
+        return
+
     # ── QUIZ MODULES: top-level list ──────────────────────────────
     if query.data == "quiz_modules":
         modules = ready_modules()
@@ -2231,6 +2531,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     was_doing_something = bool(
         PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
         or PENDING_IMAGE.get(user_id) or user_id in AWAITING_GALLERY_PHOTO
+        or PENDING_AI_EXTRACTION.get(user_id)
     )
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
@@ -2240,6 +2541,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AWAITING_NAME.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
     AWAITING_GALLERY_PHOTO.discard(user_id)
+    PENDING_AI_EXTRACTION.pop(user_id, None)
     if was_doing_something:
         await update.message.reply_text(MSG_CANCEL_DONE)
     else:
@@ -2278,6 +2580,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("/quiz — تصفح المحاضرات (موديول ← مادة ← محاضرة) وسحب أسئلتها")
     lines.append("/storage_id — يجيب chat ID بتاع المكان ده (لضبط STORAGE_GROUP_ID)")
     lines.append("/quiz_channel_id — يجيب chat ID لقناة الكويز (فوروارد رسالة منها الأول)")
+    lines.append("🤖 ابعت صورة/PDF أسئلة من غير كابشن — هيعرض زرار استخراج بالـ AI")
     lines.append("/c — القائمة دي")
 
     if is_admin(update):
@@ -2587,6 +2890,13 @@ app.add_handler(MessageHandler(
 # Image handler (photos in PDF mode) — excludes the storage group
 app.add_handler(MessageHandler(
     filters.PHOTO & ~filters.Chat(STORAGE_GROUP_ID), handle_image
+))
+
+# AI PDF ingestion — a PDF sent in a private DM gets Gemini extraction;
+# excludes the storage group (which indexes documents by password caption)
+# and the quiz channel (which only reads text/polls).
+app.add_handler(MessageHandler(
+    filters.Document.PDF & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_ID), handle_document
 ))
 
 # Inline buttons
