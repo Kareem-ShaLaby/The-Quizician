@@ -451,13 +451,14 @@ def parse_lecture_title(text: str):
     return module_match, subject_match, lecture_number, name
 
 def ready_modules():
-    return sorted({v["module"] for v in QUIZ_INDEX.values() if v["closed"] and v["ids"]})
+    # Always show every configured module — even ones with zero lectures
+    # posted yet — so the curriculum structure is visible from day one.
+    return list(MODULES.keys())
 
 def ready_subjects(module: str):
-    return sorted({
-        v["subject"] for v in QUIZ_INDEX.values()
-        if v["closed"] and v["ids"] and v["module"] == module
-    })
+    # Same idea: every subject defined for this module shows up, regardless
+    # of whether any lecture has been posted for it yet.
+    return list(MODULES.get(module, []))
 
 def ready_lecture_keys(module: str, subject: str):
     return [
@@ -602,6 +603,8 @@ PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its 
 CLARIFY_QUEUE          = {}    # user_id -> list of PDF_BUFFER indices awaiting a correct-answer tap
 POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive auto-detection
 PENDING_AI_EXTRACTION  = {}    # user_id -> {"questions": [...], "image_path": str or None}
+PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/"content"/"option", "opt_index": int?}
+                                # awaiting free-text replacement for one field of a just-added question
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -762,6 +765,10 @@ def _clear_pending_image(user_id: int):
             os.remove(path)
         except Exception:
             pass
+
+def _clear_pending_edit(user_id: int):
+    """Drop any pending 'send new text for this field' state for this user."""
+    PENDING_EDIT.pop(user_id, None)
 
 def _clear_clarify_queue(user_id: int):
     """Drop any pending 'choose the correct answer' queue/watches for this user."""
@@ -1375,6 +1382,55 @@ async def _ask_next_clarification(context, user_id: int, chat_id: int):
     # queue exhausted — nothing left to ask
     CLARIFY_QUEUE.pop(user_id, None)
 
+# ═══════════════════════════════════════════════════════════════
+# QUESTION REVIEW / EDIT — after a question lands in the PDF buffer
+# (correct answer already known at this point, whether that came in
+# automatically or via the clarify buttons above), show it back to the
+# admin with buttons to tweak the question text, any option's text, or
+# even flip which option is correct — before moving on.
+# ═══════════════════════════════════════════════════════════════
+def _review_text(item: dict) -> str:
+    if item["type"] == "written":
+        return f"📝 <b>{html.escape(item['title'])}</b>\n{html.escape(item['content'])}"
+    lines = [f"❓ {html.escape(item['q'])}"]
+    for i, opt in enumerate(item["options"]):
+        mark = "  ✅" if i == item.get("correct") else ""
+        lines.append(html.escape(opt) + mark)
+    return "\n".join(lines)
+
+def _review_buttons(item_index: int, item: dict) -> InlineKeyboardMarkup:
+    if item["type"] == "written":
+        rows = [
+            [InlineKeyboardButton("✏️ عدّل العنوان", callback_data=f"revedit:{item_index}:title")],
+            [InlineKeyboardButton("✏️ عدّل المحتوى", callback_data=f"revedit:{item_index}:content")],
+            [InlineKeyboardButton("✅ تمام، مفيش تعديل", callback_data=f"revedit:{item_index}:done")],
+        ]
+        return InlineKeyboardMarkup(rows)
+
+    opt_buttons = [
+        InlineKeyboardButton(f"✏️ {string.ascii_uppercase[i]}", callback_data=f"revedit:{item_index}:opt:{i}")
+        for i in range(len(item["options"]))
+    ]
+    rows = [opt_buttons[i:i + 6] for i in range(0, len(opt_buttons), 6)]
+    rows.append([InlineKeyboardButton("✏️ عدّل نص السؤال", callback_data=f"revedit:{item_index}:q")])
+    if item.get("correct") is not None:
+        rows.append([InlineKeyboardButton("🔁 غيّر الإجابة الصح", callback_data=f"revedit:{item_index}:correct")])
+    rows.append([InlineKeyboardButton("✅ تمام، مفيش تعديل", callback_data=f"revedit:{item_index}:done")])
+    return InlineKeyboardMarkup(rows)
+
+async def _send_review_prompt(context, chat_id: int, user_id: int, item_index: int):
+    """Ask the admin whether the just-added question needs any edits."""
+    items = PDF_BUFFER.get(user_id)
+    if not items or item_index >= len(items):
+        return
+    item = items[item_index]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="👀 <b>راجع السؤال:</b>\n\n" + _review_text(item) + "\n\nفيه حاجة عايز تعدلها؟",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_review_buttons(item_index, item),
+    )
+
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.poll:
         return
@@ -1419,12 +1475,17 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if correct_index is None:
             # Telegram hid the answer (quiz still open, not ours) — queue it
-            # for a quick button tap instead of silently guessing.
+            # for a quick button tap instead of silently guessing. The
+            # review/edit prompt fires once that tap resolves it (see the
+            # "clarify:" branch in button_handler).
             POLL_WATCH[poll.id] = (user_id, item_index)
             queue = CLARIFY_QUEUE.setdefault(user_id, [])
             queue.append(item_index)
             if len(queue) == 1:  # nothing else currently being asked
                 await _ask_next_clarification(context, user_id, update.effective_chat.id)
+        else:
+            # Correct answer already known — go straight to the review prompt.
+            await _send_review_prompt(context, update.effective_chat.id, user_id, item_index)
         return
 
     # ── Normal mode: echo the original question text + choices — ─
@@ -2091,6 +2152,32 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
+    # ── AWAITING A QUESTION EDIT (from the review/edit prompt) ───
+    pending_edit = PENDING_EDIT.pop(user_id, None)
+    if pending_edit:
+        items = PDF_BUFFER.get(user_id)
+        idx   = pending_edit["index"]
+        if not items or idx >= len(items):
+            await update.message.reply_text("⚠️ السؤال ده مش موجود في البافر دلوقتي.")
+            return
+        item  = items[idx]
+        field = pending_edit["field"]
+
+        if field == "option":
+            opt_idx = pending_edit["opt_index"]
+            if 0 <= opt_idx < len(item["options"]):
+                letter = string.ascii_uppercase[opt_idx]
+                item["options"][opt_idx] = f"{letter}) {text}"
+        elif field in ("q", "title", "content"):
+            item[field] = text
+
+        await update.message.reply_text(
+            "👀 <b>راجع السؤال:</b>\n\n" + _review_text(item) + "\n\nفيه حاجة تانية عايز تعدلها؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_review_buttons(idx, item),
+        )
+        return
+
     # ── AWAITING PDF NAME ────────────────────────────────────────
     if AWAITING_NAME.get(user_id):
         name = text.strip()
@@ -2099,6 +2186,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PROGRESS_MSG_ID.pop(user_id, None)
         _clear_pending_image(user_id)
         _clear_clarify_queue(user_id)
+        _clear_pending_edit(user_id)
         del AWAITING_NAME[user_id]
         await update.message.reply_text(
             f"📥 <b>PDF mode activated</b> — File name: <i>{name}</i>\n\n"
@@ -2185,6 +2273,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     })
                     any_saved  = True
                     last_label = title[:50] + ("…" if len(title) > 50 else "")
+                    await _send_review_prompt(
+                        context, update.effective_chat.id, user_id, len(PDF_BUFFER[user_id]) - 1
+                    )
                 else:
                     await update.message.reply_text(
                         f"*{title}*\n||{content}||",
@@ -2238,6 +2329,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 PDF_BUFFER[user_id].append(item)
                 any_saved  = True
                 last_label = ("🖼 " if pending_img else "") + question[:50] + ("…" if len(question) > 50 else "")
+                await _send_review_prompt(
+                    context, update.effective_chat.id, user_id, len(PDF_BUFFER[user_id]) - 1
+                )
                 continue
 
             # ── NORMAL QUIZ MODE ─────────────────────────────────
@@ -2364,8 +2458,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, name in enumerate(names)
         ]
         buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"module:{mod_idx}")])
+        header = f"🎓 <b>{module} - {subject}</b>"
+        if not names:
+            header += "\n\n📭 لسه مفيش محاضرات هنا."
         await query.edit_message_text(
-            f"🎓 <b>{module} - {subject}</b>", parse_mode=ParseMode.HTML,
+            header, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
@@ -2484,11 +2581,80 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             queue.remove(item_index)
 
         await query.edit_message_text(f"✅ Q{item_index + 1}: {item['options'][choice]}")
+        await _send_review_prompt(context, query.message.chat_id, user_id, item_index)
 
         if queue:
             await _ask_next_clarification(context, user_id, query.message.chat_id)
         else:
             CLARIFY_QUEUE.pop(user_id, None)
+        return
+
+    # ── QUESTION REVIEW / EDIT ──────────────────────────────────
+    if query.data.startswith("revedit:"):
+        parts      = query.data.split(":")
+        item_index = int(parts[1])
+        action     = parts[2]
+
+        items = PDF_BUFFER.get(user_id)
+        if not items or item_index >= len(items):
+            await query.edit_message_text("⚠️ السؤال ده مش موجود في البافر دلوقتي.")
+            return
+        item = items[item_index]
+
+        if action == "done":
+            await query.edit_message_text(
+                "✅ <b>خلاص، اتسجل:</b>\n\n" + _review_text(item), parse_mode=ParseMode.HTML
+            )
+            return
+
+        if action in ("q", "title", "content"):
+            PENDING_EDIT[user_id] = {"index": item_index, "field": action}
+            prompt = {
+                "q":       "✏️ اكتب نص السؤال الجديد:",
+                "title":   "✏️ اكتب العنوان الجديد:",
+                "content": "✏️ اكتب المحتوى الجديد:",
+            }[action]
+            await query.edit_message_text(prompt)
+            return
+
+        if action == "opt":
+            opt_idx = int(parts[3])
+            if not (0 <= opt_idx < len(item["options"])):
+                return
+            PENDING_EDIT[user_id] = {"index": item_index, "field": "option", "opt_index": opt_idx}
+            letter = string.ascii_uppercase[opt_idx]
+            await query.edit_message_text(f"✏️ اكتب النص الجديد للاختيار {letter} (من غير الحرف):")
+            return
+
+        if action == "correct":
+            buttons = [
+                InlineKeyboardButton(string.ascii_uppercase[i], callback_data=f"revcorrect:{item_index}:{i}")
+                for i in range(len(item["options"]))
+            ]
+            rows = [buttons[i:i + 6] for i in range(0, len(buttons), 6)]
+            await query.edit_message_text("🔁 اختار الإجابة الصح:", reply_markup=InlineKeyboardMarkup(rows))
+            return
+        return
+
+    if query.data.startswith("revcorrect:"):
+        _, item_index_str, choice_str = query.data.split(":")
+        item_index = int(item_index_str)
+        choice     = int(choice_str)
+
+        items = PDF_BUFFER.get(user_id)
+        if not items or item_index >= len(items):
+            await query.edit_message_text("⚠️ السؤال ده مش موجود في البافر دلوقتي.")
+            return
+        item = items[item_index]
+        if not (0 <= choice < len(item["options"])):
+            return
+
+        item["correct"] = choice
+        await query.edit_message_text(
+            "👀 <b>راجع السؤال:</b>\n\n" + _review_text(item) + "\n\nفيه حاجة تانية عايز تعدلها؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_review_buttons(item_index, item),
+        )
         return
 
     # ── START MENU BUTTONS ──────────────────────────────────────
@@ -2529,6 +2695,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _cleanup_images(user_id)
         _clear_pending_image(user_id)
         _clear_clarify_queue(user_id)
+        _clear_pending_edit(user_id)
         PDF_BUFFER.pop(user_id, None)
         PDF_NAMES.pop(user_id, None)
         PROGRESS_MSG_ID.pop(user_id, None)
@@ -2551,6 +2718,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _cleanup_images(user_id)
             _clear_pending_image(user_id)
             _clear_clarify_queue(user_id)
+            _clear_pending_edit(user_id)
             PDF_BUFFER.pop(user_id, None)
             PDF_NAMES.pop(user_id, None)
             PROGRESS_MSG_ID.pop(user_id, None)
@@ -2566,6 +2734,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _cleanup_images(user_id)
         _clear_pending_image(user_id)
         _clear_clarify_queue(user_id)
+        _clear_pending_edit(user_id)
         PDF_BUFFER.pop(user_id, None)
         PDF_NAMES.pop(user_id, None)
         AWAITING_NAME.pop(user_id, None)
@@ -2580,6 +2749,7 @@ async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
     _clear_clarify_queue(user_id)
+    _clear_pending_edit(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
@@ -2604,6 +2774,7 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
     _clear_clarify_queue(user_id)
+    _clear_pending_edit(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
@@ -2613,6 +2784,7 @@ async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
     _clear_clarify_queue(user_id)
+    _clear_pending_edit(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
@@ -2631,6 +2803,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
     _clear_clarify_queue(user_id)
+    _clear_pending_edit(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
