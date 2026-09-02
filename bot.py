@@ -6,25 +6,8 @@ import os
 import asyncio
 import html
 import tempfile
-import base64
 from io import BytesIO
 
-try:
-    import requests
-    REQUESTS_AVAILABLE = True
-except ImportError:
-    # requests not installed — AI question extraction (Groq) is simply
-    # disabled until it's installed; everything else works fine.
-    REQUESTS_AVAILABLE = False
-
-try:
-    import fitz  # PyMuPDF — rasterizes PDF pages to images for Groq's
-    # vision models, which (unlike Gemini) can't take raw PDF bytes.
-    PYMUPDF_AVAILABLE = True
-except ImportError:
-    # PyMuPDF not installed — AI extraction from PDFs is disabled until
-    # it's installed; AI extraction from images still works fine.
-    PYMUPDF_AVAILABLE = False
 
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile
 from telegram.error import Forbidden
@@ -118,18 +101,6 @@ MODULES = {
     "Genitourinary":  ["Anatomy", "Physio", "Histo", "Patho", "Micro"],
 }
 
-# ── Groq AI (question extraction from images/PDFs) ────────────────
-# 1. Get a free key at https://console.groq.com/keys
-# 2. Set it as GROQ_API_KEY in Railway's Variables tab. Leave unset to
-#    keep this feature off — every other part of the bot works fine
-#    without it.
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")   # ← set in Railway env vars
-GROQ_MODEL   = "qwen/qwen3.6-27b"   # Groq's current vision-capable model (preview); check
-                                     # https://console.groq.com/docs/vision if this gets deprecated
-GROQ_MAX_FILE_BYTES  = 15 * 1024 * 1024   # 15MB cap on the raw PDF/image upload before processing
-GROQ_PDF_MAX_PAGES   = 20                 # PDFs are rasterized page-by-page for the vision model —
-                                           # cap pages so one huge PDF can't take forever / cost a fortune
-
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — The Quizician's cat friend 🐾
 # ═══════════════════════════════════════════════════════════════
@@ -178,7 +149,7 @@ def quizzy_block(art: str, line: str) -> str:
 # BOT MESSAGES — every user-facing string the bot sends, in one place.
 # Grouped by feature. Dynamic ones use {placeholders} filled with .format().
 # (Content generated in a loop — like /c's command list, /quiz_list's
-# lecture rows, or gallery listings — stays where it's built, since there's
+# lecture rows — stays where it's built, since there's
 # nothing fixed to centralize there; only their static labels live here.)
 # ═══════════════════════════════════════════════════════════════
 
@@ -205,33 +176,6 @@ MSG_EXPORT_CLEARED_ALL = "🗑 تم قرار إزاله يا دولي"
 MSG_CANCEL_DONE = "❌ تم نطر أبلكاش"
 MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
 
-# ── AI question extraction (Groq) ─────────────────────────────
-MSG_AI_IMAGE_PARKED = (
-    "🖼 <b>استلمت الصورة!</b>\n"
-    "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة)، "
-    "أو خلي الـ AI يقراها ويستخرج الأسئلة تلقائي 👇"
-)
-MSG_AI_NOT_CONFIGURED = "⚠️ ميزة الاستخراج بالـ AI مش متفعّلة دلوقتي. كلم الأدمن يضيف GROQ_API_KEY في متغيرات البيئة."
-MSG_AI_PDF_NOT_AVAILABLE = "⚠️ استخراج الـ PDF مش متاح دلوقتي (مكتبة PyMuPDF مش متثبتة). ابعت صورة بدل كده."
-MSG_AI_REQUESTS_MISSING = "⚠️ مكتبة requests مش متثبتة. ثبّتها بـ: pip install requests"
-MSG_AI_ANALYZING = "🤖 جاري التحليل بالـ AI... ⏳"
-MSG_AI_ERROR = "⚠️ حصل خطأ أثناء الاستخراج بالـ AI:\n<code>{error}</code>"
-MSG_AI_NO_QUESTIONS = "🤖 معرفتش ألاقي أي أسئلة اختيار من متعدد في الملف ده. جرب صورة أوضح، أو اكتب السؤال يدوي."
-MSG_AI_IMAGE_MISSING = "⚠️ الصورة دي مش متاحة دلوقتي، ابعتها تاني."
-MSG_AI_PREVIEW_HEADER = "🤖 <b>لقيت {count} سؤال:</b>\n"
-MSG_AI_PREVIEW_QUESTION = "<b>Q{i}: {question}</b>"
-MSG_AI_ANSWER_MARKED = "<i>الإجابة: معلّمة في المصدر ✅</i>"
-MSG_AI_ANSWER_AI = "<i>الإجابة: تحديد الـ AI 🤖 (راجعها!)</i>"
-MSG_AI_ANSWER_UNCLEAR = "<i>الإجابة: مش متأكد منها الـ AI ⚠️ (راجعها كويس!)</i>"
-MSG_AI_EXPLANATION_SOURCE = "<i>الشرح ({source}): {text}</i>"
-MSG_AI_PREVIEW_FOOTER = "\n⚠️ راجع الأسئلة (خصوصاً المعلّم عليها 🤖) قبل ما تضيفها."
-MSG_AI_NOTHING_PENDING = "⚠️ مفيش نتيجة استخراج معلّقة."
-MSG_AI_DISCARDED = "❌ اتجاهلت النتيجة."
-MSG_AI_ADDED_PDF = "✅ اتضافوا {count} سؤال لملف الـ PDF!\nابعت /pdf_generate لما تخلص."
-MSG_AI_SENDING_QUIZZES = "✅ هبعتلك {count} كويز دلوقتي..."
-MSG_AI_PDF_TOO_BIG = "⚠️ الملف كبير أوي (الحد الأقصى {mb}MB)."
-MSG_AI_PDF_ANALYZING = "🤖 جاري تحليل الـ PDF بالـ AI... ده ممكن ياخد شوية وقت ⏳"
-
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
 # ═══════════════════════════════════════════════════════════════
@@ -250,21 +194,136 @@ def save_users():
 USERS = load_users()
 
 # ═══════════════════════════════════════════════════════════════
-# GALLERY STORAGE
+# ANALYTICS STORAGE
+# Tracks per-user stats that feed into XP / Levels later.
+# Schema: { "<user_id>": { "questions_created": int,
+#                          "streak": int,
+#                          "last_active_date": "YYYY-MM-DD" } }
+# Backed up to STORAGE_GROUP_ID as a pinned JSON document,
+# same pattern as the storage/quiz backups.
 # ═══════════════════════════════════════════════════════════════
-GALLERY_FILE = "gallery.json"
+ANALYTICS_FILE          = "analytics.json"
+ANALYTICS_BACKUP_MARKER = "🗄 QUIZICIAN_ANALYTICS_BACKUP"
+ANALYTICS_BACKUP_STATE_FILE = "analytics_backup_state.json"
 
-def load_gallery():
-    if os.path.exists(GALLERY_FILE):
-        with open(GALLERY_FILE, "r") as f:
+def load_analytics():
+    if os.path.exists(ANALYTICS_FILE):
+        with open(ANALYTICS_FILE, "r") as f:
             return json.load(f)
-    return []
+    return {}
 
-def save_gallery():
-    with open(GALLERY_FILE, "w") as f:
-        json.dump(GALLERY, f)
+def save_analytics():
+    with open(ANALYTICS_FILE, "w") as f:
+        json.dump(ANALYTICS, f)
 
-GALLERY: list = load_gallery()   # [{"file_id": "...", "caption": "..."}, ...]
+def load_analytics_backup_state():
+    if os.path.exists(ANALYTICS_BACKUP_STATE_FILE):
+        with open(ANALYTICS_BACKUP_STATE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_analytics_backup_state():
+    with open(ANALYTICS_BACKUP_STATE_FILE, "w") as f:
+        json.dump(ANALYTICS_BACKUP_STATE, f)
+
+ANALYTICS: dict            = load_analytics()
+ANALYTICS_BACKUP_STATE: dict = load_analytics_backup_state()
+
+def _today() -> str:
+    """UTC date string YYYY-MM-DD — consistent across restarts."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _record_activity(user_id: int, questions_delta: int = 0):
+    """Update streak and question count for user_id.
+    Call with questions_delta > 0 when questions are actually published
+    (deliver_quiz or pdf_generate), or 0 for any other bot interaction
+    that should count as an active day for streak purposes."""
+    key    = str(user_id)
+    today  = _today()
+    entry  = ANALYTICS.setdefault(key, {
+        "questions_created": 0,
+        "streak": 0,
+        "last_active_date": None,
+    })
+
+    last = entry.get("last_active_date")
+    if last != today:
+        # First activity today — advance or reset streak
+        from datetime import datetime, timezone, timedelta
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        if last == yesterday:
+            entry["streak"] += 1
+        elif last is None:
+            entry["streak"] = 1
+        else:
+            entry["streak"] = 1   # gap of ≥2 days — reset
+        entry["last_active_date"] = today
+
+    entry["questions_created"] += questions_delta
+    save_analytics()
+
+async def backup_analytics_to_channel(context):
+    if not STORAGE_GROUP_ID:
+        return
+    data       = json.dumps(ANALYTICS).encode("utf-8")
+    old_msg_id = ANALYTICS_BACKUP_STATE.get("backup_msg_id")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=STORAGE_GROUP_ID,
+            document=InputFile(BytesIO(data), filename="quizician_analytics_backup.json"),
+            caption=ANALYTICS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("ANALYTICS BACKUP ERROR:", e)
+        return
+
+    ANALYTICS_BACKUP_STATE["backup_msg_id"] = sent.message_id
+    save_analytics_backup_state()
+
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=STORAGE_GROUP_ID, message_id=sent.message_id, disable_notification=True
+        )
+    except Exception as e:
+        print("ANALYTICS BACKUP PIN ERROR:", e)
+
+    if old_msg_id and old_msg_id != sent.message_id:
+        try:
+            await context.bot.delete_message(chat_id=STORAGE_GROUP_ID, message_id=old_msg_id)
+        except Exception:
+            pass
+
+async def restore_analytics_from_channel(app):
+    """Runs once on startup — rebuilds ANALYTICS from the storage group's
+    pinned analytics backup if local file is missing/stale."""
+    if not STORAGE_GROUP_ID:
+        return
+    try:
+        # The analytics backup isn't the primary pinned message (that's the
+        # storage backup), so we scan recent messages for the marker caption
+        # rather than relying on get_chat().pinned_message.
+        saved_id = ANALYTICS_BACKUP_STATE.get("backup_msg_id")
+        if saved_id:
+            try:
+                msg     = await app.bot.forward_message(
+                    chat_id=ADMIN_ID, from_chat_id=STORAGE_GROUP_ID, message_id=saved_id
+                )
+                tg_file = await app.bot.get_file(msg.document.file_id)
+                raw     = await tg_file.download_as_bytearray()
+                ANALYTICS.update(json.loads(bytes(raw).decode("utf-8")))
+                save_analytics()
+                print(f"Restored analytics: {len(ANALYTICS)} user(s).")
+                # clean up the forwarded copy
+                try:
+                    await app.bot.delete_message(chat_id=ADMIN_ID, message_id=msg.message_id)
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                print("ANALYTICS RESTORE (saved id) ERROR:", e)
+    except Exception as e:
+        print("ANALYTICS RESTORE ERROR:", e)
 
 # ═══════════════════════════════════════════════════════════════
 # PASSWORD-GATED STORAGE (private group)
@@ -597,12 +656,9 @@ PDF_NAMES              = {}    # user_id -> str
 AWAITING_NAME          = {}    # user_id -> True
 SLEEPING               = set()
 PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
-GALLERY_SESSION        = {}    # user_id -> next photo index to send (0-based)
-AWAITING_GALLERY_PHOTO = set() # admin is expected to send the next photo to add
 PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
 CLARIFY_QUEUE          = {}    # user_id -> list of PDF_BUFFER indices awaiting a correct-answer tap
 POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive auto-detection
-PENDING_AI_EXTRACTION  = {}    # user_id -> {"questions": [...], "image_path": str or None}
 PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/"content"/"option", "opt_index": int?}
                                 # awaiting free-text replacement for one field of a just-added question
 
@@ -1526,225 +1582,6 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # ═══════════════════════════════════════════════════════════════
-# GROQ AI — extracts MCQs straight out of a screenshot/PDF, so nobody
-# has to retype a question by hand. Off entirely if GROQ_API_KEY is
-# empty or `requests` isn't installed — every other feature still works.
-# Groq's chat-completions endpoint is OpenAI-compatible and, unlike
-# Gemini, only accepts images (not raw PDF bytes) — PDFs are rasterized
-# page-by-page with PyMuPDF and sent through the same image path below.
-# ═══════════════════════════════════════════════════════════════
-GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
-
-GROQ_EXTRACT_PROMPT = (
-    "You are extracting multiple-choice exam questions from the attached image "
-    "(a photo/screenshot, or a scanned page of exam questions, likely medical). "
-    "Extract EVERY distinct MCQ you can find, preserving the exact original "
-    "wording of the question and its options — same language as the source, do "
-    "not translate and do not paraphrase.\n\n"
-    "For each question:\n"
-    "- If the source visibly marks the correct answer (checkmark, bold, highlight, "
-    "circle, different color, star, answer key, etc.), use that and set "
-    "answer_source to 'marked_in_source'.\n"
-    "- If no answer is marked anywhere, use your own subject-matter knowledge to "
-    "determine the most likely correct answer and set answer_source to "
-    "'ai_determined'. If you are genuinely unsure, still give your best guess but "
-    "set answer_source to 'unclear'.\n"
-    "- If the source includes an explanation/rationale for the answer, extract it "
-    "verbatim and set explanation_source to 'from_source'. Otherwise write a short "
-    "(1–2 sentence) explanation yourself and set explanation_source to "
-    "'ai_generated'. If you can't produce a reliable one, leave explanation empty "
-    "and set explanation_source to 'none'.\n\n"
-    "If the image contains no MCQs at all, return an empty questions array. Do not "
-    "invent questions that aren't actually present.\n\n"
-    "Respond with ONLY a JSON object (no markdown fences, no commentary) matching "
-    "exactly this shape:\n"
-    '{"questions": [{"question": "...", "options": ["...", "..."], '
-    '"correct_index": 0, "answer_source": "marked_in_source|ai_determined|unclear", '
-    '"explanation": "...", "explanation_source": "from_source|ai_generated|none"}]}'
-)
-
-async def groq_extract_questions(image_bytes: bytes, mime_type: str = "image/jpeg"):
-    """Calls Groq's vision model to extract MCQs from a single image's raw
-    bytes. Returns (questions, error) — questions is a list of dicts
-    (possibly empty) on success; error is a ready-to-send Arabic string (or
-    None) on failure."""
-    if not GROQ_API_KEY:
-        return [], MSG_AI_NOT_CONFIGURED
-    if not REQUESTS_AVAILABLE:
-        return [], MSG_AI_REQUESTS_MISSING
-
-    data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": GROQ_EXTRACT_PROMPT},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ],
-        }],
-        "response_format": {"type": "json_object"},
-    }
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-
-    try:
-        # requests is sync — run it off the event loop so we don't block
-        # every other chat the bot is handling while Groq thinks.
-        resp = await asyncio.to_thread(requests.post, GROQ_ENDPOINT, headers=headers, json=payload, timeout=90)
-        if resp.status_code >= 400:
-            # Surface Groq's actual error body (not just the status code) —
-            # it names the real problem (bad model id, unsupported param,
-            # image too large, etc.) instead of a bare "400 Bad Request".
-            print("GROQ EXTRACT ERROR:", resp.status_code, resp.text[:2000])
-            detail = resp.text.strip()
-            try:
-                detail = resp.json().get("error", {}).get("message", detail)
-            except Exception:
-                pass
-            return [], MSG_AI_ERROR.format(error=f"{resp.status_code} — {detail[:300]}")
-        data = resp.json()
-        text = data["choices"][0]["message"]["content"]
-        questions = json.loads(text).get("questions", [])
-    except Exception as e:
-        print("GROQ EXTRACT ERROR:", repr(e))
-        return [], MSG_AI_ERROR.format(error=e)
-
-    # Sanity-filter: drop anything malformed rather than trust the model
-    # blindly — a bad correct_index would silently ship a wrong answer.
-    clean = []
-    for q in questions:
-        opts = q.get("options") or []
-        ci   = q.get("correct_index")
-        if not q.get("question") or len(opts) < 2 or not isinstance(ci, int) or not (0 <= ci < len(opts)):
-            continue
-        clean.append(q)
-    return clean, None
-
-def pdf_bytes_to_page_jpegs(pdf_bytes: bytes, max_pages: int = GROQ_PDF_MAX_PAGES) -> list:
-    """Rasterizes a PDF's pages to JPEG bytes using PyMuPDF, capped at
-    max_pages. Returns a list of JPEG byte strings, one per page."""
-    images = []
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        page_count = min(len(doc), max_pages)
-        for i in range(page_count):
-            page = doc.load_page(i)
-            # 2x zoom keeps text legible for the vision model without
-            # blowing past Groq's per-image size limit.
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            images.append(pix.tobytes("jpeg"))
-    finally:
-        doc.close()
-    return images
-
-async def groq_extract_questions_from_pdf(pdf_bytes: bytes):
-    """Rasterizes a PDF page-by-page and runs groq_extract_questions on each
-    page, merging the results in page order. Returns (questions, error) with
-    the same contract as groq_extract_questions; a single page's failure
-    doesn't abort the rest."""
-    if not GROQ_API_KEY:
-        return [], MSG_AI_NOT_CONFIGURED
-    if not REQUESTS_AVAILABLE:
-        return [], MSG_AI_REQUESTS_MISSING
-    if not PYMUPDF_AVAILABLE:
-        return [], MSG_AI_PDF_NOT_AVAILABLE
-
-    try:
-        pages = pdf_bytes_to_page_jpegs(pdf_bytes)
-    except Exception as e:
-        print("PDF RASTERIZE ERROR:", repr(e))
-        return [], MSG_AI_ERROR.format(error=e)
-
-    all_questions = []
-    last_error = None
-    for page_bytes in pages:
-        questions, error = await groq_extract_questions(page_bytes, "image/jpeg")
-        if error:
-            last_error = error
-            continue
-        all_questions.extend(questions)
-
-    if not all_questions and last_error:
-        return [], last_error
-    return all_questions, None
-
-def build_ai_extraction_preview(questions: list) -> str:
-    lines = [MSG_AI_PREVIEW_HEADER.format(count=len(questions))]
-    for i, q in enumerate(questions, 1):
-        lines.append(MSG_AI_PREVIEW_QUESTION.format(i=i, question=q["question"]))
-        for j, opt in enumerate(q["options"]):
-            lines.append(("✅ " if j == q["correct_index"] else "◻️ ") + opt)
-        src = q.get("answer_source")
-        lines.append(
-            MSG_AI_ANSWER_MARKED if src == "marked_in_source"
-            else MSG_AI_ANSWER_UNCLEAR if src == "unclear"
-            else MSG_AI_ANSWER_AI
-        )
-        expl = (q.get("explanation") or "").strip()
-        if expl:
-            source_label = "من المصدر" if q.get("explanation_source") == "from_source" else "🤖 مولّد بالـ AI"
-            lines.append(MSG_AI_EXPLANATION_SOURCE.format(source=source_label, text=expl))
-        lines.append("")
-    lines.append(MSG_AI_PREVIEW_FOOTER)
-    return "\n".join(lines)
-
-async def _send_chunked_html(context, chat_id: int, text: str, reply_markup=None, chunk_size: int = 3500):
-    """Sends long HTML text as multiple messages if needed (Telegram caps
-    messages at 4096 chars) — splits on blank lines so a question is never
-    cut in half. Only the LAST chunk gets the reply_markup buttons."""
-    paragraphs = text.split("\n\n")
-    chunks, current = [], ""
-    for p in paragraphs:
-        candidate = (current + "\n\n" + p) if current else p
-        if len(candidate) > chunk_size and current:
-            chunks.append(current)
-            current = p
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    if not chunks:
-        chunks = [text]
-
-    for i, chunk in enumerate(chunks):
-        await context.bot.send_message(
-            chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup if i == len(chunks) - 1 else None,
-        )
-
-async def _present_ai_extraction(context, user_id: int, questions: list, image_path: str = None):
-    """Shared by both the image flow and the PDF flow: stashes the
-    extracted questions and shows the review card with Add/Discard buttons."""
-    PENDING_AI_EXTRACTION[user_id] = {"questions": questions, "image_path": image_path}
-    preview = build_ai_extraction_preview(questions)
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"✅ ضيف الكل ({len(questions)})", callback_data="ai_confirm_add"),
-        InlineKeyboardButton("❌ تجاهل", callback_data="ai_discard"),
-    ]])
-    await _send_chunked_html(context, user_id, preview, reply_markup=keyboard)
-
-async def _run_ai_extraction_for_image(context, user_id: int, img_path: str):
-    """Shared by the auto-triggered (uncaptioned image) and button-triggered
-    (manual retry) AI extraction paths, so the Groq call only lives once."""
-    if not os.path.exists(img_path):
-        await context.bot.send_message(chat_id=user_id, text=MSG_AI_IMAGE_MISSING)
-        return
-    await context.bot.send_message(chat_id=user_id, text=MSG_AI_ANALYZING)
-    with open(img_path, "rb") as f:
-        img_bytes = f.read()
-    questions, error = await groq_extract_questions(img_bytes, "image/jpeg")
-    if error:
-        await context.bot.send_message(chat_id=user_id, text=error, parse_mode=ParseMode.HTML)
-        return
-    if not questions:
-        await context.bot.send_message(chat_id=user_id, text=MSG_AI_NO_QUESTIONS)
-        return
-    # Only pair the original image back onto the question(s) when there's
-    # exactly one — attaching one screenshot to every question in a
-    # multi-question batch would just duplicate the same image N times.
-    await _present_ai_extraction(context, user_id, questions, image_path=img_path if len(questions) == 1 else None)
-
-# ═══════════════════════════════════════════════════════════════
 # IMAGE HANDLER (PDF mode only)
 # ═══════════════════════════════════════════════════════════════
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1757,22 +1594,6 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     photo = update.message.photo[-1] if update.message.photo else None
     if not photo:
-        return
-
-    # ── Admin adding a photo to the gallery ─────────────────────
-    if user_id in AWAITING_GALLERY_PHOTO and is_admin(update):
-        caption = update.message.caption or ""
-        GALLERY.append({"file_id": photo.file_id, "caption": caption})
-        save_gallery()
-        AWAITING_GALLERY_PHOTO.discard(user_id)
-        await update.message.reply_text(
-            "✅ <b>تمت إضافة الصورة للمعرض!</b>\n"
-            f"📸 إجمالي الصور: <b>{len(GALLERY)}</b>\n\n"
-            f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>\n\n"
-            "ابعت /gallery_add تاني لإضافة صورة أخرى\n"
-            "أو /gallery_list لتشوف المعرض",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     in_pdf_mode = user_id in PDF_BUFFER
@@ -1808,6 +1629,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context, user_id, question, raw_options, correct_index,
                 explanation=explanation, image_path=img_path,
             )
+            _record_activity(user_id, questions_delta=1)
             await react_random(update, context)
         return
 
@@ -1824,27 +1646,20 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Case 3: no caption — auto-start AI extraction right away if it's
-    # configured; otherwise fall back to the manual "send your question
-    # next" pairing flow.
-    _clear_pending_image(user_id)  # drop any earlier unclaimed pending image
+    # ── Case 3: no caption — park the image and ask for the question
+    _clear_pending_image(user_id)
     PENDING_IMAGE[user_id] = img_path
-
-    if GROQ_API_KEY and REQUESTS_AVAILABLE:
-        await _run_ai_extraction_for_image(context, user_id, img_path)
-    else:
-        await update.message.reply_text(
-            "🖼 <b>استلمت الصورة!</b>\n"
-            "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
-            "وهيتضاف الصورة تلقائي للسؤال ده.",
-            parse_mode=ParseMode.HTML,
-        )
+    await update.message.reply_text(
+        "🖼 <b>استلمت الصورة!</b>\n"
+        "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
+        "وهيتضاف الصورة تلقائي للسؤال ده.",
+        parse_mode=ParseMode.HTML,
+    )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """PDFs sent in a private DM: captioned = treated as a manual question
     (caption parsed as the MCQ text — no attachment, since Telegram polls
-    can only carry a photo, not a PDF); uncaptioned = handed to Groq for
-    AI extraction, same as an uncaptioned image (rasterized page-by-page)."""
+    can only carry a photo, not a PDF). Uncaptioned PDFs are silently ignored."""
     if not update.message or not update.message.document:
         return
     user_id = update.effective_chat.id
@@ -1874,34 +1689,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await deliver_quiz(context, user_id, question, raw_options, correct_index, explanation=explanation)
+            _record_activity(user_id, questions_delta=1)
             await react_random(update, context)
         return
 
-    # ── No caption: AI extraction ────────────────────────────────
-    if not (GROQ_API_KEY and REQUESTS_AVAILABLE):
-        return  # feature's off — stay silent rather than nag on every PDF
-    if not PYMUPDF_AVAILABLE:
-        # unlike a missing key (deliberately off), this is a broken install —
-        # tell the admin/user so it actually gets fixed instead of failing silently
-        await update.message.reply_text(MSG_AI_PDF_NOT_AVAILABLE)
-        return
-
-    if doc.file_size and doc.file_size > GROQ_MAX_FILE_BYTES:
-        await update.message.reply_text(MSG_AI_PDF_TOO_BIG.format(mb=GROQ_MAX_FILE_BYTES // (1024 * 1024)))
-        return
-
-    await update.message.reply_text(MSG_AI_PDF_ANALYZING)
-    tg_file   = await context.bot.get_file(doc.file_id)
-    pdf_bytes = bytes(await tg_file.download_as_bytearray())
-
-    questions, error = await groq_extract_questions_from_pdf(pdf_bytes)
-    if error:
-        await update.message.reply_text(error, parse_mode=ParseMode.HTML)
-        return
-    if not questions:
-        await update.message.reply_text(MSG_AI_NO_QUESTIONS)
-        return
-    await _present_ai_extraction(context, user_id, questions, image_path=None)
 
 # ═══════════════════════════════════════════════════════════════
 # STORAGE GROUP — AUTO-INDEXING
@@ -2221,27 +2012,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── GALLERY TRIGGER ──────────────────────────────────────────
-    if text.lower() == "year 2: mission accomplished":
-        if not GALLERY:
-            await update.message.reply_text("🖼 مفيش صور في المعرض دلوقتي!")
-            return
-        GALLERY_SESSION[user_id] = 1
-        photo  = GALLERY[0]
-        total  = len(GALLERY)
-        cap    = (photo.get("caption") or "").strip()
-        parts  = []
-        if cap:
-            parts.append(cap)
-        parts.append(f"📸 1 / {total}")
-        if total > 1:
-            parts.append("\nاستخدم /next للصورة الجاية 👇")
-        await context.bot.send_photo(
-            chat_id=user_id,
-            photo=photo["file_id"],
-            caption="\n".join(parts),
-        )
-        return
 
     # ── STORAGE PASSWORD LOOKUP ──────────────────────────────────
     if update.effective_chat.type == "private":
@@ -2371,6 +2141,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context, user_id, question, raw_options, correct_index,
                 explanation=explanation, image_path=pending_img,
             )
+            _record_activity(user_id, questions_delta=1)
             await react_random(update, context)
 
         # After all blocks in PDF mode — update the single progress message
@@ -2387,52 +2158,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
     await query.answer()
-
-    # ── AI EXTRACTION (Groq) — manual retry, e.g. if auto-run failed ──
-    if query.data == "ai_extract_image":
-        img_path = PENDING_IMAGE.get(user_id)
-        if not img_path:
-            await query.edit_message_text(MSG_AI_IMAGE_MISSING)
-            return
-        await _run_ai_extraction_for_image(context, user_id, img_path)
-        return
-
-    if query.data == "ai_confirm_add":
-        pending = PENDING_AI_EXTRACTION.pop(user_id, None)
-        if not pending:
-            await query.edit_message_text(MSG_AI_NOTHING_PENDING)
-            return
-        questions  = pending["questions"]
-        image_path = pending["image_path"]
-        in_pdf_mode = user_id in PDF_BUFFER
-
-        if in_pdf_mode:
-            for q in questions:
-                labeled_options = [f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(q["options"])]
-                item = {"type": "mcq", "q": q["question"], "options": labeled_options, "correct": q["correct_index"]}
-                if image_path:
-                    item["image"] = image_path
-                PDF_BUFFER[user_id].append(item)
-            await update_progress(context, user_id, user_id, latest_label=f"🤖 AI × {len(questions)}")
-            await query.edit_message_text(MSG_AI_ADDED_PDF.format(count=len(questions)))
-        else:
-            await query.edit_message_text(MSG_AI_SENDING_QUIZZES.format(count=len(questions)))
-            for i, q in enumerate(questions):
-                explanation = q.get("explanation") if q.get("explanation_source") == "from_source" else None
-                await deliver_quiz(
-                    context, user_id, q["question"], q["options"], q["correct_index"],
-                    explanation=explanation, image_path=image_path if i == 0 else None,
-                )
-
-        # The image is now either attached to the item or intentionally
-        # skipped — either way it's "used", so stop treating it as pending.
-        PENDING_IMAGE.pop(user_id, None)
-        return
-
-    if query.data == "ai_discard":
-        PENDING_AI_EXTRACTION.pop(user_id, None)
-        await query.edit_message_text(MSG_AI_DISCARDED)
-        return
 
     # ── QUIZ MODULES: top-level list ──────────────────────────────
     if query.data == "quiz_modules":
@@ -2815,6 +2540,9 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
         parse_mode=ParseMode.HTML,
     )
+    q_count = sum(1 for it in items if it.get("type") in ("mcq", "written"))
+    _record_activity(user_id, questions_delta=q_count)
+    await backup_analytics_to_channel(context)
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
     _clear_clarify_queue(user_id)
@@ -2836,13 +2564,12 @@ async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(MSG_PDF_CLEARED)
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bails out of whatever's in progress: PDF collection session, a
-    pending image waiting for its question, or (admin) gallery-add mode."""
+    """Bails out of whatever's in progress: PDF collection session or a
+    pending image waiting for its question."""
     user_id = update.effective_chat.id
     was_doing_something = bool(
         PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
-        or PENDING_IMAGE.get(user_id) or user_id in AWAITING_GALLERY_PHOTO
-        or PENDING_AI_EXTRACTION.get(user_id)
+        or PENDING_IMAGE.get(user_id)
     )
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
@@ -2852,8 +2579,6 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
-    AWAITING_GALLERY_PHOTO.discard(user_id)
-    PENDING_AI_EXTRACTION.pop(user_id, None)
     if was_doing_something:
         await update.message.reply_text(MSG_CANCEL_DONE)
     else:
@@ -2884,6 +2609,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("👤 <b>للجميع</b>")
     lines.append("/start — القائمة الرئيسية")
     lines.append("/sleep — يوقف البوت مؤقتًا في المحادثة دي")
+    lines.append("/mystats — إحصائياتك (أسئلة أنشأتها، سلسلة الأيام)")
     lines.append("/pdf_start — يبدأ سيشن تجميع صور لملف PDF")
     lines.append("/pdf_generate — يطلع PDF من الصور اللي جمعتها")
     lines.append("/pdf_clear — يمسح سيشن الـ PDF الحالي")
@@ -2902,11 +2628,6 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("/backup_now — يعمل ريفريش فوري للباك أب المثبّت (ستوريدج + كويز)")
         lines.append("/quiz_list — ليستة مرقّمة بكل المحاضرات (مفتوحة ومقفولة)")
         lines.append("/quiz_delete &lt;رقم&gt; — يشيل محاضرة من الفهرس")
-        lines.append("/gallery_add — يدخل وضع إضافة صور للجاليري")
-        lines.append("/gallery_list — يعرض كل صور الجاليري بأرقامها")
-        lines.append("/gallery_delete &lt;رقم&gt; — يمسح صورة من الجاليري")
-        lines.append("/gallery_move &lt;من&gt; &lt;إلى&gt; — يغيّر ترتيب صورة")
-        lines.append("/gallery_clear — يمسح الجاليري بالكامل")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -3009,144 +2730,34 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text(summary, parse_mode=ParseMode.HTML)
 
 # ═══════════════════════════════════════════════════════════════
-# GALLERY ADMIN COMMANDS
-# ═══════════════════════════════════════════════════════════════
-async def gallery_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: enter add-photo mode."""
-    if not is_admin(update):
-        await update.message.reply_text(MSG_ADMIN_ONLY)
-        return
-    AWAITING_GALLERY_PHOTO.add(update.effective_chat.id)
-    await update.message.reply_text(
-        "🖼 <b>ابعت الصورة اللي عايز تضيفها للمعرض</b>\n"
-        "ممكن تبعت كابشن معاها لو حبيت.",
-        parse_mode=ParseMode.HTML,
-    )
-
-async def gallery_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: view all gallery photos with index numbers."""
-    if not is_admin(update):
-        await update.message.reply_text(MSG_ADMIN_ONLY)
-        return
-    if not GALLERY:
-        await update.message.reply_text("📭 المعرض فاضي حالياً. استخدم /gallery_add لإضافة صور.")
-        return
-    await update.message.reply_text(
-        f"🖼 <b>المعرض — {len(GALLERY)} صورة:</b>\n"
-        "/gallery_delete &lt;رقم&gt; — حذف صورة\n"
-        "/gallery_move &lt;من&gt; &lt;إلى&gt; — تغيير الترتيب",
-        parse_mode=ParseMode.HTML,
-    )
-    for i, item in enumerate(GALLERY, 1):
-        cap = (item.get("caption") or "").strip()
-        try:
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=item["file_id"],
-                caption=f"#{i}" + (f" — {cap}" if cap else ""),
-            )
-        except Exception as e:
-            await update.message.reply_text(f"❌ صورة #{i} فيها مشكلة: {e}")
-
-async def gallery_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /gallery_delete <n>"""
-    if not is_admin(update):
-        await update.message.reply_text(MSG_ADMIN_ONLY)
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("استخدام: /gallery_delete <رقم>\nمثال: /gallery_delete 2")
-        return
-    n = int(context.args[0])
-    if n < 1 or n > len(GALLERY):
-        await update.message.reply_text(f"❌ رقم غلط — المعرض فيه {len(GALLERY)} صورة فقط")
-        return
-    removed = GALLERY.pop(n - 1)
-    save_gallery()
-    cap = (removed.get("caption") or "").strip()
-    await update.message.reply_text(
-        f"✅ تم حذف صورة #{n}" + (f" — {cap}" if cap else "") + f"\n"
-        f"تبقى {len(GALLERY)} صورة في المعرض"
-    )
-
-async def gallery_move_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /gallery_move <from> <to>"""
-    if not is_admin(update):
-        await update.message.reply_text(MSG_ADMIN_ONLY)
-        return
-    if (not context.args or len(context.args) < 2
-            or not context.args[0].isdigit() or not context.args[1].isdigit()):
-        await update.message.reply_text(
-            "استخدام: /gallery_move <من> <إلى>\nمثال: /gallery_move 3 1"
-        )
-        return
-    frm, to = int(context.args[0]), int(context.args[1])
-    n = len(GALLERY)
-    if frm < 1 or frm > n or to < 1 or to > n:
-        await update.message.reply_text(f"❌ الأرقام غلط — المعرض فيه {n} صورة")
-        return
-    if frm == to:
-        await update.message.reply_text("الصورة موجودة فعلاً في المكان ده!")
-        return
-    item = GALLERY.pop(frm - 1)
-    GALLERY.insert(to - 1, item)
-    save_gallery()
-    await update.message.reply_text(f"✅ تم نقل صورة #{frm} إلى موضع #{to}")
-
-async def gallery_clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: wipe the entire gallery."""
-    if not is_admin(update):
-        await update.message.reply_text(MSG_ADMIN_ONLY)
-        return
-    count = len(GALLERY)
-    GALLERY.clear()
-    save_gallery()
-    await update.message.reply_text(f"🗑 تم مسح المعرض — حُذفت {count} صورة")
-
-# ═══════════════════════════════════════════════════════════════
-# /next COMMAND
-# ═══════════════════════════════════════════════════════════════
-async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    if user_id not in GALLERY_SESSION:
-        await update.message.reply_text(
-            "❌ مفيش معرض شغال دلوقتي.\nابعت الكلمة السحرية الأول! 😉"
-        )
-        return
-    idx   = GALLERY_SESSION[user_id]
-    total = len(GALLERY)
-    if idx >= total or not GALLERY:
-        GALLERY_SESSION.pop(user_id, None)
-        await update.message.reply_text("🎉 خلصت الصور كلها!\nربنا يوفقك ❤️")
-        return
-    photo = GALLERY[idx]
-    GALLERY_SESSION[user_id] = idx + 1
-    remaining = total - (idx + 1)
-    cap   = (photo.get("caption") or "").strip()
-    parts = []
-    if cap:
-        parts.append(cap)
-    parts.append(f"📸 {idx + 1} / {total}")
-    if remaining > 0:
-        parts.append("استخدم /next للصورة الجاية 👇")
-    else:
-        parts.append("🎉 دي آخر صورة! ربنا يوفقك ❤️")
-        GALLERY_SESSION.pop(user_id, None)
-    await context.bot.send_photo(
-        chat_id=user_id,
-        photo=photo["file_id"],
-        caption="\n".join(parts),
-    )
-
-# ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
-async def _post_init(app):
+async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    entry   = ANALYTICS.get(str(user_id))
+    if not entry:
+        await update.message.reply_text("📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!")
+        return
+    streak = entry.get("streak", 0)
+    total  = entry.get("questions_created", 0)
+    last   = entry.get("last_active_date", "—")
+    flame  = "🔥" * min(streak, 5) if streak else "❄️"
+    await update.message.reply_text(
+        f"📊 <b>إحصائياتك</b>\n\n"
+        f"❓ أسئلة أنشأتها: <b>{total}</b>\n"
+        f"🗓 سلسلة الأيام: <b>{streak}</b> يوم {flame}\n"
+        f"📅 آخر نشاط: <b>{last}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
     """Runs once after the bot connects, before polling starts — restores
     the storage-group and quiz-channel indexes from their pinned backup
     messages, so a wiped/switched local disk doesn't orphan content that's
     still sitting safely in the channels themselves."""
     await restore_storage_from_channel(app)
     await restore_quiz_from_channel(app)
+    await restore_analytics_from_channel(app)
 
 app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
@@ -3159,15 +2770,9 @@ app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
 app.add_handler(CommandHandler("pdf_start",      pdf_start))
 app.add_handler(CommandHandler("pdf_generate",   pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",      pdf_clear))
-# Gallery admin
-app.add_handler(CommandHandler("gallery_add",    gallery_add_cmd))
-app.add_handler(CommandHandler("gallery_list",   gallery_list_cmd))
-app.add_handler(CommandHandler("gallery_delete", gallery_delete_cmd))
-app.add_handler(CommandHandler("gallery_move",   gallery_move_cmd))
-app.add_handler(CommandHandler("gallery_clear",  gallery_clear_cmd))
-# User navigation
 app.add_handler(CommandHandler("next",           next_cmd))
 # Storage group setup helper
+app.add_handler(CommandHandler("mystats",         mystats_cmd))
 app.add_handler(CommandHandler("storage_id",     storage_id_cmd))
 app.add_handler(CommandHandler("backup_now",     backup_now_cmd))
 # Quiz channel
@@ -3204,9 +2809,8 @@ app.add_handler(MessageHandler(
     filters.PHOTO & ~filters.Chat(STORAGE_GROUP_ID), handle_image
 ))
 
-# AI PDF ingestion — a PDF sent in a private DM gets Groq extraction;
-# excludes the storage group (which indexes documents by password caption)
-# and the quiz channel (which only reads text/polls).
+# PDF handler — captioned PDFs in a private DM are parsed as manual MCQs;
+# excludes the storage group and quiz channel.
 app.add_handler(MessageHandler(
     filters.Document.PDF & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_ID), handle_document
 ))
