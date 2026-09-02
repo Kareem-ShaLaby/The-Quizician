@@ -1418,18 +1418,11 @@ def _review_buttons(item_index: int, item: dict) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("✅ تمام، مفيش تعديل", callback_data=f"revedit:{item_index}:done")])
     return InlineKeyboardMarkup(rows)
 
-async def _send_review_prompt(context, chat_id: int, user_id: int, item_index: int):
-    """Ask the admin whether the just-added question needs any edits."""
-    items = PDF_BUFFER.get(user_id)
-    if not items or item_index >= len(items):
-        return
-    item = items[item_index]
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="👀 <b>راجع السؤال:</b>\n\n" + _review_text(item) + "\n\nفيه حاجة عايز تعدلها؟",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_review_buttons(item_index, item),
-    )
+def _edit_button_markup(item_index: int) -> InlineKeyboardMarkup:
+    """Single '✏️ تعديل' button — shown on confirmation, pressed only if needed."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ تعديل", callback_data=f"revedit:{item_index}:open")
+    ]])
 
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.poll:
@@ -1484,22 +1477,53 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(queue) == 1:  # nothing else currently being asked
                 await _ask_next_clarification(context, user_id, update.effective_chat.id)
         else:
-            # Correct answer already known — go straight to the review prompt.
-            await _send_review_prompt(context, update.effective_chat.id, user_id, item_index)
+            # Correct answer already known — show confirmation with edit button.
+            short = question[:50] + ("…" if len(question) > 50 else "")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"✅ اتسجل: {html.escape(short)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_edit_button_markup(item_index),
+            )
         return
 
-    # ── Normal mode: echo the original question text + choices — ─
-    # ── no header label, no recreated quiz poll, no correct answer ──
-    full_text = question + "\n" + "\n".join(raw_options)
+    # ── Normal mode: show the poll question + choices with an edit button ──
+    lines = [f"❓ <b>{html.escape(question)}</b>"]
+    for opt in raw_options:
+        lines.append(html.escape(opt))
+    full_text = "\n".join(lines)
+
+    # Build a temporary "normal mode" item so the edit flow works the same way
+    normal_item = {
+        "type": "mcq", "q": question,
+        "options": [f"{string.ascii_uppercase[i]}) {o}" if not o.startswith(tuple(string.ascii_uppercase)) else o
+                    for i, o in enumerate(raw_options)],
+        "correct": None,
+    }
+    nm_buf = PDF_BUFFER.setdefault(user_id, [])
+    nm_buf.append(normal_item)
+    nm_index = len(nm_buf) - 1
+
     if pending_img:
         with open(pending_img, "rb") as f:
-            if len(full_text) <= 1024:  # Telegram's photo caption limit
-                await context.bot.send_photo(chat_id=user_id, photo=f, caption=full_text)
-            else:
-                await context.bot.send_photo(chat_id=user_id, photo=f)
-                await context.bot.send_message(chat_id=user_id, text=full_text)
+            cap = full_text if len(full_text) <= 1024 else None
+            sent = await context.bot.send_photo(
+                chat_id=user_id, photo=f, caption=cap,
+                parse_mode=ParseMode.HTML if cap else None,
+                reply_markup=_edit_button_markup(nm_index) if cap else None,
+            )
+            if not cap:
+                await context.bot.send_message(
+                    chat_id=user_id, text=full_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_edit_button_markup(nm_index),
+                )
     else:
-        await context.bot.send_message(chat_id=user_id, text=full_text)
+        await context.bot.send_message(
+            chat_id=user_id, text=full_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_edit_button_markup(nm_index),
+        )
 
 # ═══════════════════════════════════════════════════════════════
 # GROQ AI — extracts MCQs straight out of a screenshot/PDF, so nobody
@@ -2273,8 +2297,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     })
                     any_saved  = True
                     last_label = title[:50] + ("…" if len(title) > 50 else "")
-                    await _send_review_prompt(
-                        context, update.effective_chat.id, user_id, len(PDF_BUFFER[user_id]) - 1
+                    item_index = len(PDF_BUFFER[user_id]) - 1
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=f"✅ اتسجل: <b>{html.escape(last_label)}</b>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_edit_button_markup(item_index),
                     )
                 else:
                     await update.message.reply_text(
@@ -2329,8 +2357,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 PDF_BUFFER[user_id].append(item)
                 any_saved  = True
                 last_label = ("🖼 " if pending_img else "") + question[:50] + ("…" if len(question) > 50 else "")
-                await _send_review_prompt(
-                    context, update.effective_chat.id, user_id, len(PDF_BUFFER[user_id]) - 1
+                item_index = len(PDF_BUFFER[user_id]) - 1
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"✅ اتسجل: {html.escape(last_label)}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_edit_button_markup(item_index),
                 )
                 continue
 
@@ -2580,8 +2612,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if item_index in queue:
             queue.remove(item_index)
 
-        await query.edit_message_text(f"✅ Q{item_index + 1}: {item['options'][choice]}")
-        await _send_review_prompt(context, query.message.chat_id, user_id, item_index)
+        await query.edit_message_text(
+            f"✅ Q{item_index + 1}: {html.escape(item['options'][choice])}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_edit_button_markup(item_index),
+        )
 
         if queue:
             await _ask_next_clarification(context, user_id, query.message.chat_id)
@@ -2600,6 +2635,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ السؤال ده مش موجود في البافر دلوقتي.")
             return
         item = items[item_index]
+
+        if action == "open":
+            # First press — expand into the full edit menu
+            await query.edit_message_text(
+                "✏️ <b>إيه اللي عايز تعدله؟</b>\n\n" + _review_text(item),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_review_buttons(item_index, item),
+            )
+            return
 
         if action == "done":
             await query.edit_message_text(
