@@ -17,6 +17,7 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     PollHandler,
+    PollAnswerHandler,
     filters,
     ContextTypes,
 )
@@ -92,7 +93,7 @@ QUIZ_CHANNEL_ID = -1004402622263
 # ── Dedicated group for analytics JSON backups ────────────────
 # The bot pins the latest analytics.json here after every change
 # and deletes the previous one — always exactly one file in the group.
-ANALYTICS_GROUP_ID = -5378747120
+ANALYTICS_GROUP_ID = -1005378747120
 
 # ── Curriculum structure for the quiz channel ─────────────────────
 # Add new modules/subjects here as they come up. Lecture titles posted in
@@ -1516,6 +1517,8 @@ async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         entry = QUIZ_POLL_STATUS[poll.id]
         if not entry["closed"]:
             entry["closed"] = True
+            if poll.correct_option_ids and entry.get("correct_option_id") is None:
+                entry["correct_option_id"] = poll.correct_option_ids[0]
             save_quiz_poll_status()
             try:
                 await context.bot.set_message_reaction(
@@ -1555,6 +1558,65 @@ async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     except Exception:
         pass
+
+# ── XP for lecture quiz answers ───────────────────────────────
+XP_QUIZ_ATTEMPT = 5    # just for trying
+XP_QUIZ_CORRECT = 15   # bonus on top of attempt XP (total 20 for correct)
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires when a user answers any non-anonymous poll the bot has seen.
+    Awards XP for lecture quiz answers — attempt XP always, +correct bonus
+    if they got it right. Only fires for polls in QUIZ_POLL_STATUS."""
+    answer  = update.poll_answer
+    poll_id = answer.poll_id
+    user_id = answer.user.id
+
+    entry = QUIZ_POLL_STATUS.get(poll_id)
+    if not entry:
+        return   # not a tracked lecture poll
+
+    correct_id = entry.get("correct_option_id")
+    if correct_id is None:
+        # poll not closed yet — correct answer unknown, award attempt XP only
+        xp_delta   = XP_QUIZ_ATTEMPT
+        is_correct = None
+    else:
+        chosen     = answer.option_ids[0] if answer.option_ids else None
+        is_correct = (chosen == correct_id)
+        xp_delta   = XP_QUIZ_ATTEMPT + (XP_QUIZ_CORRECT if is_correct else 0)
+
+    events = _record_activity(user_id, questions_delta=0)
+    # award the XP directly (separate from _record_activity's question XP)
+    user_entry = _get_entry(user_id)
+    new_level  = _award_xp(user_entry, xp_delta)
+    if new_level:
+        events["level_up"] = new_level
+    save_analytics()
+
+    await _announce_events(context, user_id, events)
+
+    if is_correct is True:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ إجابة صح! <b>+{xp_delta} XP</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    elif is_correct is False:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ إجابة غلط. <b>+{XP_QUIZ_ATTEMPT} XP</b> للمحاولة.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    # if is_correct is None (poll still open): no feedback message,
+    # XP is awarded silently
+
+    await backup_analytics_to_channel(context)
 
 # ═══════════════════════════════════════════════════════════════
 # FORWARDED POLL HANDLER
@@ -1959,7 +2021,12 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         # Track this poll so we know once it's stopped (only then is it
         # actually copyable — Telegram requires the correct answer to be
         # known before a quiz poll can be copied at all).
-        QUIZ_POLL_STATUS[msg.poll.id] = {"lecture": current, "message_id": msg.message_id, "closed": msg.poll.is_closed}
+        QUIZ_POLL_STATUS[msg.poll.id] = {
+            "lecture":           current,
+            "message_id":        msg.message_id,
+            "closed":            msg.poll.is_closed,
+            "correct_option_id": msg.poll.correct_option_ids[0] if msg.poll.correct_option_ids else None,
+        }
         save_quiz_poll_status()
         # NOTE: the channel backup document + the "still open" reaction are
         # both deliberately deferred to -END (below) instead of happening
@@ -2944,13 +3011,24 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-    """Runs once after the bot connects, before polling starts — restores
-    the storage-group and quiz-channel indexes from their pinned backup
-    messages, so a wiped/switched local disk doesn't orphan content that's
-    still sitting safely in the channels themselves."""
-    await restore_storage_from_channel(app)
-    await restore_quiz_from_channel(app)
-    await restore_analytics_from_channel(app)
+async def reset_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: wipe all analytics data locally and delete the pinned
+    backup in the analytics group. Use when you need a clean slate."""
+    global _analytics_backup_msg_id
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    ANALYTICS.clear()
+    save_analytics()
+    if _analytics_backup_msg_id and ANALYTICS_GROUP_ID:
+        try:
+            await context.bot.delete_message(
+                chat_id=ANALYTICS_GROUP_ID,
+                message_id=_analytics_backup_msg_id,
+            )
+        except Exception:
+            pass
+    _analytics_backup_msg_id = None
+    await update.message.reply_text("🗑 Analytics wiped — local file cleared and backup deleted.")
 
 async def _post_init(app):
     """Runs once after the bot connects, before polling starts — restores
@@ -2973,7 +3051,8 @@ app.add_handler(CommandHandler("pdf_start",      pdf_start))
 app.add_handler(CommandHandler("pdf_generate",   pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",      pdf_clear))
 # Storage group setup helper
-app.add_handler(CommandHandler("mystats",         mystats_cmd))
+app.add_handler(CommandHandler("mystats",           mystats_cmd))
+app.add_handler(CommandHandler("reset_analytics",   reset_analytics_cmd))
 app.add_handler(CommandHandler("storage_id",     storage_id_cmd))
 app.add_handler(CommandHandler("backup_now",     backup_now_cmd))
 # Quiz channel
@@ -3019,6 +3098,7 @@ app.add_handler(MessageHandler(
 # Inline buttons
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(PollHandler(poll_update_handler))
+app.add_handler(PollAnswerHandler(handle_poll_answer))
 
 # Text handler last — excludes the storage group and the quiz channel
 app.add_handler(MessageHandler(
