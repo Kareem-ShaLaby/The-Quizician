@@ -89,6 +89,11 @@ STORAGE_GROUP_ID = -1004447646576
 #    then send /quiz_channel_id right after — the bot replies with the ID.
 QUIZ_CHANNEL_ID = -1004402622263
 
+# ── Dedicated group for analytics JSON backups ────────────────
+# The bot pins the latest analytics.json here after every change
+# and deletes the previous one — always exactly one file in the group.
+ANALYTICS_GROUP_ID = -5378747120
+
 # ── Curriculum structure for the quiz channel ─────────────────────
 # Add new modules/subjects here as they come up. Lecture titles posted in
 # the quiz channel must be formatted as:
@@ -212,9 +217,9 @@ USERS = load_users()
 #   }
 # }
 # ═══════════════════════════════════════════════════════════════
-ANALYTICS_FILE              = "analytics.json"
-ANALYTICS_BACKUP_MARKER     = "🗄 QUIZICIAN_ANALYTICS_BACKUP"
-ANALYTICS_BACKUP_STATE_FILE = "analytics_backup_state.json"
+ANALYTICS_FILE          = "analytics.json"
+ANALYTICS_BACKUP_MARKER = "🗄 QUIZICIAN_ANALYTICS_BACKUP"
+
 
 # ── XP per action ────────────────────────────────────────────
 XP_PER_QUESTION   = 10
@@ -302,18 +307,12 @@ def save_analytics():
     with open(ANALYTICS_FILE, "w") as f:
         json.dump(ANALYTICS, f, indent=2)
 
-def load_analytics_backup_state() -> dict:
-    if os.path.exists(ANALYTICS_BACKUP_STATE_FILE):
-        with open(ANALYTICS_BACKUP_STATE_FILE) as f:
-            return json.load(f)
-    return {}
+ANALYTICS: dict = load_analytics()
 
-def save_analytics_backup_state():
-    with open(ANALYTICS_BACKUP_STATE_FILE, "w") as f:
-        json.dump(ANALYTICS_BACKUP_STATE, f)
-
-ANALYTICS: dict              = load_analytics()
-ANALYTICS_BACKUP_STATE: dict = load_analytics_backup_state()
+# Message ID of the currently pinned analytics backup in ANALYTICS_GROUP_ID.
+# Populated on startup by restore_analytics_from_channel; the pin is the
+# source of truth — no separate state file needed.
+_analytics_backup_msg_id: int | None = None
 
 def _today() -> str:
     from datetime import datetime, timezone
@@ -432,46 +431,54 @@ async def _announce_events(context, chat_id: int, events: dict):
         )
 
 async def backup_analytics_to_channel(context):
-    if not STORAGE_GROUP_ID:
+    global _analytics_backup_msg_id
+    if not ANALYTICS_GROUP_ID:
         return
-    data   = json.dumps(ANALYTICS, indent=2).encode("utf-8")
-    old_id = ANALYTICS_BACKUP_STATE.get("backup_msg_id")
+    data = json.dumps(ANALYTICS, indent=2).encode("utf-8")
     try:
         sent = await context.bot.send_document(
-            chat_id=STORAGE_GROUP_ID,
+            chat_id=ANALYTICS_GROUP_ID,
             document=InputFile(BytesIO(data), filename="analytics.json"),
             caption=ANALYTICS_BACKUP_MARKER,
         )
     except Exception as e:
         print("ANALYTICS BACKUP ERROR:", e)
         return
-    ANALYTICS_BACKUP_STATE["backup_msg_id"] = sent.message_id
-    save_analytics_backup_state()
-    if old_id and old_id != sent.message_id:
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=ANALYTICS_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("ANALYTICS PIN ERROR:", e)
+    if _analytics_backup_msg_id and _analytics_backup_msg_id != sent.message_id:
         try:
-            await context.bot.delete_message(chat_id=STORAGE_GROUP_ID, message_id=old_id)
+            await context.bot.delete_message(
+                chat_id=ANALYTICS_GROUP_ID,
+                message_id=_analytics_backup_msg_id,
+            )
         except Exception:
             pass
+    _analytics_backup_msg_id = sent.message_id
 
 async def restore_analytics_from_channel(app):
-    if not STORAGE_GROUP_ID:
-        return
-    saved_id = ANALYTICS_BACKUP_STATE.get("backup_msg_id")
-    if not saved_id:
+    global _analytics_backup_msg_id
+    if not ANALYTICS_GROUP_ID:
         return
     try:
-        msg     = await app.bot.forward_message(
-            chat_id=ADMIN_ID, from_chat_id=STORAGE_GROUP_ID, message_id=saved_id
-        )
-        tg_file = await app.bot.get_file(msg.document.file_id)
+        chat   = await app.bot.get_chat(ANALYTICS_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document:
+            return
+        if (pinned.caption or "") != ANALYTICS_BACKUP_MARKER:
+            return
+        tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
         ANALYTICS.update(json.loads(bytes(raw).decode("utf-8")))
         save_analytics()
+        _analytics_backup_msg_id = pinned.message_id
         print(f"Restored analytics: {len(ANALYTICS)} user(s).")
-        try:
-            await app.bot.delete_message(chat_id=ADMIN_ID, message_id=msg.message_id)
-        except Exception:
-            pass
     except Exception as e:
         print("ANALYTICS RESTORE ERROR:", e)
 
