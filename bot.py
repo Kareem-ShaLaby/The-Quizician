@@ -2759,6 +2759,15 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await restore_quiz_from_channel(app)
     await restore_analytics_from_channel(app)
 
+async def _post_init(app):
+    """Runs once after the bot connects, before polling starts — restores
+    the storage-group and quiz-channel indexes from their pinned backup
+    messages, so a wiped/switched local disk doesn't orphan content that's
+    still sitting safely in the channels themselves."""
+    await restore_storage_from_channel(app)
+    await restore_quiz_from_channel(app)
+    await restore_analytics_from_channel(app)
+
 app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
 app.add_handler(CommandHandler("start",          start))
