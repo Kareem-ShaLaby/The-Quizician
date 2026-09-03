@@ -195,30 +195,38 @@ USERS = load_users()
 
 # ═══════════════════════════════════════════════════════════════
 # ANALYTICS STORAGE
-# Tracks per-user stats that feed into XP / Levels later.
-# Schema: { "<user_id>": { "questions_created": int,
-#                          "streak": int,
-#                          "last_active_date": "YYYY-MM-DD" } }
-# Backed up to STORAGE_GROUP_ID as a pinned JSON document,
-# same pattern as the storage/quiz backups.
+# One JSON file per user — analytics_{user_id}.json locally,
+# one document per user in STORAGE_GROUP_ID with caption
+# "🗄 QUIZICIAN_ANALYTICS_{user_id}".
+# State file tracks each user's current backup message_id so
+# the old one can be deleted when a new one is uploaded.
+# Schema per file: { "questions_created": int,
+#                    "streak": int,
+#                    "last_active_date": "YYYY-MM-DD" }
 # ═══════════════════════════════════════════════════════════════
-ANALYTICS_FILE          = "analytics.json"
-ANALYTICS_BACKUP_MARKER = "🗄 QUIZICIAN_ANALYTICS_BACKUP"
-ANALYTICS_BACKUP_STATE_FILE = "analytics_backup_state.json"
+ANALYTICS_DIR               = "analytics"          # folder for local per-user files
+ANALYTICS_MARKER_PREFIX     = "🗄 QUIZICIAN_ANALYTICS_"
+ANALYTICS_BACKUP_STATE_FILE = "analytics_backup_state.json"  # {user_id_str: msg_id}
 
-def load_analytics():
-    if os.path.exists(ANALYTICS_FILE):
-        with open(ANALYTICS_FILE, "r") as f:
+os.makedirs(ANALYTICS_DIR, exist_ok=True)
+
+def _analytics_path(user_id: int) -> str:
+    return os.path.join(ANALYTICS_DIR, f"analytics_{user_id}.json")
+
+def load_user_analytics(user_id: int) -> dict:
+    path = _analytics_path(user_id)
+    if os.path.exists(path):
+        with open(path) as f:
             return json.load(f)
-    return {}
+    return {"questions_created": 0, "streak": 0, "last_active_date": None}
 
-def save_analytics():
-    with open(ANALYTICS_FILE, "w") as f:
-        json.dump(ANALYTICS, f)
+def save_user_analytics(user_id: int, entry: dict):
+    with open(_analytics_path(user_id), "w") as f:
+        json.dump(entry, f)
 
-def load_analytics_backup_state():
+def load_analytics_backup_state() -> dict:
     if os.path.exists(ANALYTICS_BACKUP_STATE_FILE):
-        with open(ANALYTICS_BACKUP_STATE_FILE, "r") as f:
+        with open(ANALYTICS_BACKUP_STATE_FILE) as f:
             return json.load(f)
     return {}
 
@@ -226,104 +234,85 @@ def save_analytics_backup_state():
     with open(ANALYTICS_BACKUP_STATE_FILE, "w") as f:
         json.dump(ANALYTICS_BACKUP_STATE, f)
 
-ANALYTICS: dict            = load_analytics()
+# { "user_id_str": backup_message_id_int }
 ANALYTICS_BACKUP_STATE: dict = load_analytics_backup_state()
 
 def _today() -> str:
-    """UTC date string YYYY-MM-DD — consistent across restarts."""
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def _record_activity(user_id: int, questions_delta: int = 0):
-    """Update streak and question count for user_id.
-    Call with questions_delta > 0 when questions are actually published
-    (deliver_quiz or pdf_generate), or 0 for any other bot interaction
-    that should count as an active day for streak purposes."""
-    key    = str(user_id)
+    """Update streak and question count for this user.
+    questions_delta > 0 only when questions are actually published."""
+    from datetime import datetime, timezone, timedelta
     today  = _today()
-    entry  = ANALYTICS.setdefault(key, {
-        "questions_created": 0,
-        "streak": 0,
-        "last_active_date": None,
-    })
+    entry  = load_user_analytics(user_id)
+    last   = entry.get("last_active_date")
 
-    last = entry.get("last_active_date")
     if last != today:
-        # First activity today — advance or reset streak
-        from datetime import datetime, timezone, timedelta
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         if last == yesterday:
             entry["streak"] += 1
-        elif last is None:
-            entry["streak"] = 1
         else:
-            entry["streak"] = 1   # gap of ≥2 days — reset
+            entry["streak"] = 1   # gap ≥ 2 days, or first ever — reset to 1
         entry["last_active_date"] = today
 
     entry["questions_created"] += questions_delta
-    save_analytics()
+    save_user_analytics(user_id, entry)
 
-async def backup_analytics_to_channel(context):
+async def backup_user_analytics_to_channel(context, user_id: int):
+    """Upload/replace one user's analytics file in the storage group."""
     if not STORAGE_GROUP_ID:
         return
-    data       = json.dumps(ANALYTICS).encode("utf-8")
-    old_msg_id = ANALYTICS_BACKUP_STATE.get("backup_msg_id")
+    uid_str = str(user_id)
+    entry   = load_user_analytics(user_id)
+    data    = json.dumps(entry, indent=2).encode("utf-8")
+    marker  = f"{ANALYTICS_MARKER_PREFIX}{user_id}"
+    old_id  = ANALYTICS_BACKUP_STATE.get(uid_str)
+
     try:
         sent = await context.bot.send_document(
             chat_id=STORAGE_GROUP_ID,
-            document=InputFile(BytesIO(data), filename="quizician_analytics_backup.json"),
-            caption=ANALYTICS_BACKUP_MARKER,
+            document=InputFile(BytesIO(data), filename=f"analytics_{user_id}.json"),
+            caption=marker,
         )
     except Exception as e:
-        print("ANALYTICS BACKUP ERROR:", e)
+        print(f"ANALYTICS BACKUP ERROR (user {user_id}):", e)
         return
 
-    ANALYTICS_BACKUP_STATE["backup_msg_id"] = sent.message_id
+    ANALYTICS_BACKUP_STATE[uid_str] = sent.message_id
     save_analytics_backup_state()
 
-    try:
-        await context.bot.pin_chat_message(
-            chat_id=STORAGE_GROUP_ID, message_id=sent.message_id, disable_notification=True
-        )
-    except Exception as e:
-        print("ANALYTICS BACKUP PIN ERROR:", e)
-
-    if old_msg_id and old_msg_id != sent.message_id:
+    if old_id and old_id != sent.message_id:
         try:
-            await context.bot.delete_message(chat_id=STORAGE_GROUP_ID, message_id=old_msg_id)
+            await context.bot.delete_message(chat_id=STORAGE_GROUP_ID, message_id=old_id)
         except Exception:
             pass
 
 async def restore_analytics_from_channel(app):
-    """Runs once on startup — rebuilds ANALYTICS from the storage group's
-    pinned analytics backup if local file is missing/stale."""
-    if not STORAGE_GROUP_ID:
+    """On startup, fetch every known user's analytics file from the
+    storage group using the saved message IDs, and rebuild local files."""
+    if not STORAGE_GROUP_ID or not ANALYTICS_BACKUP_STATE:
         return
-    try:
-        # The analytics backup isn't the primary pinned message (that's the
-        # storage backup), so we scan recent messages for the marker caption
-        # rather than relying on get_chat().pinned_message.
-        saved_id = ANALYTICS_BACKUP_STATE.get("backup_msg_id")
-        if saved_id:
+    restored = 0
+    for uid_str, msg_id in list(ANALYTICS_BACKUP_STATE.items()):
+        try:
+            msg     = await app.bot.forward_message(
+                chat_id=ADMIN_ID, from_chat_id=STORAGE_GROUP_ID, message_id=msg_id
+            )
+            tg_file = await app.bot.get_file(msg.document.file_id)
+            raw     = await tg_file.download_as_bytearray()
+            entry   = json.loads(bytes(raw).decode("utf-8"))
+            save_user_analytics(int(uid_str), entry)
+            restored += 1
             try:
-                msg     = await app.bot.forward_message(
-                    chat_id=ADMIN_ID, from_chat_id=STORAGE_GROUP_ID, message_id=saved_id
-                )
-                tg_file = await app.bot.get_file(msg.document.file_id)
-                raw     = await tg_file.download_as_bytearray()
-                ANALYTICS.update(json.loads(bytes(raw).decode("utf-8")))
-                save_analytics()
-                print(f"Restored analytics: {len(ANALYTICS)} user(s).")
-                # clean up the forwarded copy
-                try:
-                    await app.bot.delete_message(chat_id=ADMIN_ID, message_id=msg.message_id)
-                except Exception:
-                    pass
-                return
-            except Exception as e:
-                print("ANALYTICS RESTORE (saved id) ERROR:", e)
-    except Exception as e:
-        print("ANALYTICS RESTORE ERROR:", e)
+                await app.bot.delete_message(chat_id=ADMIN_ID, message_id=msg.message_id)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"ANALYTICS RESTORE ERROR (user {uid_str}):", e)
+    if restored:
+        print(f"Restored analytics for {restored} user(s).")
 
 # ═══════════════════════════════════════════════════════════════
 # PASSWORD-GATED STORAGE (private group)
@@ -1631,6 +1620,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             _record_activity(user_id, questions_delta=1)
             await react_random(update, context)
+            await backup_user_analytics_to_channel(context, user_id)
         return
 
     # ── Case 2 (PDF mode only): non-empty caption that ISN'T a full
@@ -1691,6 +1681,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await deliver_quiz(context, user_id, question, raw_options, correct_index, explanation=explanation)
             _record_activity(user_id, questions_delta=1)
             await react_random(update, context)
+            await backup_user_analytics_to_channel(context, user_id)
         return
 
 
@@ -2143,8 +2134,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             _record_activity(user_id, questions_delta=1)
             await react_random(update, context)
-
-        # After all blocks in PDF mode — update the single progress message
+            await backup_user_analytics_to_channel(context, user_id)
         if in_pdf_mode and any_saved:
             await update_progress(context, user_id, update.effective_chat.id, last_label)
 
@@ -2542,7 +2532,7 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     q_count = sum(1 for it in items if it.get("type") in ("mcq", "written"))
     _record_activity(user_id, questions_delta=q_count)
-    await backup_analytics_to_channel(context)
+    await backup_user_analytics_to_channel(context, user_id)
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
     _clear_clarify_queue(user_id)
@@ -2733,8 +2723,8 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
-    entry   = ANALYTICS.get(str(user_id))
-    if not entry:
+    entry   = load_user_analytics(user_id)
+    if not entry.get("last_active_date"):
         await update.message.reply_text("📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!")
         return
     streak = entry.get("streak", 0)
