@@ -93,7 +93,7 @@ QUIZ_CHANNEL_ID = -1004402622263
 # ── Dedicated group for analytics JSON backups ────────────────
 # The bot pins the latest analytics.json here after every change
 # and deletes the previous one — always exactly one file in the group.
-ANALYTICS_GROUP_ID = -1005378747120
+ANALYTICS_GROUP_ID = -1003767364410
 
 # ── Curriculum structure for the quiz channel ─────────────────────
 # Add new modules/subjects here as they come up. Lecture titles posted in
