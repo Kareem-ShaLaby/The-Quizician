@@ -818,8 +818,9 @@ PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its 
 CLARIFY_QUEUE          = {}    # user_id -> list of PDF_BUFFER indices awaiting a correct-answer tap
 POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive auto-detection
 PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/"content"/"option", "opt_index": int?}
-PENDING_POLL_ANSWERS   = {}    # poll_id -> {user_id: chosen_option_id} for polls answered before closing
                                 # awaiting free-text replacement for one field of a just-added question
+LECTURE_SESSIONS       = {}    # user_id -> {"module","subject","lecture_key","queue":[mid,...],
+                                #             "current_poll_id","total","answered"} — active one-at-a-time delivery
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -1529,31 +1530,6 @@ async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception:
                 pass
 
-            # ── Retroactively award XP to everyone who answered before close ──
-            correct_id = entry.get("correct_option_id")
-            pending    = PENDING_POLL_ANSWERS.pop(poll.id, {})
-            for uid, chosen in pending.items():
-                is_correct = (chosen == correct_id) if correct_id is not None else None
-                xp_delta   = XP_QUIZ_ATTEMPT + (XP_QUIZ_CORRECT if is_correct else 0)
-                events     = _record_activity(uid)
-                user_entry = _get_entry(uid)
-                new_level  = _award_xp(user_entry, xp_delta)
-                if new_level:
-                    events["level_up"] = new_level
-                save_analytics()
-                await _announce_events(context, uid, events)
-                try:
-                    msg = "✅ إجابة صح!" if is_correct else "❌ إجابة غلط."
-                    await context.bot.send_message(
-                        chat_id=uid,
-                        text=f"{msg} <b>+{xp_delta} XP</b>",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-            if pending:
-                await backup_analytics_to_channel(context)
-
     if poll is None or not poll.correct_option_ids:
         return
 
@@ -1586,56 +1562,78 @@ async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
 # ── XP for lecture quiz answers ───────────────────────────────
-XP_QUIZ_ATTEMPT = 5    # just for trying
-XP_QUIZ_CORRECT = 15   # bonus on top of attempt XP (total 20 for correct)
+XP_LECTURE_QUESTION       = 10   # flat, per question answered — right or wrong doesn't matter
+XP_LECTURE_COMPLETE_BONUS = 25   # extra, on top of the above, for the lecture's last question
+
+async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
+    """Pops message ids off session['queue'] and copies them to the user one
+    at a time, skipping (and cleaning up) any that were deleted from the
+    channel since indexing, until one is delivered or the queue runs dry.
+    Sets session['current_poll_id'] to the freshly-sent poll's id. Returns
+    whether a question actually went out."""
+    entry = QUIZ_INDEX.get(session["lecture_key"])
+    while session["queue"]:
+        mid = session["queue"].pop(0)
+        try:
+            msg = await context.bot.copy_message(chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_id=mid)
+        except Exception as e:
+            print(f"Quiz question {mid} in lecture '{session['lecture_key']}' unreachable (likely deleted): {e}")
+            if entry and mid in entry.get("ids", []):
+                entry["ids"].remove(mid)
+                if not entry["ids"]:
+                    QUIZ_INDEX.pop(session["lecture_key"], None)  # whole lecture was deleted
+            for pid in [pid for pid, v in QUIZ_POLL_STATUS.items() if v["message_id"] == mid]:
+                QUIZ_POLL_STATUS.pop(pid, None)
+            save_quiz_index()
+            save_quiz_poll_status()
+            continue
+        session["current_poll_id"] = msg.poll.id if msg.poll else None
+        return True
+    return False
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a user answers any non-anonymous poll the bot has seen.
-    If the poll is already closed (correct answer known) → award XP immediately.
-    If the poll is still open → store the answer and award XP retroactively
-    once poll_update_handler fires with the correct answer."""
+    """Fires when a user answers a poll the bot sent. If it's the poll we're
+    currently waiting on for that user's active lecture session, award flat
+    XP — right or wrong makes no difference — and immediately forward the
+    next question, with a bonus tacked on once the lecture runs out."""
     answer  = update.poll_answer
     poll_id = answer.poll_id
     user_id = answer.user.id
-    chosen  = answer.option_ids[0] if answer.option_ids else None
 
-    entry = QUIZ_POLL_STATUS.get(poll_id)
-    if not entry:
-        return   # not a tracked lecture poll
+    session = LECTURE_SESSIONS.get(user_id)
+    if not session or session.get("current_poll_id") != poll_id:
+        return   # not the question we're tracking for this user right now
 
-    correct_id = entry.get("correct_option_id")
+    session["answered"] += 1
+    sent_next = await _deliver_next_lecture_question(context, user_id, session)
+    is_last   = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
 
-    if correct_id is not None:
-        # correct answer already known — award XP immediately
-        is_correct = (chosen == correct_id)
-        xp_delta   = XP_QUIZ_ATTEMPT + (XP_QUIZ_CORRECT if is_correct else 0)
-        events     = _record_activity(user_id)
-        user_entry = _get_entry(user_id)
-        new_level  = _award_xp(user_entry, xp_delta)
-        if new_level:
-            events["level_up"] = new_level
-        save_analytics()
-        await _announce_events(context, user_id, events)
-        try:
-            msg = "✅ إجابة صح!" if is_correct else "❌ إجابة غلط."
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"{msg} <b>+{xp_delta} XP</b>",
-                parse_mode=ParseMode.HTML,
+    xp_delta   = XP_LECTURE_QUESTION + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    events     = _record_activity(user_id)
+    user_entry = _get_entry(user_id)
+    new_level  = _award_xp(user_entry, xp_delta)
+    if new_level:
+        events["level_up"] = new_level
+    save_analytics()
+    await _announce_events(context, user_id, events)
+
+    try:
+        if is_last:
+            text = (
+                f"🎉 خلصت المحاضرة! <b>+{XP_LECTURE_QUESTION} XP</b>، "
+                f"وبونص إتمام المحاضرة <b>+{XP_LECTURE_COMPLETE_BONUS} XP</b> "
+                f"→ إجمالي <b>+{xp_delta} XP</b>"
             )
-        except Exception:
-            pass
-        await backup_analytics_to_channel(context)
-    else:
-        # poll still open — store answer, XP will be awarded when poll closes
-        PENDING_POLL_ANSWERS.setdefault(poll_id, {})[user_id] = chosen
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="📝 اتسجلت إجابتك! هيتحسب الـ XP لما السؤال يتقفل.",
-            )
-        except Exception:
-            pass
+        else:
+            text = f"<b>+{xp_delta} XP</b> ⭐"
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+    await backup_analytics_to_channel(context)
+
+    if is_last:
+        LECTURE_SESSIONS.pop(user_id, None)
 
 # ═══════════════════════════════════════════════════════════════
 # FORWARDED POLL HANDLER
@@ -2474,7 +2472,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── LECTURE: deliver a closed lecture's ready quizzes ─────────
+    # ── LECTURE: start one-at-a-time delivery of a closed lecture's ready quizzes ──
     if query.data.startswith("lecture:"):
         _, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
@@ -2504,55 +2502,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ready_ids     = [mid for mid in ids if mid in closed_message_ids]
         not_ready_cnt = len(ids) - len(ready_ids)
 
+        if not ready_ids:
+            await query.edit_message_text(
+                "⚠️ محدش قفل أي سؤال في المحاضرة دي لسه — هتتبعت لما الأدمن يوقف التصويت."
+                if not_ready_cnt else
+                "⚠️ المحاضرة دي مفيهاش أسئلة.",
+            )
+            return
+
+        session = {
+            "module": module, "subject": subject, "lecture_key": lecture_key,
+            "queue": list(ready_ids), "current_poll_id": None,
+            "total": len(ready_ids), "answered": 0,
+        }
+        LECTURE_SESSIONS[user_id] = session
+
         await query.edit_message_text(
-            f"🎓 <b>{module} - {subject}: {entry['name']}</b> — جاري إرسال {len(ready_ids)} سؤال...",
+            f"🎓 <b>{module} - {subject}: {entry['name']}</b> — {len(ready_ids)} سؤال، هيتبعتولك واحد واحد 👇",
             parse_mode=ParseMode.HTML,
         )
 
-        progress_msg_id = query.message.message_id
-        total = len(ready_ids)
-        # For small lectures this fires almost every question anyway; for
-        # large ones, throttle to roughly 10 edits total to stay well clear
-        # of Telegram's rate limits.
-        update_every = max(1, total // 10)
-
-        delivered, dead_ids = 0, []
-        for i, mid in enumerate(ready_ids, 1):
-            try:
-                await context.bot.copy_message(chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_id=mid)
-                delivered += 1
-            except Exception as e:
-                print(f"Quiz question {mid} in lecture '{lecture_key}' unreachable (likely deleted): {e}")
-                dead_ids.append(mid)
-
-            if total > 5 and (i % update_every == 0 or i == total):
-                try:
-                    label = "✅ اتبعت" if i == total else "⏳ جاري إرسال"
-                    await context.bot.edit_message_text(
-                        chat_id=user_id, message_id=progress_msg_id,
-                        text=f"🎓 <b>{module} - {subject}: {entry['name']}</b> — {label} {i}/{total}...",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass  # e.g. "message not modified" if delivered==0 questions failed — harmless
-
-        if dead_ids:
-            entry["ids"] = [mid for mid in entry["ids"] if mid not in dead_ids]
-            for mid in dead_ids:
-                stale_poll_ids = [pid for pid, v in QUIZ_POLL_STATUS.items() if v["message_id"] == mid]
-                for pid in stale_poll_ids:
-                    QUIZ_POLL_STATUS.pop(pid, None)
-            if not entry["ids"]:
-                QUIZ_INDEX.pop(lecture_key, None)  # whole lecture was deleted — drop it
-            save_quiz_index()
-            save_quiz_poll_status()
-            await backup_quiz_to_channel(context)
-
-        if delivered == 0 and not_ready_cnt == 0:
+        sent = await _deliver_next_lecture_question(context, user_id, session)
+        if not sent:
+            LECTURE_SESSIONS.pop(user_id, None)
             await context.bot.send_message(
                 chat_id=user_id,
                 text="⚠️ المحاضرة دي اتحذفت من القناة، فاتشالت من القايمة.",
             )
+            await backup_quiz_to_channel(context)
             return
 
         if not_ready_cnt:
@@ -2705,73 +2682,85 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(MSG_EXPORT_EMPTY)
             return
         await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind="PDF", count=len(items)))
-        pdf = build_pdf(items, name)
-        await query.message.reply_document(
-            document=pdf, filename=f"{safe}.pdf",
-            caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
-            parse_mode=ParseMode.HTML,
-        )
-        _cleanup_images(user_id)
-        _clear_pending_image(user_id)
-        _clear_clarify_queue(user_id)
-        _clear_pending_edit(user_id)
-        PDF_BUFFER.pop(user_id, None)
-        PDF_NAMES.pop(user_id, None)
-        PROGRESS_MSG_ID.pop(user_id, None)
+        await _export_pdf_session(context, query.message, user_id, user_id, items, name, fmt="pdf")
 
     elif query.data == "gen_docx":
-        if not DOCX_AVAILABLE:
-            await query.message.reply_text(MSG_DOCX_UNAVAILABLE)
-            return
         if not items:
             await query.message.reply_text(MSG_EXPORT_EMPTY)
             return
         await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind="DOCX", count=len(items)))
-        try:
-            docx_buf = build_docx(items, name)
-            await query.message.reply_document(
-                document=docx_buf, filename=f"{safe}.docx",
-                caption=MSG_DOCX_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
-                parse_mode=ParseMode.HTML,
-            )
-            _cleanup_images(user_id)
-            _clear_pending_image(user_id)
-            _clear_clarify_queue(user_id)
-            _clear_pending_edit(user_id)
-            PDF_BUFFER.pop(user_id, None)
-            PDF_NAMES.pop(user_id, None)
-            PROGRESS_MSG_ID.pop(user_id, None)
-        except Exception as e:
-            print("DOCX ERROR:", e)
-            await query.message.reply_text(
-                f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n"
-                f"<code>{e}</code>",
-                parse_mode=ParseMode.HTML,
-            )
+        await _export_pdf_session(context, query.message, user_id, user_id, items, name, fmt="docx")
 
     elif query.data == "clear_pdf":
-        _cleanup_images(user_id)
-        _clear_pending_image(user_id)
-        _clear_clarify_queue(user_id)
-        _clear_pending_edit(user_id)
-        PDF_BUFFER.pop(user_id, None)
-        PDF_NAMES.pop(user_id, None)
-        AWAITING_NAME.pop(user_id, None)
-        PROGRESS_MSG_ID.pop(user_id, None)
+        _reset_pdf_session(user_id)
         await query.message.reply_text(MSG_EXPORT_CLEARED_ALL)
 
 # ═══════════════════════════════════════════════════════════════
-# PDF COMMANDS
+# PDF/DOCX EXPORT — single source of truth, called from both the
+# /pdf_generate and /pdf_clear commands and their button equivalents
+# (gen_pdf/gen_docx/clear_pdf), so there's only one place that can
+# forget to track XP or diverge in behavior between the two.
 # ═══════════════════════════════════════════════════════════════
-async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
+def _reset_pdf_session(user_id: int) -> None:
+    """Clears everything tied to an in-progress PDF-collection session —
+    used after a successful export and by explicit clear/cancel alike."""
     _cleanup_images(user_id)
     _clear_pending_image(user_id)
     _clear_clarify_queue(user_id)
     _clear_pending_edit(user_id)
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
+    AWAITING_NAME.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
+
+async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
+                               analytics_uid: int, items: list, name: str, fmt: str) -> bool:
+    """Builds a PDF or DOCX (fmt='pdf'|'docx') from items, sends it via
+    message.reply_document, records the export XP/counter against
+    analytics_uid, announces any level-up, and resets the session keyed by
+    session_id. Returns False (having already replied with the reason) if
+    DOCX isn't available or the build blew up."""
+    safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
+
+    if fmt == "docx":
+        if not DOCX_AVAILABLE:
+            await message.reply_text(MSG_DOCX_UNAVAILABLE)
+            return False
+        try:
+            doc_bytes = build_docx(items, name)
+        except Exception as e:
+            print("DOCX ERROR:", e)
+            await message.reply_text(
+                f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{e}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+        await message.reply_document(
+            document=doc_bytes, filename=f"{safe}.docx",
+            caption=MSG_DOCX_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        pdf_bytes = build_pdf(items, name)
+        await message.reply_document(
+            document=pdf_bytes, filename=f"{safe}.pdf",
+            caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            parse_mode=ParseMode.HTML,
+        )
+
+    q_count = sum(1 for it in items if it.get("type") in ("mcq", "written"))
+    events  = _record_activity(analytics_uid, questions_delta=q_count, pdfs_delta=1, session_questions=q_count)
+    await _announce_events(context, session_id, events)
+    await backup_analytics_to_channel(context)
+    _reset_pdf_session(session_id)
+    return True
+
+# ═══════════════════════════════════════════════════════════════
+# PDF COMMANDS
+# ═══════════════════════════════════════════════════════════════
+async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    _reset_pdf_session(user_id)
     AWAITING_NAME[user_id] = True
     await update.message.reply_text(MSG_PDF_ASK_NAME, parse_mode=ParseMode.HTML)
 
@@ -2783,39 +2772,12 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(MSG_PDF_EMPTY)
         return
     name = PDF_NAMES.get(user_id, "questions")
-    safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
     await update.message.reply_text(MSG_PDF_GENERATING.format(count=len(items)))
-    pdf = build_pdf(items, name)
-    await update.message.reply_document(
-        document=pdf, filename=f"{safe}.pdf",
-        caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
-        parse_mode=ParseMode.HTML,
-    )
-    q_count = sum(1 for it in items if it.get("type") in ("mcq", "written"))
-    events  = _record_activity(real_uid,
-                               questions_delta=q_count,
-                               pdfs_delta=1,
-                               session_questions=q_count)
-    await _announce_events(context, user_id, events)
-    await backup_analytics_to_channel(context)
-    _cleanup_images(user_id)
-    _clear_pending_image(user_id)
-    _clear_clarify_queue(user_id)
-    _clear_pending_edit(user_id)
-    PDF_BUFFER.pop(user_id, None)
-    PDF_NAMES.pop(user_id, None)
-    PROGRESS_MSG_ID.pop(user_id, None)
+    await _export_pdf_session(context, update.message, user_id, real_uid, items, name, fmt="pdf")
 
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
-    _cleanup_images(user_id)
-    _clear_pending_image(user_id)
-    _clear_clarify_queue(user_id)
-    _clear_pending_edit(user_id)
-    PDF_BUFFER.pop(user_id, None)
-    PDF_NAMES.pop(user_id, None)
-    AWAITING_NAME.pop(user_id, None)
-    PROGRESS_MSG_ID.pop(user_id, None)
+    _reset_pdf_session(user_id)
     await update.message.reply_text(MSG_PDF_CLEARED)
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
