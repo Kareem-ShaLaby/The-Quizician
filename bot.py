@@ -17,7 +17,6 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     PollHandler,
-    PollAnswerHandler,
     filters,
     ContextTypes,
 )
@@ -821,6 +820,10 @@ PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/
                                 # awaiting free-text replacement for one field of a just-added question
 LECTURE_SESSIONS       = {}    # user_id -> {"module","subject","lecture_key","queue":[mid,...],
                                 #             "current_poll_id","total","answered"} — active one-at-a-time delivery
+LECTURE_SESSION_POLLS  = {}    # poll_id -> user_id — reverse lookup, since Update.poll carries no
+                                # chat/user context (needed because channel polls, and therefore
+                                # their copies, are always anonymous — Telegram never sends
+                                # poll_answer for those, only the anonymous Update.poll vote-count tick)
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -1514,6 +1517,21 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll = update.poll
 
+    # ── Lecture-quiz sequencing: detect an answer via the vote-count tick ──
+    # Channel-sourced quiz polls (and therefore their DM copies) are always
+    # anonymous, so Telegram never sends poll_answer for them — this is the
+    # only signal we get that someone answered. It has to be checked here,
+    # ahead of the "not poll.correct_option_ids" guard below, because a
+    # still-open poll never carries a correct_option_id at all — only once
+    # it's closed. Each copy only ever lives in one user's private chat, so
+    # any vote on it can only be that user's.
+    if poll is not None and poll.id in LECTURE_SESSION_POLLS and poll.total_voter_count >= 1:
+        lec_user_id = LECTURE_SESSION_POLLS.pop(poll.id, None)
+        session = LECTURE_SESSIONS.get(lec_user_id)
+        if session and session.get("current_poll_id") == poll.id:
+            await _advance_lecture_session(context, lec_user_id, session)
+        # else: stale (session already moved on or was cleared) — ignore
+
     # ── Quiz-channel poll tracking: mark it closed once stopped ──
     if poll is not None and poll.id in QUIZ_POLL_STATUS and poll.is_closed:
         entry = QUIZ_POLL_STATUS[poll.id]
@@ -1569,8 +1587,15 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
     """Pops message ids off session['queue'] and copies them to the user one
     at a time, skipping (and cleaning up) any that were deleted from the
     channel since indexing, until one is delivered or the queue runs dry.
-    Sets session['current_poll_id'] to the freshly-sent poll's id. Returns
-    whether a question actually went out."""
+    Sets session['current_poll_id'] and registers it in
+    LECTURE_SESSION_POLLS so poll_update_handler can find this session from
+    the bare Poll object it gets back (channel-sourced polls are always
+    anonymous, so there's no poll_answer/user info to key off of directly).
+    Returns whether a question actually went out."""
+    old_poll_id = session.get("current_poll_id")
+    if old_poll_id is not None:
+        LECTURE_SESSION_POLLS.pop(old_poll_id, None)
+
     entry = QUIZ_INDEX.get(session["lecture_key"])
     while session["queue"]:
         mid = session["queue"].pop(0)
@@ -1587,23 +1612,20 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
             save_quiz_index()
             save_quiz_poll_status()
             continue
-        session["current_poll_id"] = msg.poll.id if msg.poll else None
+        new_poll_id = msg.poll.id if msg.poll else None
+        session["current_poll_id"] = new_poll_id
+        if new_poll_id is not None:
+            LECTURE_SESSION_POLLS[new_poll_id] = user_id
         return True
+    session["current_poll_id"] = None
     return False
 
-async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a user answers a poll the bot sent. If it's the poll we're
-    currently waiting on for that user's active lecture session, award flat
-    XP — right or wrong makes no difference — and immediately forward the
-    next question, with a bonus tacked on once the lecture runs out."""
-    answer  = update.poll_answer
-    poll_id = answer.poll_id
-    user_id = answer.user.id
-
-    session = LECTURE_SESSIONS.get(user_id)
-    if not session or session.get("current_poll_id") != poll_id:
-        return   # not the question we're tracking for this user right now
-
+async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict):
+    """Called once we've detected (via the anonymous vote-count tick on
+    Update.poll — see poll_update_handler) that the user answered their
+    current lecture question. Awards flat XP — right or wrong makes no
+    difference — and immediately forwards the next question, with a bonus
+    tacked on once the lecture runs out."""
     session["answered"] += 1
     sent_next = await _deliver_next_lecture_question(context, user_id, session)
     is_last   = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
@@ -1634,6 +1656,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if is_last:
         LECTURE_SESSIONS.pop(user_id, None)
+
 
 # ═══════════════════════════════════════════════════════════════
 # FORWARDED POLL HANDLER
@@ -3137,7 +3160,6 @@ app.add_handler(MessageHandler(
 # Inline buttons
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(PollHandler(poll_update_handler))
-app.add_handler(PollAnswerHandler(handle_poll_answer))
 
 # Text handler last — excludes the storage group and the quiz channel
 app.add_handler(MessageHandler(
