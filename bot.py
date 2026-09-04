@@ -1826,7 +1826,8 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    user_id = update.effective_chat.id
+    user_id  = update.effective_chat.id
+    real_uid = update.effective_user.id if update.effective_user else user_id
     if user_id in SLEEPING:
         return
 
@@ -1867,7 +1868,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context, user_id, question, raw_options, correct_index,
                 explanation=explanation, image_path=img_path,
             )
-            events = _record_activity(user_id, questions_delta=1)
+            events = _record_activity(real_uid, questions_delta=1)
             await react_random(update, context)
             await _announce_events(context, user_id, events)
             await backup_analytics_to_channel(context)
@@ -1902,7 +1903,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     can only carry a photo, not a PDF). Uncaptioned PDFs are silently ignored."""
     if not update.message or not update.message.document:
         return
-    user_id = update.effective_chat.id
+    user_id  = update.effective_chat.id
+    real_uid = update.effective_user.id if update.effective_user else user_id
     if user_id in SLEEPING:
         return
     doc = update.message.document
@@ -1929,7 +1931,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await deliver_quiz(context, user_id, question, raw_options, correct_index, explanation=explanation)
-            events = _record_activity(user_id, questions_delta=1)
+            events = _record_activity(real_uid, questions_delta=1)
             await react_random(update, context)
             await _announce_events(context, user_id, events)
             await backup_analytics_to_channel(context)
@@ -2208,7 +2210,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    user_id = update.effective_chat.id
+    user_id  = update.effective_chat.id
+    real_uid = update.effective_user.id if update.effective_user else user_id
     if user_id in SLEEPING:
         return
 
@@ -2388,7 +2391,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context, user_id, question, raw_options, correct_index,
                 explanation=explanation, image_path=pending_img,
             )
-            events = _record_activity(user_id, questions_delta=1)
+            events = _record_activity(real_uid, questions_delta=1)
             await react_random(update, context)
             await _announce_events(context, user_id, events)
             await backup_analytics_to_channel(context)
@@ -2773,8 +2776,9 @@ async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(MSG_PDF_ASK_NAME, parse_mode=ParseMode.HTML)
 
 async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    items   = PDF_BUFFER.get(user_id, [])
+    user_id  = update.effective_chat.id
+    real_uid = update.effective_user.id if update.effective_user else user_id
+    items    = PDF_BUFFER.get(user_id, [])
     if not items:
         await update.message.reply_text(MSG_PDF_EMPTY)
         return
@@ -2788,7 +2792,7 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
     q_count = sum(1 for it in items if it.get("type") in ("mcq", "written"))
-    events  = _record_activity(user_id,
+    events  = _record_activity(real_uid,
                                questions_delta=q_count,
                                pdfs_delta=1,
                                session_questions=q_count)
@@ -2983,7 +2987,10 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ═══════════════════════════════════════════════════════════════
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
+    # Analytics are keyed by the person's real Telegram user id — not the
+    # chat id — so this shows the same numbers whether /mystats is run in
+    # a DM or inside a group/channel the bot is in.
+    user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
     entry   = ANALYTICS.get(str(user_id))
     if not entry or not entry.get("last_active_date"):
         await update.message.reply_text("📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!")
@@ -3049,6 +3056,55 @@ async def reset_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     _analytics_backup_msg_id = None
     await update.message.reply_text("🗑 Analytics wiped — local file cleared and backup deleted.")
 
+async def restore_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: manually re-pull analytics.json from the pinned backup
+    in ANALYTICS_GROUP_ID — the same restore that runs automatically on
+    startup. Use this if the local file ever gets wiped, corrupted, or
+    out of sync with the backup, without needing to restart the bot."""
+    if not (update.effective_user and update.effective_user.id == ADMIN_ID):
+        return
+    before = len(ANALYTICS)
+    await restore_analytics_from_channel(context)
+    await update.message.reply_text(
+        f"♻️ Restored from pinned backup.\n"
+        f"Users on file: <b>{len(ANALYTICS)}</b> (was {before} before restore).",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: import analytics from an uploaded .json file. Reply to
+    the file's message with /import_analytics. This is the fallback for
+    when the pinned backup itself is missing/corrupted — e.g. importing a
+    copy you saved elsewhere. Merges into (does not wipe) existing data,
+    then re-saves and re-pins so the channel backup reflects the import."""
+    if not (update.effective_user and update.effective_user.id == ADMIN_ID):
+        return
+    reply = update.message.reply_to_message
+    doc   = reply.document if reply else None
+    if not doc:
+        await update.message.reply_text(
+            "⚠️ Reply to the analytics .json file with /import_analytics."
+        )
+        return
+    try:
+        tg_file  = await context.bot.get_file(doc.file_id)
+        raw      = await tg_file.download_as_bytearray()
+        imported = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(imported, dict):
+            raise ValueError("File doesn't look like an analytics export (expected a JSON object).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Import failed: {e}")
+        return
+    ANALYTICS.update(imported)
+    save_analytics()
+    await backup_analytics_to_channel(context)
+    await update.message.reply_text(
+        f"✅ Imported <b>{len(imported)}</b> user(s) — merged into current data, "
+        f"saved locally, and re-pinned to the backup channel.\n"
+        f"Total users on file now: <b>{len(ANALYTICS)}</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
 async def _post_init(app):
     """Runs once after the bot connects, before polling starts — restores
     the storage-group and quiz-channel indexes from their pinned backup
@@ -3071,6 +3127,8 @@ app.add_handler(CommandHandler("pdf_generate",   pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",      pdf_clear))
 # Storage group setup helper
 app.add_handler(CommandHandler("mystats",           mystats_cmd))
+app.add_handler(CommandHandler("restore_analytics", restore_analytics_cmd))
+app.add_handler(CommandHandler("import_analytics",  import_analytics_cmd))
 app.add_handler(CommandHandler("reset_analytics",   reset_analytics_cmd))
 app.add_handler(CommandHandler("storage_id",     storage_id_cmd))
 app.add_handler(CommandHandler("backup_now",     backup_now_cmd))
