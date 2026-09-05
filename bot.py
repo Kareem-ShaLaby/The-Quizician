@@ -3,6 +3,7 @@ import string
 import random
 import json
 import os
+import time
 import asyncio
 import html
 import tempfile
@@ -332,6 +333,14 @@ ANALYTICS: dict = load_analytics()
 # source of truth — no separate state file needed.
 _analytics_backup_msg_id: int | None = None
 
+# Throttle for backup_analytics_to_channel — local save_analytics() (a
+# plain JSON.dump) still happens every time and is never delayed; only the
+# channel mirror (upload + pin + delete-old-pin, three Telegram calls) gets
+# debounced, since callers like lecture-answer XP can fire dozens of times
+# a minute and would otherwise risk hitting Telegram's rate limits.
+_last_analytics_backup_at: float = 0.0
+ANALYTICS_BACKUP_MIN_INTERVAL = 5  # seconds
+
 def _today() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -449,9 +458,13 @@ async def _announce_events(context, chat_id: int, events: dict):
         )
 
 async def backup_analytics_to_channel(context):
-    global _analytics_backup_msg_id
+    global _analytics_backup_msg_id, _last_analytics_backup_at
     if not ANALYTICS_GROUP_ID:
         return
+    now = time.monotonic()
+    if now - _last_analytics_backup_at < ANALYTICS_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_analytics() already has the latest data
+    _last_analytics_backup_at = now
     data = json.dumps(ANALYTICS, indent=2).encode("utf-8")
     try:
         sent = await context.bot.send_document(
@@ -1193,6 +1206,9 @@ def start_menu_keyboard():
         [
             InlineKeyboardButton("🦦 How To Use", callback_data="menu_how"),
             InlineKeyboardButton("Quizzes ⁉️",    callback_data="menu_quizzes"),
+        ],
+        [
+            InlineKeyboardButton("📊 My Stats", callback_data="menu_mystats"),
         ],
     ])
 
@@ -2780,6 +2796,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML)
         return
 
+    if query.data == "menu_mystats":
+        await _send_mystats(context, user_id, query.message)
+        return
+
     if query.data == "menu_quizzes":
         # Same as typing /quiz — sends a fresh message (not an edit) so the
         # welcome message with its buttons stays intact above it.
@@ -3069,14 +3089,13 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
-async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Analytics are keyed by the person's real Telegram user id — not the
-    # chat id — so this shows the same numbers whether /mystats is run in
-    # a DM or inside a group/channel the bot is in.
-    user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
-    entry   = ANALYTICS.get(str(user_id))
+async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
+    """Builds and sends the /mystats report to reply_target (an
+    update.message or a callback_query.message — both support
+    reply_text). Shared by the /mystats command and the main-menu button."""
+    entry = ANALYTICS.get(str(user_id))
     if not entry or not entry.get("last_active_date"):
-        await update.message.reply_text("📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!")
+        await reply_target.reply_text("📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!")
         return
 
     streak  = entry.get("streak", 0)
@@ -3111,7 +3130,7 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ach_text = "\n".join(ach_lines) if ach_lines else "  لسه مفيش إنجازات"
 
-    await update.message.reply_text(
+    await reply_target.reply_text(
         f"📊 <b>إحصائياتك</b>\n\n"
         f"🏅 المستوى: <b>{level}</b> — <i>{title}</i>\n"
         f"✨ XP: <b>{xp}</b>  [{bar}]  → {xp_end}\n\n"
@@ -3124,6 +3143,13 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏆 <b>إنجازات:</b>\n{ach_text}",
         parse_mode=ParseMode.HTML,
     )
+
+async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Analytics are keyed by the person's real Telegram user id — not the
+    # chat id — so this shows the same numbers whether /mystats is run in
+    # a DM or inside a group/channel the bot is in.
+    user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+    await _send_mystats(context, user_id, update.message)
 
 
 async def reset_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
