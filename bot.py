@@ -1211,10 +1211,6 @@ HOW_TO_USE_TEXT = (
     "Forward any Telegram quiz — the bot re-sends it with the correct answer preserved.\n\n"
     "<b>5) PDF / DOCX Mode</b>\n"
     "Use /pdf_start, collect items, then export.\n\n"
-    "<b>6) 🤖 AI Extraction</b>\n"
-    "Send a screenshot or PDF of MCQs with no caption — Quizzy reads it with AI, "
-    "pulls out every question (even several at once), and shows you a preview "
-    "to approve before anything's added. Always double-check the answers it picks!\n\n"
     "😴 /sleep — mute the bot until /start"
 )
 
@@ -2028,8 +2024,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed = parse_mcq_block(caption)
         if not parsed:
             await update.message.reply_text(
-                "⚠️ الكابشن مش صيغة سؤال كاملة (لازم سؤال + اختيارات + إجابة صح متعلّم عليها بـ z).\n"
-                "ابعت الملف تاني من غير كابشن لو عايز تستخدم استخراج الـ AI بدل كده."
+                "⚠️ الكابشن مش صيغة سؤال كاملة (لازم سؤال + اختيارات + إجابة صح متعلّم عليها بـ z)."
             )
             return
         question, raw_options, correct_index, explanation = parsed
@@ -2954,7 +2949,6 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("/quiz — browse lectures (module → subject → lecture) and pull their questions")
     lines.append("/storage_id — gets this chat's ID (for setting STORAGE_GROUP_ID)")
     lines.append("/quiz_channel_id — gets the quiz channel's chat ID (forward a message from it first)")
-    lines.append("🤖 Send a question image/PDF with no caption — an AI-extraction button will show up")
     lines.append("/c — this list")
 
     if is_admin(update):
@@ -3270,5 +3264,36 @@ app.add_handler(MessageHandler(
     filters.TEXT & ~filters.COMMAND & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_ID), handle
 ))
 
-print("Bot running... V5.5")
+def _print_startup_banner():
+    """Cosmetic-only console banner on launch — pure stdout, no side
+    effects, runs once right before polling starts."""
+    CYAN, GREEN, DIM, BOLD, RESET = "\033[96m", "\033[92m", "\033[90m", "\033[1m", "\033[0m"
+
+    art = (
+        f"{CYAN} ██████╗  ██╗   ██╗ ██╗ ███████╗ ██╗\n"
+        f"██╔═══██╗ ██║   ██║ ██║ ╚══███╔╝ ██║\n"
+        f"██║   ██║ ██║   ██║ ██║   ███╔╝  ██║\n"
+        f"██║▄▄ ██║ ██║   ██║ ██║  ███╔╝   ╚═╝\n"
+        f"╚██████╔╝ ╚██████╔╝ ██║ ███████╗ ██╗\n"
+        f" ╚══▀▀═╝   ╚═════╝  ╚═╝ ╚══════╝ ╚═╝{RESET}\n"
+    )
+    boot_lines = [
+        "[ OK ] question bank engine loaded",
+        "[ OK ] quiz channel index mounted",
+        "[ OK ] XP + achievements module warmed up",
+        "[ OK ] analytics backup channel linked",
+        f"[ {'OK' if DOCX_AVAILABLE else 'SKIP'} ] DOCX export module"
+        + ("" if DOCX_AVAILABLE else " — python-docx not installed"),
+        "[ OK ] handshake with Telegram Bot API...",
+    ]
+
+    print(art)
+    print(f"{DIM}{'─' * 42}{RESET}")
+    for line in boot_lines:
+        print(f"{GREEN}{line}{RESET}")
+    print(f"{DIM}{'─' * 42}{RESET}")
+    print(f"{BOLD}{GREEN}>> Quizzician v5.5 online — listening for updates{RESET}")
+    print(f"{DIM}{'─' * 42}{RESET}\n")
+
+_print_startup_banner()
 app.run_polling()
