@@ -3319,7 +3319,7 @@ def _print_startup_banner():
         sys.stdout.write("\r" + color + text + RESET + "\n")
         sys.stdout.flush()
 
-print(f"{DIM}{'─' * 42}{RESET}")
+    print(f"{DIM}{'─' * 42}{RESET}")
     print()
     for line in cat_lines:
         print(f"{ORANGE}{line}{RESET}")
@@ -3333,8 +3333,9 @@ print(f"{DIM}{'─' * 42}{RESET}")
     for line in boot_lines:
         _decode_line(line, GREEN)
     print(f"{DIM}{'─' * 42}{RESET}")
-    print(f"{BOLD}{GREEN}>> The Quizician: online — Welecome back, operator.{RESET}")
+    print(f"{BOLD}{GREEN}>> The Quizician: online — Welcome back, operator.{RESET}")
     print(f"{DIM}{'─' * 42}{RESET}\n")
+
 
 _print_startup_banner()
 app.run_polling()
