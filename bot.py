@@ -3267,15 +3267,22 @@ app.add_handler(MessageHandler(
 def _print_startup_banner():
     """Cosmetic-only console banner on launch — pure stdout, no side
     effects, runs once right before polling starts."""
-    CYAN, GREEN, DIM, BOLD, RESET = "\033[96m", "\033[92m", "\033[90m", "\033[1m", "\033[0m"
+    PURPLE, ORANGE, GREEN, DIM, BOLD, RESET = (
+        "\033[38;5;135m", "\033[38;5;208m", "\033[92m", "\033[90m", "\033[1m", "\033[0m"
+    )
 
     art = (
-        f"{CYAN} ██████╗  ██╗   ██╗ ██╗ ███████╗ ██╗\n"
+        f"{PURPLE} ██████╗  ██╗   ██╗ ██╗ ███████╗ ██╗\n"
         f"██╔═══██╗ ██║   ██║ ██║ ╚══███╔╝ ██║\n"
         f"██║   ██║ ██║   ██║ ██║   ███╔╝  ██║\n"
         f"██║▄▄ ██║ ██║   ██║ ██║  ███╔╝   ╚═╝\n"
         f"╚██████╔╝ ╚██████╔╝ ██║ ███████╗ ██╗\n"
         f" ╚══▀▀═╝   ╚═════╝  ╚═╝ ╚══════╝ ╚═╝{RESET}\n"
+    )
+    cat = (
+        f"{ORANGE}        /\\_/\\ \n"
+        f"       ( o.o ) meow~\n"
+        f"        > ^ <{RESET}\n"
     )
     boot_lines = [
         "[ OK ] question bank engine loaded",
@@ -3288,6 +3295,7 @@ def _print_startup_banner():
     ]
 
     print(art)
+    print(cat)
     print(f"{DIM}{'─' * 42}{RESET}")
     for line in boot_lines:
         print(f"{GREEN}{line}{RESET}")
