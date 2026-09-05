@@ -60,9 +60,16 @@ if os.path.exists(_POPPINS_REG) and os.path.exists(_POPPINS_BOLD):
         FONT_NAME_BOLD = "Poppins-Bold"
         print("Poppins font loaded")
     except Exception as e:
-        print("loading...")
+        print(f"Poppins load error: {e} — using Helvetica")
 else:
-    print("Poppins not found — using Helvetica")
+    import time as _time, sys as _sys
+    _text = "(LOADING...)"
+    _delay = 2.0 / len(_text)
+    for _ch in _text:
+        _sys.stdout.write(_ch)
+        _sys.stdout.flush()
+        _time.sleep(_delay)
+    print()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — never hardcode it
 
@@ -3295,7 +3302,6 @@ def _print_startup_banner():
         "[ OK ] quiz channel index mounted",
         "[ OK ] XP + achievements module warmed up",
         "[ OK ] analytics backup channel linked",
-        "[ OK ] Storage backup channel linked",
         f"[ {'OK' if DOCX_AVAILABLE else 'SKIP'} ] DOCX export module"
         + ("" if DOCX_AVAILABLE else " — python-docx not installed"),
         "[ OK ] handshake with Telegram Bot API...",
@@ -3319,8 +3325,8 @@ def _print_startup_banner():
         sys.stdout.write("\r" + color + text + RESET + "\n")
         sys.stdout.flush()
 
-    print(f"{DIM}{'─' * 42}{RESET}")
     print()
+    print(f"{DIM}{'─' * 42}{RESET}")
     for line in cat_lines:
         print(f"{ORANGE}{line}{RESET}")
         time.sleep(0.12)
@@ -3333,9 +3339,8 @@ def _print_startup_banner():
     for line in boot_lines:
         _decode_line(line, GREEN)
     print(f"{DIM}{'─' * 42}{RESET}")
-    print(f"{BOLD}{GREEN}>> The Quizician: online — Welcome back, operator.{RESET}")
+    print(f"{BOLD}{GREEN}>> Quizzician v5.5 online — listening for updates{RESET}")
     print(f"{DIM}{'─' * 42}{RESET}\n")
-
 
 _print_startup_banner()
 app.run_polling()
