@@ -208,6 +208,11 @@ USERS = load_users()
 #   "streak":            int,
 #   "last_active_date":  "YYYY-MM-DD" | null,
 #   "pdfs_exported":     int,
+#   "lecture_questions_answered":   int,
+#   "lecture_questions_correct":    int,
+#   "lecture_questions_incorrect":  int,
+#   "lecture_correct_streak_current": int,
+#   "lecture_correct_streak_best":    int,
 #   "xp":                int,
 #   "level":             int,
 #   "achievements": {
@@ -293,6 +298,11 @@ def _blank_entry() -> dict:
         "streak":            0,
         "last_active_date":  None,
         "pdfs_exported":     0,
+        "lecture_questions_answered":   0,
+        "lecture_questions_correct":    0,
+        "lecture_questions_incorrect":  0,
+        "lecture_correct_streak_current": 0,
+        "lecture_correct_streak_best":    0,
         "xp":                0,
         "level":             0,
         "achievements":      {k: 0 for k in ACHIEVEMENTS},
@@ -1570,7 +1580,8 @@ async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
 # ── XP for lecture quiz answers ───────────────────────────────
-XP_LECTURE_QUESTION       = 10   # flat, per question answered — right or wrong doesn't matter
+XP_LECTURE_CORRECT        = 15   # per question answered correctly
+XP_LECTURE_INCORRECT      = 5    # per question answered incorrectly
 XP_LECTURE_COMPLETE_BONUS = 25   # extra, on top of the above, for the lecture's last question
 
 async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
@@ -1653,17 +1664,20 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
             print(f"Couldn't send lecture question {mid}: {e}")
             continue
 
-        session["current_poll_id"] = msg.poll.id
+        session["current_poll_id"]    = msg.poll.id
+        session["current_correct_id"] = correct_id
         return True
 
-    session["current_poll_id"] = None
+    session["current_poll_id"]    = None
+    session["current_correct_id"] = None
     return False
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fires when a user answers a poll the bot sent (our lecture-delivery
     polls are always is_anonymous=False specifically so this reliably
     fires). If it's the question we're currently waiting on for that user's
-    active lecture session, hand off to _advance_lecture_session."""
+    active lecture session, work out whether they got it right and hand off
+    to _advance_lecture_session."""
     answer  = update.poll_answer
     poll_id = answer.poll_id
     user_id = answer.user.id
@@ -1672,43 +1686,65 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not session or session.get("current_poll_id") != poll_id:
         return   # not the question we're tracking for this user right now
 
-    await _advance_lecture_session(context, user_id, session)
+    chosen     = answer.option_ids[0] if answer.option_ids else None
+    is_correct = chosen is not None and chosen == session.get("current_correct_id")
+    await _advance_lecture_session(context, user_id, session, is_correct)
 
 
-async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict):
+async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool):
     """Called once handle_poll_answer confirms the user answered their
-    current lecture question. Awards flat XP — right or wrong makes no
-    difference — and immediately forwards the next question, with a bonus
-    tacked on once the lecture runs out."""
+    current lecture question, and whether it was right. Awards XP —
+    15 correct, 5 incorrect — silently (no per-question message) and
+    immediately forwards the next question. Once the lecture runs out,
+    tacks on a completion bonus and sends a single results summary with the
+    right/wrong count and the XP total accumulated across the lecture."""
     session["answered"] += 1
+    session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+
     sent_next = await _deliver_next_lecture_question(context, user_id, session)
     is_last   = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
 
-    xp_delta   = XP_LECTURE_QUESTION + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
+    xp_delta         = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
+
     events     = _record_activity(user_id)
     user_entry = _get_entry(user_id)
+    user_entry["lecture_questions_answered"]  += 1
+    user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
+    user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    if is_correct:
+        user_entry["lecture_correct_streak_current"] += 1
+        if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
+            user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
+    else:
+        user_entry["lecture_correct_streak_current"] = 0
     new_level  = _award_xp(user_entry, xp_delta)
     if new_level:
         events["level_up"] = new_level
     save_analytics()
-    await _announce_events(context, user_id, events)
-
-    try:
-        if is_last:
-            text = (
-                f"🎉 خلصت المحاضرة! <b>+{XP_LECTURE_QUESTION} XP</b>، "
-                f"وبونص إتمام المحاضرة <b>+{XP_LECTURE_COMPLETE_BONUS} XP</b> "
-                f"→ إجمالي <b>+{xp_delta} XP</b>"
-            )
-        else:
-            text = f"<b>+{xp_delta} XP</b> ⭐"
-        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
+    await _announce_events(context, user_id, events)   # still immediate: level-ups/achievements are rare enough to be worth a heads-up mid-lecture
 
     await backup_analytics_to_channel(context)
 
     if is_last:
+        total     = session["total"]
+        correct   = session["correct"]
+        incorrect = session["answered"] - correct
+        pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+        lecture_name = QUIZ_INDEX.get(session["lecture_key"], {}).get("name", session["lecture_key"])
+        summary = (
+            f"🎓 <b>خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!</b>\n\n"
+            f"✅ صح: {correct}\n"
+            f"❌ غلط: {incorrect}\n"
+            f"📊 نسبة: {pct}%\n"
+            f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
+            f"✨ XP: <b>+{session['xp_earned']}</b>"
+        )
+        try:
+            await context.bot.send_message(chat_id=user_id, text=summary, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
         LECTURE_SESSIONS.pop(user_id, None)
 
 
@@ -2596,8 +2632,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         session = {
             "module": module, "subject": subject, "lecture_key": lecture_key,
-            "queue": list(ready_ids), "current_poll_id": None,
-            "total": len(ready_ids), "answered": 0,
+            "queue": list(ready_ids), "current_poll_id": None, "current_correct_id": None,
+            "total": len(ready_ids), "answered": 0, "correct": 0,
         }
         LECTURE_SESSIONS[user_id] = session
 
@@ -2906,28 +2942,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/c — lists every command, admin-only ones only shown to the admin."""
-    lines = ["📖 <b>الأوامر المتاحة:</b>\n"]
-    lines.append("👤 <b>للجميع</b>")
-    lines.append("/start — القائمة الرئيسية")
-    lines.append("/sleep — يوقف البوت مؤقتًا في المحادثة دي")
-    lines.append("/mystats — إحصائياتك (أسئلة أنشأتها، سلسلة الأيام)")
-    lines.append("/pdf_start — يبدأ سيشن تجميع صور لملف PDF")
-    lines.append("/pdf_generate — يطلع PDF من الصور اللي جمعتها")
-    lines.append("/pdf_clear — يمسح سيشن الـ PDF الحالي")
-    lines.append("/cancel — يلغي أي حاجة شغالة دلوقتي (PDF، صورة معلّقة، إلخ)")
-    lines.append("/quiz — تصفح المحاضرات (موديول ← مادة ← محاضرة) وسحب أسئلتها")
-    lines.append("/storage_id — يجيب chat ID بتاع المكان ده (لضبط STORAGE_GROUP_ID)")
-    lines.append("/quiz_channel_id — يجيب chat ID لقناة الكويز (فوروارد رسالة منها الأول)")
-    lines.append("🤖 ابعت صورة/PDF أسئلة من غير كابشن — هيعرض زرار استخراج بالـ AI")
-    lines.append("/c — القائمة دي")
+    lines = ["📖 <b>Available commands:</b>\n"]
+    lines.append("👤 <b>For everyone</b>")
+    lines.append("/start — main menu")
+    lines.append("/sleep — pauses the bot temporarily in this chat")
+    lines.append("/mystats — your stats (questions created, day streak, lecture quiz results)")
+    lines.append("/pdf_start — starts a session collecting images for a PDF")
+    lines.append("/pdf_generate — builds a PDF from the images you've collected")
+    lines.append("/pdf_clear — clears the current PDF session")
+    lines.append("/cancel — cancels whatever's currently in progress (PDF, pending image, etc.)")
+    lines.append("/quiz — browse lectures (module → subject → lecture) and pull their questions")
+    lines.append("/storage_id — gets this chat's ID (for setting STORAGE_GROUP_ID)")
+    lines.append("/quiz_channel_id — gets the quiz channel's chat ID (forward a message from it first)")
+    lines.append("🤖 Send a question image/PDF with no caption — an AI-extraction button will show up")
+    lines.append("/c — this list")
 
     if is_admin(update):
-        lines.append("\n🔐 <b>للأدمن بس</b>")
-        lines.append("/admincheck — يتأكد إنك أدمن")
-        lines.append("/broadcast &lt;رسالة&gt; — يبعت رسالة لكل المستخدمين")
-        lines.append("/backup_now — يعمل ريفريش فوري للباك أب المثبّت (ستوريدج + كويز)")
-        lines.append("/quiz_list — ليستة مرقّمة بكل المحاضرات (مفتوحة ومقفولة)")
-        lines.append("/quiz_delete &lt;رقم&gt; — يشيل محاضرة من الفهرس")
+        lines.append("\n🔐 <b>Admin only</b>")
+        lines.append("/admincheck — confirms you're an admin")
+        lines.append("/broadcast &lt;message&gt; — sends a message to every user")
+        lines.append("/backup_now — instantly refreshes the pinned backup (storage + quiz)")
+        lines.append("/quiz_list — numbered list of every lecture (open and closed)")
+        lines.append("/quiz_delete &lt;number&gt; — removes a lecture from the index")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -3045,6 +3081,10 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     streak  = entry.get("streak", 0)
     total_q = entry.get("questions_created", 0)
     pdfs    = entry.get("pdfs_exported", 0)
+    lec_answered  = entry.get("lecture_questions_answered", 0)
+    lec_correct   = entry.get("lecture_questions_correct", 0)
+    lec_incorrect = entry.get("lecture_questions_incorrect", 0)
+    lec_best_streak = entry.get("lecture_correct_streak_best", 0)
     last    = entry.get("last_active_date", "—")
     xp      = entry.get("xp", 0)
     level   = entry.get("level", 0)
@@ -3076,6 +3116,8 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✨ XP: <b>{xp}</b>  [{bar}]  → {xp_end}\n\n"
         f"❓ أسئلة أنشأتها: <b>{total_q}</b>\n"
         f"📚 PDFs: <b>{pdfs}</b>\n"
+        f"🎓 أسئلة محاضرات جاوبتها: <b>{lec_answered}</b> (✅ {lec_correct} / ❌ {lec_incorrect})\n"
+        f"🎯 أعلى سلسلة إجابات صح: <b>{lec_best_streak}</b>\n"
         f"🗓 سلسلة الأيام: <b>{streak}</b> {flame}\n"
         f"📅 آخر نشاط: <b>{last}</b>\n\n"
         f"🏆 <b>إنجازات:</b>\n{ach_text}",
