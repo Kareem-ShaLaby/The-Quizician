@@ -60,7 +60,7 @@ if os.path.exists(_POPPINS_REG) and os.path.exists(_POPPINS_BOLD):
         FONT_NAME_BOLD = "Poppins-Bold"
         print("Poppins font loaded")
     except Exception as e:
-        print(f"Poppins load error: {e} — using Helvetica")
+        print("loading...")
 else:
     print("Poppins not found — using Helvetica")
 
@@ -3295,6 +3295,7 @@ def _print_startup_banner():
         "[ OK ] quiz channel index mounted",
         "[ OK ] XP + achievements module warmed up",
         "[ OK ] analytics backup channel linked",
+        "[ OK ] Storage backup channel linked",
         f"[ {'OK' if DOCX_AVAILABLE else 'SKIP'} ] DOCX export module"
         + ("" if DOCX_AVAILABLE else " — python-docx not installed"),
         "[ OK ] handshake with Telegram Bot API...",
@@ -3313,11 +3314,12 @@ def _print_startup_banner():
             ]
             sys.stdout.write("\r" + color + "".join(frame) + RESET)
             sys.stdout.flush()
-            time.sleep(0.02)
+            time.sleep(0.08)
             revealed += 3
         sys.stdout.write("\r" + color + text + RESET + "\n")
         sys.stdout.flush()
 
+print(f"{DIM}{'─' * 42}{RESET}")
     print()
     for line in cat_lines:
         print(f"{ORANGE}{line}{RESET}")
@@ -3331,7 +3333,7 @@ def _print_startup_banner():
     for line in boot_lines:
         _decode_line(line, GREEN)
     print(f"{DIM}{'─' * 42}{RESET}")
-    print(f"{BOLD}{GREEN}>> Quizzician v5.5 online — listening for updates{RESET}")
+    print(f"{BOLD}{GREEN}>> The Quizician: online — Welecome back, operator.{RESET}")
     print(f"{DIM}{'─' * 42}{RESET}\n")
 
 _print_startup_banner()
