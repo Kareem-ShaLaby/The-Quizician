@@ -17,6 +17,7 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     PollHandler,
+    PollAnswerHandler,
     filters,
     ContextTypes,
 )
@@ -820,10 +821,6 @@ PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/
                                 # awaiting free-text replacement for one field of a just-added question
 LECTURE_SESSIONS       = {}    # user_id -> {"module","subject","lecture_key","queue":[mid,...],
                                 #             "current_poll_id","total","answered"} — active one-at-a-time delivery
-LECTURE_SESSION_POLLS  = {}    # poll_id -> user_id — reverse lookup, since Update.poll carries no
-                                # chat/user context (needed because channel polls, and therefore
-                                # their copies, are always anonymous — Telegram never sends
-                                # poll_answer for those, only the anonymous Update.poll vote-count tick)
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -1517,21 +1514,6 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll = update.poll
 
-    # ── Lecture-quiz sequencing: detect an answer via the vote-count tick ──
-    # Channel-sourced quiz polls (and therefore their DM copies) are always
-    # anonymous, so Telegram never sends poll_answer for them — this is the
-    # only signal we get that someone answered. It has to be checked here,
-    # ahead of the "not poll.correct_option_ids" guard below, because a
-    # still-open poll never carries a correct_option_id at all — only once
-    # it's closed. Each copy only ever lives in one user's private chat, so
-    # any vote on it can only be that user's.
-    if poll is not None and poll.id in LECTURE_SESSION_POLLS and poll.total_voter_count >= 1:
-        lec_user_id = LECTURE_SESSION_POLLS.pop(poll.id, None)
-        session = LECTURE_SESSIONS.get(lec_user_id)
-        if session and session.get("current_poll_id") == poll.id:
-            await _advance_lecture_session(context, lec_user_id, session)
-        # else: stale (session already moved on or was cleared) — ignore
-
     # ── Quiz-channel poll tracking: mark it closed once stopped ──
     if poll is not None and poll.id in QUIZ_POLL_STATUS and poll.is_closed:
         entry = QUIZ_POLL_STATUS[poll.id]
@@ -1539,6 +1521,14 @@ async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             entry["closed"] = True
             if poll.correct_option_ids and entry.get("correct_option_id") is None:
                 entry["correct_option_id"] = poll.correct_option_ids[0]
+            # Capture full poll content too, not just the correct answer —
+            # lecture delivery needs to rebuild these as our own polls (see
+            # _deliver_next_lecture_question) so it can get real poll_answer
+            # events, since a straight copy of a channel poll stays
+            # anonymous forever and Telegram never sends those for it.
+            entry["question"]    = poll.question
+            entry["options"]     = [o.text for o in poll.options]
+            entry["explanation"] = poll.explanation
             save_quiz_poll_status()
             try:
                 await context.bot.set_message_reaction(
@@ -1584,45 +1574,105 @@ XP_LECTURE_QUESTION       = 10   # flat, per question answered — right or wron
 XP_LECTURE_COMPLETE_BONUS = 25   # extra, on top of the above, for the lecture's last question
 
 async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
-    """Pops message ids off session['queue'] and copies them to the user one
-    at a time, skipping (and cleaning up) any that were deleted from the
-    channel since indexing, until one is delivered or the queue runs dry.
-    Sets session['current_poll_id'] and registers it in
-    LECTURE_SESSION_POLLS so poll_update_handler can find this session from
-    the bare Poll object it gets back (channel-sourced polls are always
-    anonymous, so there's no poll_answer/user info to key off of directly).
-    Returns whether a question actually went out."""
-    old_poll_id = session.get("current_poll_id")
-    if old_poll_id is not None:
-        LECTURE_SESSION_POLLS.pop(old_poll_id, None)
+    """Pops message ids off session['queue'] and sends them to the user one
+    at a time as the bot's own non-anonymous quiz polls (built from content
+    captured off the channel poll when it closed — see poll_update_handler),
+    skipping (and cleaning up) any that were deleted from the channel since
+    indexing, until one is delivered or the queue runs dry.
 
+    Why not just copy_message the original? Because channel polls (and
+    therefore any straight copy of one) are always anonymous, and Telegram
+    never sends poll_answer for anonymous polls — there'd be no way to tell
+    the question had been answered. Sending our own copy with
+    is_anonymous=False sidesteps that entirely.
+
+    For lecture questions closed before this content-capture existed, the
+    QUIZ_POLL_STATUS entry won't have "question"/"options" yet — those get
+    backfilled here via a one-time throwaway copy (read its poll content,
+    delete it, never shown to the user) the first time they're delivered.
+
+    Sets session['current_poll_id']. Returns whether a question went out."""
     entry = QUIZ_INDEX.get(session["lecture_key"])
+
+    def _drop_dead(mid: int):
+        if entry and mid in entry.get("ids", []):
+            entry["ids"].remove(mid)
+            if not entry["ids"]:
+                QUIZ_INDEX.pop(session["lecture_key"], None)  # whole lecture was deleted
+        for pid in [pid for pid, v in QUIZ_POLL_STATUS.items() if v["message_id"] == mid]:
+            QUIZ_POLL_STATUS.pop(pid, None)
+        save_quiz_index()
+        save_quiz_poll_status()
+
     while session["queue"]:
         mid = session["queue"].pop(0)
+        status = next((v for v in QUIZ_POLL_STATUS.values() if v["message_id"] == mid), None)
+
+        question    = status.get("question")    if status else None
+        options     = status.get("options")      if status else None
+        correct_id  = status.get("correct_option_id") if status else None
+        explanation = status.get("explanation")  if status else None
+
+        if not (question and options and correct_id is not None):
+            # Legacy entry (closed before content-capture existed) — grab
+            # the content via a throwaway copy, then delete it; the copy
+            # itself is never what gets answered.
+            try:
+                probe = await context.bot.copy_message(chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_id=mid)
+            except Exception as e:
+                print(f"Quiz question {mid} in lecture '{session['lecture_key']}' unreachable (likely deleted): {e}")
+                _drop_dead(mid)
+                continue
+            if probe.poll and probe.poll.correct_option_ids:
+                question    = probe.poll.question
+                options     = [o.text for o in probe.poll.options]
+                correct_id  = probe.poll.correct_option_ids[0]
+                explanation = probe.poll.explanation
+                if status is not None:
+                    status.update(question=question, options=options,
+                                   correct_option_id=correct_id, explanation=explanation)
+                    save_quiz_poll_status()
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=probe.message_id)
+            except Exception:
+                pass
+            if not (question and options and correct_id is not None):
+                continue  # still couldn't recover real quiz content — skip it
+
         try:
-            msg = await context.bot.copy_message(chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_id=mid)
+            msg = await context.bot.send_poll(
+                chat_id=user_id, question=question, options=options,
+                type="quiz", correct_option_id=correct_id, is_anonymous=False,
+                explanation=(explanation or None),
+            )
         except Exception as e:
-            print(f"Quiz question {mid} in lecture '{session['lecture_key']}' unreachable (likely deleted): {e}")
-            if entry and mid in entry.get("ids", []):
-                entry["ids"].remove(mid)
-                if not entry["ids"]:
-                    QUIZ_INDEX.pop(session["lecture_key"], None)  # whole lecture was deleted
-            for pid in [pid for pid, v in QUIZ_POLL_STATUS.items() if v["message_id"] == mid]:
-                QUIZ_POLL_STATUS.pop(pid, None)
-            save_quiz_index()
-            save_quiz_poll_status()
+            print(f"Couldn't send lecture question {mid}: {e}")
             continue
-        new_poll_id = msg.poll.id if msg.poll else None
-        session["current_poll_id"] = new_poll_id
-        if new_poll_id is not None:
-            LECTURE_SESSION_POLLS[new_poll_id] = user_id
+
+        session["current_poll_id"] = msg.poll.id
         return True
+
     session["current_poll_id"] = None
     return False
 
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires when a user answers a poll the bot sent (our lecture-delivery
+    polls are always is_anonymous=False specifically so this reliably
+    fires). If it's the question we're currently waiting on for that user's
+    active lecture session, hand off to _advance_lecture_session."""
+    answer  = update.poll_answer
+    poll_id = answer.poll_id
+    user_id = answer.user.id
+
+    session = LECTURE_SESSIONS.get(user_id)
+    if not session or session.get("current_poll_id") != poll_id:
+        return   # not the question we're tracking for this user right now
+
+    await _advance_lecture_session(context, user_id, session)
+
+
 async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict):
-    """Called once we've detected (via the anonymous vote-count tick on
-    Update.poll — see poll_update_handler) that the user answered their
+    """Called once handle_poll_answer confirms the user answered their
     current lecture question. Awards flat XP — right or wrong makes no
     difference — and immediately forwards the next question, with a bonus
     tacked on once the lecture runs out."""
@@ -2519,8 +2569,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ids   = entry["ids"]
 
         # Only polls Telegram has confirmed as stopped are actually
-        # copyable — a quiz poll can't be copied while its correct
-        # answer is still unknown, so filter to those first.
+        # deliverable — a quiz poll's correct answer isn't known until
+        # it's closed, and we need that to rebuild it as our own poll.
         closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS.values() if v["closed"]}
         ready_ids     = [mid for mid in ids if mid in closed_message_ids]
         not_ready_cnt = len(ids) - len(ready_ids)
@@ -3160,6 +3210,7 @@ app.add_handler(MessageHandler(
 # Inline buttons
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(PollHandler(poll_update_handler))
+app.add_handler(PollAnswerHandler(handle_poll_answer))
 
 # Text handler last — excludes the storage group and the quiz channel
 app.add_handler(MessageHandler(
