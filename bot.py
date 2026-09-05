@@ -1588,8 +1588,9 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
 
     For lecture questions closed before this content-capture existed, the
     QUIZ_POLL_STATUS entry won't have "question"/"options" yet — those get
-    backfilled here via a one-time throwaway copy (read its poll content,
-    delete it, never shown to the user) the first time they're delivered.
+    backfilled here via a one-time throwaway forward (read its poll
+    content, delete it, never shown to the user) the first time they're
+    delivered.
 
     Sets session['current_poll_id']. Returns whether a question went out."""
     entry = QUIZ_INDEX.get(session["lecture_key"])
@@ -1615,10 +1616,13 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
 
         if not (question and options and correct_id is not None):
             # Legacy entry (closed before content-capture existed) — grab
-            # the content via a throwaway copy, then delete it; the copy
-            # itself is never what gets answered.
+            # the content via a throwaway forward, then delete it; the
+            # forward itself is never what gets answered. Must be
+            # forward_message here, not copy_message: copyMessage's API
+            # response is just a bare message_id with no poll content at
+            # all, so there'd be nothing here to read.
             try:
-                probe = await context.bot.copy_message(chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_id=mid)
+                probe = await context.bot.forward_message(chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_id=mid)
             except Exception as e:
                 print(f"Quiz question {mid} in lecture '{session['lecture_key']}' unreachable (likely deleted): {e}")
                 _drop_dead(mid)
@@ -2110,14 +2114,21 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             return
         QUIZ_INDEX[current]["ids"].append(msg.message_id)
         save_quiz_index()
-        # Track this poll so we know once it's stopped (only then is it
-        # actually copyable — Telegram requires the correct answer to be
-        # known before a quiz poll can be copied at all).
+        # Track this poll so we know once it's stopped (only then is the
+        # correct answer known — needed before it can be delivered as a
+        # lecture question). question/options are captured right away since
+        # those aren't access-restricted like correct_option_id is; that
+        # lets lecture delivery build its own poll (see
+        # _deliver_next_lecture_question) without depending on a copy of
+        # the original, which would stay anonymous forever.
         QUIZ_POLL_STATUS[msg.poll.id] = {
             "lecture":           current,
             "message_id":        msg.message_id,
             "closed":            msg.poll.is_closed,
             "correct_option_id": msg.poll.correct_option_ids[0] if msg.poll.correct_option_ids else None,
+            "question":          msg.poll.question,
+            "options":           [o.text for o in msg.poll.options],
+            "explanation":       msg.poll.explanation,
         }
         save_quiz_poll_status()
         # NOTE: the channel backup document + the "still open" reaction are
