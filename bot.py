@@ -3326,6 +3326,8 @@ def _print_startup_banner():
     boot_lines = [
         "[ OK ] question bank engine loaded",
         "[ OK ] quiz channel index mounted",
+        "[ OK ] CommandHandler Activation",
+        "[ OK ] Hot potatoes",
         "[ OK ] XP + achievements module warmed up",
         "[ OK ] analytics backup channel linked",
         f"[ {'OK' if DOCX_AVAILABLE else 'SKIP'} ] DOCX export module"
@@ -3358,14 +3360,14 @@ def _print_startup_banner():
         time.sleep(0.12)
     for line in quiz_lines:
         print(f"{PURPLE}{line}{RESET}")
-        time.sleep(0.08)
+        time.sleep(0.07)
     print()
 
     print(f"{DIM}{'─' * 42}{RESET}")
     for line in boot_lines:
         _decode_line(line, GREEN)
     print(f"{DIM}{'─' * 42}{RESET}")
-    print(f"{BOLD}{GREEN}>> Quizzician v5.5 online — listening for updates{RESET}")
+    print(f"{BOLD}{GREEN}>> The Quizician status: ONLINE — Welcome back, Operator.{RESET}")
     print(f"{DIM}{'─' * 42}{RESET}\n")
 
 _print_startup_banner()
