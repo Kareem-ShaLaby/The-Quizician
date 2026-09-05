@@ -1,2 +1,2 @@
 # The-Quizician
-# MOMMA AM A CRIMINALLLL
+it was once a joke, now a great machine
