@@ -3266,21 +3266,30 @@ app.add_handler(MessageHandler(
 
 def _print_startup_banner():
     """Cosmetic-only console banner on launch — pure stdout, no side
-    effects, runs once right before polling starts."""
+    effects, runs once right before polling starts. Reveals the QUIZ! art
+    line by line, then decrypts each boot-check line from random
+    characters (adds well under a second total, doesn't meaningfully
+    delay startup). Note: the flicker relies on carriage-return overwrite,
+    which only collapses cleanly in a live/interactive terminal — on a
+    non-interactive log stream (e.g. Railway's log viewer) each frame may
+    render as its own line instead of overwriting in place."""
+    import time, sys
     PURPLE, ORANGE, GREEN, DIM, BOLD, RESET = (
         "\033[38;5;135m", "\033[38;5;208m", "\033[92m", "\033[90m", "\033[1m", "\033[0m"
     )
 
-    art = (
-        f"{ORANGE}                         /\\_/\\\n"
-        f"                        ( ⌒.⌒ )\n"
-        f"{PURPLE} ██████╗  ██╗   ██╗ ██╗ ███████╗ ██╗\n"
-        f"██╔═══██╗ ██║   ██║ ██║ ╚══███╔╝ ██║\n"
-        f"██║   ██║ ██║   ██║ ██║   ███╔╝  ██║\n"
-        f"██║▄▄ ██║ ██║   ██║ ██║  ███╔╝   ╚═╝\n"
-        f"╚██████╔╝ ╚██████╔╝ ██║ ███████╗ ██╗\n"
-        f" ╚══▀▀═╝   ╚═════╝  ╚═╝ ╚══════╝ ╚═╝{RESET}\n"
-    )
+    cat_lines = [
+        "                         /\\_/\\",
+        "                        ( ⌒.⌒ )",
+    ]
+    quiz_lines = [
+        " ██████╗  ██╗   ██╗ ██╗ ███████╗ ██╗",
+        "██╔═══██╗ ██║   ██║ ██║ ╚══███╔╝ ██║",
+        "██║   ██║ ██║   ██║ ██║   ███╔╝  ██║",
+        "██║▄▄ ██║ ██║   ██║ ██║  ███╔╝   ╚═╝",
+        "╚██████╔╝ ╚██████╔╝ ██║ ███████╗ ██╗",
+        " ╚══▀▀═╝   ╚═════╝  ╚═╝ ╚══════╝ ╚═╝",
+    ]
     boot_lines = [
         "[ OK ] question bank engine loaded",
         "[ OK ] quiz channel index mounted",
@@ -3291,10 +3300,36 @@ def _print_startup_banner():
         "[ OK ] handshake with Telegram Bot API...",
     ]
 
-    print(art)
+    def _decode_line(text: str, color: str) -> None:
+        """Call-of-Duty-style decrypt flicker: random characters settle
+        into the real text a few characters at a time, left to right."""
+        charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
+        n = len(text)
+        revealed = 0
+        while revealed < n:
+            frame = [
+                text[i] if (i < revealed or text[i] == " ") else random.choice(charset)
+                for i in range(n)
+            ]
+            sys.stdout.write("\r" + color + "".join(frame) + RESET)
+            sys.stdout.flush()
+            time.sleep(0.02)
+            revealed += 3
+        sys.stdout.write("\r" + color + text + RESET + "\n")
+        sys.stdout.flush()
+
+    print()
+    for line in cat_lines:
+        print(f"{ORANGE}{line}{RESET}")
+        time.sleep(0.12)
+    for line in quiz_lines:
+        print(f"{PURPLE}{line}{RESET}")
+        time.sleep(0.08)
+    print()
+
     print(f"{DIM}{'─' * 42}{RESET}")
     for line in boot_lines:
-        print(f"{GREEN}{line}{RESET}")
+        _decode_line(line, GREEN)
     print(f"{DIM}{'─' * 42}{RESET}")
     print(f"{BOLD}{GREEN}>> Quizzician v5.5 online — listening for updates{RESET}")
     print(f"{DIM}{'─' * 42}{RESET}\n")
