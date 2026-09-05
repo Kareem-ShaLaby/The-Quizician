@@ -3272,17 +3272,14 @@ def _print_startup_banner():
     )
 
     art = (
+        f"{ORANGE}                         /\\_/\\\n"
+        f"                        ( ⌒.⌒ )\n"
         f"{PURPLE} ██████╗  ██╗   ██╗ ██╗ ███████╗ ██╗\n"
         f"██╔═══██╗ ██║   ██║ ██║ ╚══███╔╝ ██║\n"
         f"██║   ██║ ██║   ██║ ██║   ███╔╝  ██║\n"
         f"██║▄▄ ██║ ██║   ██║ ██║  ███╔╝   ╚═╝\n"
         f"╚██████╔╝ ╚██████╔╝ ██║ ███████╗ ██╗\n"
         f" ╚══▀▀═╝   ╚═════╝  ╚═╝ ╚══════╝ ╚═╝{RESET}\n"
-    )
-    cat = (
-        f"{ORANGE}        /\\_/\\ \n"
-        f"       ( o.o ) meow~\n"
-        f"        > ^ <{RESET}\n"
     )
     boot_lines = [
         "[ OK ] question bank engine loaded",
@@ -3295,7 +3292,6 @@ def _print_startup_banner():
     ]
 
     print(art)
-    print(cat)
     print(f"{DIM}{'─' * 42}{RESET}")
     for line in boot_lines:
         print(f"{GREEN}{line}{RESET}")
