@@ -244,6 +244,17 @@ XP_LEVEL_FACTOR   = 50   # level 1 = 50xp, 5 = 1250xp, 10 = 5000xp
 
 # ── Achievement definitions ───────────────────────────────────
 # Each achievement has 5 tiers: (threshold, label, xp_bonus, emoji)
+# stat_key → the actual analytics entry field each category's threshold is
+# checked against (kept separate from the ACHIEVEMENTS dict key so the
+# lookup doesn't silently break if either name changes later).
+ACHIEVEMENT_STAT_FIELD = {
+    "questions":         "questions_created",
+    "streak":            "streak",
+    "pdfs":              "pdfs_exported",
+    "speed":             "_session_max",
+    "lecture_questions": "lecture_questions_answered",
+    "lecture_streak":    "lecture_correct_streak_best",
+}
 ACHIEVEMENTS = {
     "questions": [
         (1,    "صانع الأسئلة I",    25,  "❓"),
@@ -272,6 +283,20 @@ ACHIEVEMENTS = {
         (20, "سريع III", 125,  "⚡"),
         (30, "سريع IV",  250,  "⚡"),
         (50, "سريع V",   500,  "⚡"),
+    ],
+    "lecture_questions": [
+        (1,    "طالب مجتهد I",    25,  "🎓"),
+        (100,  "طالب مجتهد II",   75,  "🎓"),
+        (250,  "طالب مجتهد III", 150,  "🎓"),
+        (500,  "طالب مجتهد IV",  300,  "🎓"),
+        (1000, "طالب مجتهد V",   600,  "🎓"),
+    ],
+    "lecture_streak": [
+        (5,  "دقة I",    20,  "🎯"),
+        (10, "دقة II",   50,  "🎯"),
+        (20, "دقة III", 125,  "🎯"),
+        (30, "دقة IV",  250,  "🎯"),
+        (50, "دقة V",   500,  "🎯"),
     ],
 }
 
@@ -368,7 +393,8 @@ def _award_xp(entry: dict, amount: int) -> int:
 def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
     """Check one stat against its achievement tiers. Returns list of newly
     unlocked tiers as dicts with keys: name, emoji, xp_bonus, tier (1-5)."""
-    value    = entry.get(stat_key, 0)
+    field    = ACHIEVEMENT_STAT_FIELD.get(stat_key, stat_key)
+    value    = entry.get(field, 0)
     tiers    = ACHIEVEMENTS[stat_key]
     current  = entry["achievements"][stat_key]
     unlocked = []
@@ -1738,9 +1764,18 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
             user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
     else:
         user_entry["lecture_correct_streak_current"] = 0
-    new_level  = _award_xp(user_entry, xp_delta)
-    if new_level:
-        events["level_up"] = new_level
+
+    events["achievements"] += _check_achievements(user_entry, "lecture_questions")
+    events["achievements"] += _check_achievements(user_entry, "lecture_streak")
+
+    _award_xp(user_entry, xp_delta)
+    # recompute from scratch rather than trust _award_xp's own return value —
+    # the achievement checks above may have just granted bonus XP of their
+    # own, so the true level-up (if any) has to account for all of it together
+    final_level = _xp_to_level(user_entry["xp"])
+    if final_level > user_entry["level"]:
+        user_entry["level"] = final_level
+        events["level_up"] = final_level
     save_analytics()
     await _announce_events(context, user_id, events)   # still immediate: level-ups/achievements are rare enough to be worth a heads-up mid-lecture
 
@@ -1760,8 +1795,14 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
             f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
             f"✨ XP: <b>+{session['xp_earned']}</b>"
         )
+        result_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+            InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_modules"),
+        ]])
         try:
-            await context.bot.send_message(chat_id=user_id, text=summary, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(
+                chat_id=user_id, text=summary, parse_mode=ParseMode.HTML, reply_markup=result_keyboard,
+            )
         except Exception:
             pass
         LECTURE_SESSIONS.pop(user_id, None)
@@ -2792,6 +2833,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── START MENU BUTTONS ──────────────────────────────────────
+    if query.data == "back_home":
+        await query.message.reply_text(
+            f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+            "تحب تعمل أي؟!:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=start_menu_keyboard(),
+        )
+        return
+
     if query.data == "menu_how":
         await query.message.reply_text(HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML)
         return
@@ -3120,7 +3170,10 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
     # achievements summary
     ach        = entry.get("achievements", {})
     ach_lines  = []
-    icons      = {"questions": "❓", "streak": "🔥", "pdfs": "📚", "speed": "⚡"}
+    icons      = {
+        "questions": "❓", "streak": "🔥", "pdfs": "📚", "speed": "⚡",
+        "lecture_questions": "🎓", "lecture_streak": "🎯",
+    }
     tier_names = ["", "I", "II", "III", "IV", "V"]
     for key, emoji in icons.items():
         tier = ach.get(key, 0)
@@ -3220,6 +3273,45 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode=ParseMode.HTML,
     )
 
+async def _pin_start_message(app):
+    """Runs on every launch: (re)sends the /start main menu to every known
+    user's DM and pins it, so the main menu is always sitting right at the
+    top of their chat after a restart/redeploy — no need to type /start
+    again to get back to it."""
+    text = (
+        f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+        "تحب تعمل أي؟!:"
+    )
+    blocked = []
+    for uid in list(USERS):
+        try:
+            chat   = await app.bot.get_chat(uid)
+            pinned = chat.pinned_message
+            if pinned and pinned.text and "تحب تعمل أي؟!" in pinned.text:
+                # already has the menu pinned from a previous launch — skip
+                # re-sending/re-pinning so restarts don't spam a fresh
+                # notification at everyone every single time
+                await asyncio.sleep(0.05)
+                continue
+            msg = await app.bot.send_message(
+                chat_id=uid, text=text, parse_mode=ParseMode.HTML,
+                reply_markup=start_menu_keyboard(),
+            )
+            await app.bot.pin_chat_message(chat_id=uid, message_id=msg.message_id, disable_notification=True)
+        except Forbidden:
+            blocked.append(uid)   # they blocked the bot — safe to drop, same rule as /broadcast
+        except Exception as e:
+            # Any other error (network blip, rate limit, deactivated
+            # account) isn't proof they blocked us — leave them in USERS.
+            print(f"Couldn't pin /start message for {uid} on launch: {e}")
+        await asyncio.sleep(0.05)   # stay well clear of Telegram's rate limits across a whole user list
+
+    if blocked:
+        for uid in blocked:
+            USERS.discard(uid)
+        save_users()
+        await backup_storage_to_channel(app)
+
 async def _post_init(app):
     """Runs once after the bot connects, before polling starts — restores
     the storage-group and quiz-channel indexes from their pinned backup
@@ -3228,6 +3320,7 @@ async def _post_init(app):
     await restore_storage_from_channel(app)
     await restore_quiz_from_channel(app)
     await restore_analytics_from_channel(app)
+    await _pin_start_message(app)
 
 app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
@@ -3326,8 +3419,6 @@ def _print_startup_banner():
     boot_lines = [
         "[ OK ] question bank engine loaded",
         "[ OK ] quiz channel index mounted",
-        "[ OK ] CommandHandler Activation",
-        "[ OK ] Hot potatoes",
         "[ OK ] XP + achievements module warmed up",
         "[ OK ] analytics backup channel linked",
         f"[ {'OK' if DOCX_AVAILABLE else 'SKIP'} ] DOCX export module"
@@ -3360,14 +3451,14 @@ def _print_startup_banner():
         time.sleep(0.12)
     for line in quiz_lines:
         print(f"{PURPLE}{line}{RESET}")
-        time.sleep(0.07)
+        time.sleep(0.08)
     print()
 
     print(f"{DIM}{'─' * 42}{RESET}")
     for line in boot_lines:
         _decode_line(line, GREEN)
     print(f"{DIM}{'─' * 42}{RESET}")
-    print(f"{BOLD}{GREEN}>> The Quizician status: ONLINE — Welcome back, Operator.{RESET}")
+    print(f"{BOLD}{GREEN}>> Quizzician v5.5 online — listening for updates{RESET}")
     print(f"{DIM}{'─' * 42}{RESET}\n")
 
 _print_startup_banner()
