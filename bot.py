@@ -2846,6 +2846,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML)
         return
 
+    if query.data == "view_achievements":
+        await _send_achievements(context, user_id, query.message)
+        return
+
     if query.data == "menu_mystats":
         await _send_mystats(context, user_id, query.message)
         return
@@ -3139,6 +3143,41 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
+ACHIEVEMENT_CATEGORY_LABEL = {
+    "questions":         "❓ صانع الأسئلة",
+    "streak":            "🔥 ملتزم",
+    "pdfs":              "📚 صانع PDF",
+    "speed":             "⚡ سريع",
+    "lecture_questions": "🎓 طالب مجتهد",
+    "lecture_streak":    "🎯 دقة",
+}
+
+async def _send_achievements(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
+    """Full achievements breakdown — every category, all 5 tiers each,
+    marked unlocked/locked with its threshold. Shared by the /mystats
+    'Achievements' button (only entry point for now)."""
+    entry = _get_entry(user_id)
+    ach   = entry.get("achievements", {})
+
+    lines = ["🏆 <b>كل الإنجازات</b>\n"]
+    for key, tiers in ACHIEVEMENTS.items():
+        current = ach.get(key, 0)
+        label   = ACHIEVEMENT_CATEGORY_LABEL.get(key, key)
+        lines.append(f"{label} ({current}/5)")
+        for i, (threshold, name, xp_bonus, emoji) in enumerate(tiers):
+            tier = i + 1
+            mark = "✅" if tier <= current else "🔒"
+            lines.append(f"  {mark} {name} — {threshold}+")
+        lines.append("")
+
+    await reply_target.reply_text(
+        "\n".join(lines).strip(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+        ]]),
+    )
+
 async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
     """Builds and sends the /mystats report to reply_target (an
     update.message or a callback_query.message — both support
@@ -3195,6 +3234,11 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         f"📅 آخر نشاط: <b>{last}</b>\n\n"
         f"🏆 <b>إنجازات:</b>\n{ach_text}",
         parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏆 Achievements", callback_data="view_achievements"),
+            InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_modules"),
+            InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home"),
+        ]]),
     )
 
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3273,45 +3317,6 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode=ParseMode.HTML,
     )
 
-async def _pin_start_message(app):
-    """Runs on every launch: (re)sends the /start main menu to every known
-    user's DM and pins it, so the main menu is always sitting right at the
-    top of their chat after a restart/redeploy — no need to type /start
-    again to get back to it."""
-    text = (
-        f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
-        "تحب تعمل أي؟!:"
-    )
-    blocked = []
-    for uid in list(USERS):
-        try:
-            chat   = await app.bot.get_chat(uid)
-            pinned = chat.pinned_message
-            if pinned and pinned.text and "تحب تعمل أي؟!" in pinned.text:
-                # already has the menu pinned from a previous launch — skip
-                # re-sending/re-pinning so restarts don't spam a fresh
-                # notification at everyone every single time
-                await asyncio.sleep(0.05)
-                continue
-            msg = await app.bot.send_message(
-                chat_id=uid, text=text, parse_mode=ParseMode.HTML,
-                reply_markup=start_menu_keyboard(),
-            )
-            await app.bot.pin_chat_message(chat_id=uid, message_id=msg.message_id, disable_notification=True)
-        except Forbidden:
-            blocked.append(uid)   # they blocked the bot — safe to drop, same rule as /broadcast
-        except Exception as e:
-            # Any other error (network blip, rate limit, deactivated
-            # account) isn't proof they blocked us — leave them in USERS.
-            print(f"Couldn't pin /start message for {uid} on launch: {e}")
-        await asyncio.sleep(0.05)   # stay well clear of Telegram's rate limits across a whole user list
-
-    if blocked:
-        for uid in blocked:
-            USERS.discard(uid)
-        save_users()
-        await backup_storage_to_channel(app)
-
 async def _post_init(app):
     """Runs once after the bot connects, before polling starts — restores
     the storage-group and quiz-channel indexes from their pinned backup
@@ -3320,7 +3325,6 @@ async def _post_init(app):
     await restore_storage_from_channel(app)
     await restore_quiz_from_channel(app)
     await restore_analytics_from_channel(app)
-    await _pin_start_message(app)
 
 app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
