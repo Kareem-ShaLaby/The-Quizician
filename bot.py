@@ -77,7 +77,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — n
 # Portable temp dir: tempfile.gettempdir() respects $TMPDIR, so this resolves
 # to a writable path on both Railway (/tmp) and Termux ($PREFIX/tmp) — a
 # hardcoded "/tmp" fails on Android, which has no writable /tmp.
-IMG_BASE_DIR = os.path.join(tempfile.gettempdir(), "quizician_imgs")
+IMG_BASE_DIR  = os.path.join(tempfile.gettempdir(), "quizician_imgs")
+FONT_BASE_DIR = os.path.join(tempfile.gettempdir(), "quizician_fonts")
 
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
@@ -868,6 +869,10 @@ async def restore_quiz_from_channel(app):
 PDF_BUFFER             = {}    # user_id -> list of item dicts
 PDF_NAMES              = {}    # user_id -> str
 AWAITING_NAME          = {}    # user_id -> True
+PDF_FONT_PATH          = {}    # user_id -> path to an uploaded .ttf/.otf, or absent for the default font
+PDF_BG_IMAGE_PATH      = {}    # user_id -> path to an uploaded per-page background image, or absent for none
+AWAITING_FONT          = {}    # user_id -> True, while the PDF-setup flow is waiting on a font file/skip
+AWAITING_BG            = {}    # user_id -> True, while the PDF-setup flow is waiting on a background image/skip
 SLEEPING               = set()
 PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
 PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
@@ -1224,8 +1229,33 @@ def export_keyboard():
         row.append(InlineKeyboardButton("📝 Export as DOCX", callback_data="gen_docx"))
     return InlineKeyboardMarkup([
         row,
+        [InlineKeyboardButton("✏️ Edit a Question", callback_data="edit_pick")],
         [InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
     ])
+
+def _item_preview_label(item: dict, max_len: int = 40) -> str:
+    """First few words of a buffered item, for the edit-picker list."""
+    if item["type"] == "written":
+        text = item.get("title", "")
+    elif item["type"] == "image":
+        text = item.get("caption") or "(صورة من غير نص)"
+    else:
+        text = item.get("q", "")
+    text = text.strip()
+    return text[:max_len] + ("…" if len(text) > max_len else "")
+
+def edit_pick_keyboard(items: list) -> InlineKeyboardMarkup:
+    """Numbered grid (1, 2, 3...) — one button per buffered question, each
+    jumping straight into the existing per-question edit menu (same
+    revedit:{index}:open flow the old per-confirmation '✏️ تعديل' button
+    used to open)."""
+    buttons = [
+        InlineKeyboardButton(str(i + 1), callback_data=f"revedit:{i}:open")
+        for i in range(len(items))
+    ]
+    rows = [buttons[i:i + 6] for i in range(0, len(buttons), 6)]
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="edit_pick_back")])
+    return InlineKeyboardMarkup(rows)
 
 def start_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -1266,19 +1296,33 @@ HOW_TO_USE_TEXT = (
 # ═══════════════════════════════════════════════════════════════
 # PDF BUILDER
 # ═══════════════════════════════════════════════════════════════
-def build_pdf(items: list, doc_title: str = "questions") -> BytesIO:
+def build_pdf(items: list, doc_title: str = "questions", font_path: str = None, bg_image_path: str = None) -> BytesIO:
     buffer = BytesIO()
 
-    LEFT_COLOR  = colors.HexColor("#00BCD4")
-    RIGHT_COLOR = colors.HexColor("#7B1FA2")
+    # Custom font: registered under a name unique to this call so two users'
+    # uploaded fonts (built around the same time) can never clobber each
+    # other in reportlab's global font registry. Falls back to the bot's
+    # normal default font on any registration failure — same font used for
+    # both regular and bold, since we only ever have the one uploaded file.
+    font_name, font_name_bold = FONT_NAME, FONT_NAME_BOLD
+    if font_path and os.path.exists(font_path):
+        try:
+            custom_name = f"CustomFont_{abs(hash(font_path)) % 10**8}"
+            pdfmetrics.registerFont(TTFont(custom_name, font_path))
+            font_name = font_name_bold = custom_name
+        except Exception as e:
+            print(f"Custom PDF font load error: {e} — using default")
 
     def draw_header(canvas, doc):
         canvas.saveState()
-        canvas.setFont(FONT_NAME_BOLD, 9)
-        canvas.setFillColor(LEFT_COLOR)
-        canvas.drawString(2 * cm, A4[1] - 1.4 * cm, "MDM44 | Notes & Files")
-        canvas.setFillColor(RIGHT_COLOR)
-        canvas.drawRightString(A4[0] - 2 * cm, A4[1] - 1.4 * cm, "Made by The Quizician")
+        if bg_image_path and os.path.exists(bg_image_path):
+            try:
+                canvas.drawImage(
+                    bg_image_path, 0, 0, width=A4[0], height=A4[1],
+                    preserveAspectRatio=False, mask="auto",
+                )
+            except Exception as e:
+                print(f"PDF background image draw error: {e}")
         canvas.setStrokeColor(colors.HexColor("#CFD8DC"))
         canvas.setLineWidth(0.5)
         canvas.line(2 * cm, A4[1] - 1.65 * cm, A4[0] - 2 * cm, A4[1] - 1.65 * cm)
@@ -1291,36 +1335,37 @@ def build_pdf(items: list, doc_title: str = "questions") -> BytesIO:
     )
 
     Q_STYLE = ParagraphStyle(
-        "QStyle", fontName=FONT_NAME_BOLD, fontSize=12, leading=16,
+        "QStyle", fontName=font_name_bold, fontSize=12, leading=16,
         textColor=colors.HexColor("#1A1A2E"), spaceAfter=6, spaceBefore=14,
     )
     OPT_STYLE = ParagraphStyle(
-        "OptStyle", fontName=FONT_NAME, fontSize=11, leading=15,
+        "OptStyle", fontName=font_name, fontSize=11, leading=15,
         textColor=colors.HexColor("#1A1A2E"), leftIndent=14, spaceAfter=3,
     )
     OPT_CORRECT = ParagraphStyle(
-        "OptCorrect", fontName=FONT_NAME_BOLD, fontSize=11, leading=15,
+        "OptCorrect", fontName=font_name_bold, fontSize=11, leading=15,
         textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=3,
     )
     WRITTEN_TITLE = ParagraphStyle(
-        "WTitle", fontName=FONT_NAME_BOLD, fontSize=12, leading=16,
+        "WTitle", fontName=font_name_bold, fontSize=12, leading=16,
         textColor=colors.HexColor("#1A1A2E"), spaceAfter=4, spaceBefore=14,
     )
     WRITTEN_BODY = ParagraphStyle(
-        "WBody", fontName=FONT_NAME, fontSize=11, leading=15,
+        "WBody", fontName=font_name, fontSize=11, leading=15,
         textColor=colors.HexColor("#37474F"), leftIndent=14, spaceAfter=6,
     )
     NUM_STYLE = ParagraphStyle(
-        "NumStyle", fontName=FONT_NAME_BOLD, fontSize=9,
+        "NumStyle", fontName=font_name_bold, fontSize=9,
         textColor=colors.HexColor("#90A4AE"), spaceAfter=2,
     )
     IMG_CAPTION = ParagraphStyle(
-        "ImgCaption", fontName=FONT_NAME, fontSize=9, leading=12,
+        "ImgCaption", fontName=font_name, fontSize=9, leading=12,
         textColor=colors.HexColor("#78909C"), spaceAfter=6, spaceBefore=4,
     )
 
     HR_COLOR = colors.HexColor("#CFD8DC")
     story    = []
+
 
     for idx, item in enumerate(items, 1):
         q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
@@ -1429,8 +1474,92 @@ def _set_header_border(para):
     pBdr.append(bottom)
     pPr.append(pBdr)
 
-def build_docx(items: list, doc_title: str = "questions") -> BytesIO:
+def _set_style_font(style, font_name: str) -> None:
+    """Sets a style's font across every script slot Word actually checks —
+    python-docx's high-level Font.name only touches ascii/hAnsi, but Arabic
+    (and this bot is Arabic-heavy) renders off the w:cs slot specifically,
+    so that has to be set explicitly or the custom font silently never
+    applies to any Arabic text at all."""
+    style.font.name = font_name
+    rpr = style.element.get_or_add_rPr()
+    rFonts = rpr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rpr.append(rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rFonts.set(qn(attr), font_name)
+
+def _add_docx_page_background(doc, image_path: str) -> None:
+    """Inserts image_path into every section's header as a full-page image
+    anchored behind the text (not a plain inline header image, and not
+    Word's native w:background element — that one's web-layout-only and
+    typically doesn't survive printing or PDF export). Lets python-docx's
+    own add_picture() handle the fiddly, error-prone part (embedding the
+    image + registering its relationship) and only rewrites the outer
+    wp:inline wrapper into a wp:anchor positioned to cover the page."""
+    for section in doc.sections:
+        section.header.is_linked_to_previous = False
+        header = section.header
+        p   = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+        run = p.add_run()
+        run.add_picture(image_path, width=section.page_width, height=section.page_height)
+
+        drawing = run._element.find(qn("w:drawing"))
+        inline  = drawing.find(qn("wp:inline"))
+        extent  = inline.find(qn("wp:extent"))
+        docpr   = inline.find(qn("wp:docPr"))
+        graphic = inline.find(qn("a:graphic"))
+
+        anchor = OxmlElement("wp:anchor")
+        for attr, val in (
+            ("distT", "0"), ("distB", "0"), ("distL", "0"), ("distR", "0"),
+            ("simplePos", "0"), ("relativeHeight", "0"), ("behindDoc", "1"),
+            ("locked", "0"), ("layoutInCell", "1"), ("allowOverlap", "1"),
+        ):
+            anchor.set(attr, val)
+
+        simple_pos = OxmlElement("wp:simplePos")
+        simple_pos.set("x", "0")
+        simple_pos.set("y", "0")
+
+        pos_h = OxmlElement("wp:positionH")
+        pos_h.set("relativeFrom", "page")
+        pos_h_off = OxmlElement("wp:posOffset")
+        pos_h_off.text = "0"
+        pos_h.append(pos_h_off)
+
+        pos_v = OxmlElement("wp:positionV")
+        pos_v.set("relativeFrom", "page")
+        pos_v_off = OxmlElement("wp:posOffset")
+        pos_v_off.text = "0"
+        pos_v.append(pos_v_off)
+
+        effect_extent = OxmlElement("wp:effectExtent")
+        for attr in ("l", "t", "r", "b"):
+            effect_extent.set(attr, "0")
+
+        wrap_none = OxmlElement("wp:wrapNone")
+        cnv_graphic_frame_pr = OxmlElement("wp:cNvGraphicFramePr")
+
+        for el in (simple_pos, pos_h, pos_v, extent, effect_extent, wrap_none, docpr, cnv_graphic_frame_pr, graphic):
+            anchor.append(el)
+
+        drawing.remove(inline)
+        drawing.append(anchor)
+
+def build_docx(items: list, doc_title: str = "questions", font_path: str = None, bg_image_path: str = None) -> BytesIO:
     doc = DocxDocument()
+
+    # Custom font: unlike the PDF export, .docx can't embed the actual font
+    # file — Word only renders this correctly if the reader's own machine
+    # happens to already have a font by this exact name installed. Best
+    # effort: apply it as the doc's base style so everything inherits it.
+    if font_path and os.path.exists(font_path):
+        try:
+            font_display_name = TTFont("Probe", font_path).face.name or os.path.splitext(os.path.basename(font_path))[0]
+            _set_style_font(doc.styles["Normal"], font_display_name)
+        except Exception as e:
+            print(f"Custom DOCX font apply error: {e}")
 
     # ── Page margins ──────────────────────────────────────────
     for section in doc.sections:
@@ -1439,22 +1568,16 @@ def build_docx(items: list, doc_title: str = "questions") -> BytesIO:
         section.left_margin   = Cm(2.0)
         section.right_margin  = Cm(2.0)
 
+    if bg_image_path and os.path.exists(bg_image_path):
+        try:
+            _add_docx_page_background(doc, bg_image_path)
+        except Exception as e:
+            print(f"DOCX background image error: {e}")
+
     # ── Header ────────────────────────────────────────────────
     header_para = doc.add_paragraph()
     header_para.paragraph_format.space_after = Pt(8)
     _set_header_border(header_para)
-
-    r1 = header_para.add_run("MDM44 | Notes & Files")
-    r1.bold            = True
-    r1.font.size       = Pt(9)
-    r1.font.color.rgb  = _hex_to_rgb("00BCD4")
-
-    header_para.add_run("   ·   ")
-
-    r2 = header_para.add_run("Made by The Quizician")
-    r2.bold            = True
-    r2.font.size       = Pt(9)
-    r2.font.color.rgb  = _hex_to_rgb("7B1FA2")
 
     # ── Items ─────────────────────────────────────────────────
     for idx, item in enumerate(items, 1):
@@ -1883,11 +2006,14 @@ def _review_buttons(item_index: int, item: dict) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("✅ تمام، مفيش تعديل", callback_data=f"revedit:{item_index}:done")])
     return InlineKeyboardMarkup(rows)
 
-def _edit_button_markup(item_index: int) -> InlineKeyboardMarkup:
-    """Single '✏️ تعديل' button — shown on confirmation, pressed only if needed."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✏️ تعديل", callback_data=f"revedit:{item_index}:open")
-    ]])
+def _edit_button_markup(item_index: int) -> None:
+    """No longer attached to every single per-question confirmation — that
+    was the exact 'a prompt for every question' clutter this replaced.
+    Editing now goes through one global entry point instead: the '✏️ Edit
+    a Question' button on the PDF Collection Mode progress message, which
+    opens a numbered picker (see edit_pick_keyboard) and reuses the same
+    revedit:{index}:open flow this used to jump into directly."""
+    return None
 
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.poll:
@@ -2006,6 +2132,18 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not photo:
         return
 
+    # ── AWAITING BACKGROUND IMAGE (part of the /pdf_start setup flow) ──
+    if AWAITING_BG.get(user_id):
+        bg_dir  = os.path.join(IMG_BASE_DIR, str(user_id))
+        os.makedirs(bg_dir, exist_ok=True)
+        bg_path = os.path.join(bg_dir, "page_background.jpg")
+        tg_file = await context.bot.get_file(photo.file_id)
+        await tg_file.download_to_drive(bg_path)
+        PDF_BG_IMAGE_PATH[user_id] = bg_path
+        del AWAITING_BG[user_id]
+        await _finish_pdf_setup(context, user_id, update.message)
+        return
+
     in_pdf_mode = user_id in PDF_BUFFER
     caption     = (update.message.caption or "").strip()
 
@@ -2066,6 +2204,38 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
         "وهيتضاف الصورة تلقائي للسؤال ده.",
         parse_mode=ParseMode.HTML,
+    )
+
+async def handle_font_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Font file (.ttf/.otf) uploaded during the /pdf_start setup flow.
+    Registered on a filter that only matches those two extensions, but
+    still guarded by AWAITING_FONT — an unsolicited font upload outside
+    the setup flow is just ignored, not treated as a command."""
+    if not update.message or not update.message.document:
+        return
+    user_id = update.effective_chat.id
+    if user_id in SLEEPING:
+        return
+    if not AWAITING_FONT.get(user_id):
+        return
+
+    doc      = update.message.document
+    font_dir = os.path.join(FONT_BASE_DIR, str(user_id))
+    os.makedirs(font_dir, exist_ok=True)
+    ext       = ".otf" if (doc.file_name or "").lower().endswith(".otf") else ".ttf"
+    font_path = os.path.join(font_dir, f"font{ext}")
+    tg_file   = await context.bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(font_path)
+
+    PDF_FONT_PATH[user_id] = font_path
+    del AWAITING_FONT[user_id]
+    AWAITING_BG[user_id] = True
+    await update.message.reply_text(
+        "✅ الخط اتسجل!\n\n"
+        "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF/DOCX، أو دوس Skip لو مش عايز خلفية.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
+        ]]),
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2423,19 +2593,33 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── AWAITING PDF NAME ────────────────────────────────────────
     if AWAITING_NAME.get(user_id):
         name = text.strip()
-        PDF_NAMES[user_id]  = name
-        PDF_BUFFER[user_id] = []
-        PROGRESS_MSG_ID.pop(user_id, None)
-        _clear_pending_image(user_id)
-        _clear_clarify_queue(user_id)
-        _clear_pending_edit(user_id)
+        PDF_NAMES[user_id] = name
         del AWAITING_NAME[user_id]
+        AWAITING_FONT[user_id] = True
         await update.message.reply_text(
-            f"📥 <b>PDF mode activated</b> — File name: <i>{name}</i>\n\n"
-            "• ابعت أسئلة نصية (MCQ أو مكتوبة)\n"
-            "• أو <b>فوروارد</b> كويزات أو صور/جداول مقارنة\n\n"
-            "اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b> لما تخلص 👇",
+            f"📥 <b>الاسم اتسجل:</b> <i>{name}</i>\n\n"
+            "دلوقتي ابعت ملف الخط (.ttf أو .otf) اللي عايز تستخدمه في الـ PDF/DOCX، "
+            "أو دوس Skip لو عايز الخط الافتراضي.",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏭ Skip", callback_data="font_skip"),
+            ]]),
+        )
+        return
+
+    # ── AWAITING FONT FILE (reminder — the real handling is in
+    #    handle_font_upload/the font_skip button; this only fires if the
+    #    user sends plain text instead) ─────────────────────────────
+    if AWAITING_FONT.get(user_id):
+        await update.message.reply_text(
+            "⚠️ محتاج ملف خط (.ttf أو .otf) كـ Document، أو دوس Skip فوق.",
+        )
+        return
+
+    # ── AWAITING BACKGROUND IMAGE (same — reminder only) ────────────
+    if AWAITING_BG.get(user_id):
+        await update.message.reply_text(
+            "⚠️ محتاج تبعت صورة كخلفية، أو دوس Skip فوق.",
         )
         return
 
@@ -2756,6 +2940,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── QUESTION REVIEW / EDIT ──────────────────────────────────
+    if query.data == "edit_pick":
+        items = PDF_BUFFER.get(user_id, [])
+        if not items:
+            await query.answer("مفيش أسئلة في البافر دلوقتي", show_alert=True)
+            return
+        lines = ["✏️ <b>اختار رقم السؤال اللي عايز تعدله:</b>\n"]
+        for i, item in enumerate(items):
+            lines.append(f"{i + 1}. {html.escape(_item_preview_label(item))}")
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML,
+            reply_markup=edit_pick_keyboard(items),
+        )
+        return
+
+    if query.data == "edit_pick_back":
+        items = PDF_BUFFER.get(user_id, [])
+        await query.edit_message_text(
+            build_progress_text(items), parse_mode=ParseMode.HTML,
+            reply_markup=export_keyboard(),
+        )
+        return
+
     if query.data.startswith("revedit:"):
         parts      = query.data.split(":")
         item_index = int(parts[1])
@@ -2832,9 +3038,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── PDF SETUP FLOW: font/background skip buttons ────────────────
+    if query.data == "font_skip":
+        if not AWAITING_FONT.get(user_id):
+            return
+        del AWAITING_FONT[user_id]
+        AWAITING_BG[user_id] = True
+        await query.edit_message_text(
+            "⏭ اتخطيت اختيار الخط.\n\n"
+            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF/DOCX، أو دوس Skip لو مش عايز خلفية.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
+            ]]),
+        )
+        return
+
+    if query.data == "bg_skip":
+        if not AWAITING_BG.get(user_id):
+            return
+        del AWAITING_BG[user_id]
+        await _finish_pdf_setup(context, user_id, query.message, edit=True)
+        return
+
     # ── START MENU BUTTONS ──────────────────────────────────────
     if query.data == "back_home":
-        await query.message.reply_text(
+        await query.edit_message_text(
             f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
             "تحب تعمل أي؟!:",
             parse_mode=ParseMode.HTML,
@@ -2843,15 +3071,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "menu_how":
-        await query.message.reply_text(HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML)
+        await query.edit_message_text(
+            HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+            ]]),
+        )
         return
 
     if query.data == "view_achievements":
-        await _send_achievements(context, user_id, query.message)
+        await _send_achievements(context, user_id, query.message, edit=True)
         return
 
     if query.data == "menu_mystats":
-        await _send_mystats(context, user_id, query.message)
+        await _send_mystats(context, user_id, query.message, edit=True)
         return
 
     if query.data == "menu_quizzes":
@@ -2897,6 +3130,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # (gen_pdf/gen_docx/clear_pdf), so there's only one place that can
 # forget to track XP or diverge in behavior between the two.
 # ═══════════════════════════════════════════════════════════════
+async def _finish_pdf_setup(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
+    """Last step of the /pdf_start flow (name → font → background) — opens
+    the actual question buffer and shows the 'PDF mode activated' message.
+    edit=True rewrites reply_target in place (the bg_skip button flow);
+    edit=False sends a fresh reply (there's no bot-owned message to edit
+    when this follows an uploaded background photo instead)."""
+    PDF_BUFFER[user_id] = []
+    PROGRESS_MSG_ID.pop(user_id, None)
+    _clear_pending_image(user_id)
+    _clear_clarify_queue(user_id)
+    _clear_pending_edit(user_id)
+    name = PDF_NAMES.get(user_id, "questions")
+    text = (
+        f"📥 <b>PDF mode activated</b> — File name: <i>{name}</i>\n\n"
+        "• ابعت أسئلة نصية (MCQ أو مكتوبة)\n"
+        "• أو <b>فوروارد</b> كويزات أو صور/جداول مقارنة\n\n"
+        "اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b> لما تخلص 👇"
+    )
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(text, parse_mode=ParseMode.HTML)
+
 def _reset_pdf_session(user_id: int) -> None:
     """Clears everything tied to an in-progress PDF-collection session —
     used after a successful export and by explicit clear/cancel alike."""
@@ -2907,7 +3161,21 @@ def _reset_pdf_session(user_id: int) -> None:
     PDF_BUFFER.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
+    AWAITING_FONT.pop(user_id, None)
+    AWAITING_BG.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
+    font_path = PDF_FONT_PATH.pop(user_id, None)
+    if font_path and os.path.exists(font_path):
+        try:
+            os.remove(font_path)
+        except Exception:
+            pass
+    bg_path = PDF_BG_IMAGE_PATH.pop(user_id, None)
+    if bg_path and os.path.exists(bg_path):
+        try:
+            os.remove(bg_path)
+        except Exception:
+            pass
 
 async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
                                analytics_uid: int, items: list, name: str, fmt: str) -> bool:
@@ -2917,13 +3185,15 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
     session_id. Returns False (having already replied with the reason) if
     DOCX isn't available or the build blew up."""
     safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
+    font_path = PDF_FONT_PATH.get(session_id)
+    bg_path   = PDF_BG_IMAGE_PATH.get(session_id)
 
     if fmt == "docx":
         if not DOCX_AVAILABLE:
             await message.reply_text(MSG_DOCX_UNAVAILABLE)
             return False
         try:
-            doc_bytes = build_docx(items, name)
+            doc_bytes = build_docx(items, name, font_path=font_path, bg_image_path=bg_path)
         except Exception as e:
             print("DOCX ERROR:", e)
             await message.reply_text(
@@ -2937,7 +3207,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             parse_mode=ParseMode.HTML,
         )
     else:
-        pdf_bytes = build_pdf(items, name)
+        pdf_bytes = build_pdf(items, name, font_path=font_path, bg_image_path=bg_path)
         await message.reply_document(
             document=pdf_bytes, filename=f"{safe}.pdf",
             caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
@@ -2977,21 +3247,15 @@ async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(MSG_PDF_CLEARED)
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bails out of whatever's in progress: PDF collection session or a
-    pending image waiting for its question."""
+    """Bails out of whatever's in progress: PDF collection session (or its
+    font/background setup step) or a pending image waiting for its question."""
     user_id = update.effective_chat.id
     was_doing_something = bool(
         PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
+        or AWAITING_FONT.get(user_id) or AWAITING_BG.get(user_id)
         or PENDING_IMAGE.get(user_id)
     )
-    _cleanup_images(user_id)
-    _clear_pending_image(user_id)
-    _clear_clarify_queue(user_id)
-    _clear_pending_edit(user_id)
-    PDF_BUFFER.pop(user_id, None)
-    PDF_NAMES.pop(user_id, None)
-    AWAITING_NAME.pop(user_id, None)
-    PROGRESS_MSG_ID.pop(user_id, None)
+    _reset_pdf_session(user_id)
     if was_doing_something:
         await update.message.reply_text(MSG_CANCEL_DONE)
     else:
@@ -3152,10 +3416,13 @@ ACHIEVEMENT_CATEGORY_LABEL = {
     "lecture_streak":    "🎯 دقة",
 }
 
-async def _send_achievements(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
+async def _send_achievements(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
     """Full achievements breakdown — every category, all 5 tiers each,
     marked unlocked/locked with its threshold. Shared by the /mystats
-    'Achievements' button (only entry point for now)."""
+    'Achievements' button (only entry point for now). reply_target is a
+    Message — edit=True rewrites it in place (button flow); edit=False
+    sends a fresh reply (there's nothing bot-owned to edit yet, e.g. a
+    freshly typed command)."""
     entry = _get_entry(user_id)
     ach   = entry.get("achievements", {})
 
@@ -3170,21 +3437,21 @@ async def _send_achievements(context: ContextTypes.DEFAULT_TYPE, user_id: int, r
             lines.append(f"  {mark} {name} — {threshold}+")
         lines.append("")
 
-    await reply_target.reply_text(
-        "\n".join(lines).strip(),
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
-        ]]),
-    )
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send("\n".join(lines).strip(), parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
+async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
     """Builds and sends the /mystats report to reply_target (an
     update.message or a callback_query.message — both support
-    reply_text). Shared by the /mystats command and the main-menu button."""
+    reply_text/edit_text). Shared by the /mystats command and the
+    main-menu button. edit=True rewrites reply_target in place instead of
+    sending a new message — only valid for a bot-owned message (button
+    flow), not a freshly typed command."""
     entry = ANALYTICS.get(str(user_id))
     if not entry or not entry.get("last_active_date"):
-        await reply_target.reply_text("📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!")
+        send = reply_target.edit_text if edit else reply_target.reply_text
+        await send("📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!")
         return
 
     streak  = entry.get("streak", 0)
@@ -3222,7 +3489,8 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
 
     ach_text = "\n".join(ach_lines) if ach_lines else "  لسه مفيش إنجازات"
 
-    await reply_target.reply_text(
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(
         f"📊 <b>إحصائياتك</b>\n\n"
         f"🏅 المستوى: <b>{level}</b> — <i>{title}</i>\n"
         f"✨ XP: <b>{xp}</b>  [{bar}]  → {xp_end}\n\n"
@@ -3376,6 +3644,15 @@ app.add_handler(MessageHandler(
 # Image handler (photos in PDF mode) — excludes the storage group
 app.add_handler(MessageHandler(
     filters.PHOTO & ~filters.Chat(STORAGE_GROUP_ID), handle_image
+))
+
+# Font-file handler (.ttf/.otf uploads during /pdf_start setup) — must be
+# registered before the general PDF/document handlers below since it's a
+# different mime/extension entirely; excludes the storage group and quiz channel.
+app.add_handler(MessageHandler(
+    (filters.Document.FileExtension("ttf") | filters.Document.FileExtension("otf"))
+    & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_ID),
+    handle_font_upload,
 ))
 
 # PDF handler — captioned PDFs in a private DM are parsed as manual MCQs;
