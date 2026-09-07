@@ -653,7 +653,11 @@ async def restore_analytics_from_channel(app):
 #
 # settings.json schema per user:
 # {
-#   "nickname": str | None
+#   "nickname":   str | None,
+#   "reactions":  bool,  # emoji reactions on submitted quiz questions
+#   "auto_next":  bool,  # sends lecture questions one by one, waiting for
+#                        # each answer, instead of all at once
+#   "randomize":  bool,  # shuffles question order within a lecture
 # }
 #
 # Mirrors the ANALYTICS system exactly: local JSON file, plus a pinned
@@ -665,7 +669,10 @@ SETTINGS_BACKUP_MARKER = "⚙️ QUIZICIAN_SETTINGS_BACKUP"
 
 def _blank_settings_entry() -> dict:
     return {
-        "nickname": None,
+        "nickname":  None,
+        "reactions": True,
+        "auto_next": True,
+        "randomize": True,
     }
 
 def load_settings() -> dict:
@@ -700,6 +707,20 @@ def _get_settings_entry(user_id: int) -> dict:
 
 def get_nickname(user_id: int) -> str | None:
     return SETTINGS.get(str(user_id), {}).get("nickname")
+
+def _get_bool_setting(user_id: int, key: str) -> bool:
+    # Defaults to True for anyone not yet in SETTINGS (or missing the key) —
+    # matches _blank_settings_entry() defaults, no backfill required to read.
+    return SETTINGS.get(str(user_id), {}).get(key, True)
+
+def get_reactions_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "reactions")
+
+def get_auto_next_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "auto_next")
+
+def get_randomize_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "randomize")
 
 async def backup_settings_to_channel(context):
     global _settings_backup_msg_id, _last_settings_backup_at
@@ -1509,9 +1530,17 @@ def start_menu_keyboard():
         ],
     ])
 
-def settings_menu_keyboard() -> InlineKeyboardMarkup:
+def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    def _tag(on: bool) -> str:
+        return "🟢 On" if on else "🔴 Off"
+    reactions = get_reactions_enabled(user_id)
+    auto_next = get_auto_next_enabled(user_id)
+    randomize = get_randomize_enabled(user_id)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
+        [InlineKeyboardButton(f"🎭 Reactions: {_tag(reactions)}", callback_data="toggle_reactions")],
+        [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
+        [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
         [InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home")],
     ])
 
@@ -1940,6 +1969,9 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
 # REACTIONS
 # ═══════════════════════════════════════════════════════════════
 async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+    if not get_reactions_enabled(user_id):
+        return
     try:
         roll  = random.randint(1, 20)
         emoji = "🫡" if roll <= 15 else "❤️" if roll <= 19 else "🏆"
@@ -2122,18 +2154,53 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
     session["current_correct_id"] = None
     return False
 
+async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> int:
+    """Auto-Next OFF path: sends every remaining question in session['queue']
+    up front instead of one at a time. Reuses _deliver_next_lecture_question
+    for the actual send/skip-dead-poll/legacy-recovery logic, just calling it
+    repeatedly and recording each poll_id -> correct_option_id in
+    session['pending_polls'] so handle_poll_answer can match any of them,
+    not just a single 'current' one. Returns how many were actually sent."""
+    session.setdefault("pending_polls", {})
+    sent_count = 0
+    while session["queue"]:
+        sent = await _deliver_next_lecture_question(context, user_id, session)
+        if not sent:
+            break
+        session["pending_polls"][session["current_poll_id"]] = session["current_correct_id"]
+        sent_count += 1
+    # These are meaningless in batch mode (there's no single "current"
+    # question) — clear them so nothing downstream mistakes this for auto mode.
+    session["current_poll_id"]    = None
+    session["current_correct_id"] = None
+    return sent_count
+
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fires when a user answers a poll the bot sent (our lecture-delivery
     polls are always is_anonymous=False specifically so this reliably
-    fires). If it's the question we're currently waiting on for that user's
-    active lecture session, work out whether they got it right and hand off
-    to _advance_lecture_session."""
+    fires). In auto-next mode there's a single question in flight at a
+    time, matched via current_poll_id. In batch mode (Auto-Next OFF) every
+    question was already sent, so any poll_id in pending_polls can come in,
+    in any order, as the user works through them."""
     answer  = update.poll_answer
     poll_id = answer.poll_id
     user_id = answer.user.id
 
     session = LECTURE_SESSIONS.get(user_id)
-    if not session or session.get("current_poll_id") != poll_id:
+    if not session:
+        return
+
+    if session.get("mode") == "batch":
+        pending = session.get("pending_polls", {})
+        if poll_id not in pending:
+            return   # not one of this lecture's questions (or already answered)
+        correct_id = pending.pop(poll_id)
+        chosen     = answer.option_ids[0] if answer.option_ids else None
+        is_correct = chosen is not None and chosen == correct_id
+        await _advance_lecture_session(context, user_id, session, is_correct)
+        return
+
+    if session.get("current_poll_id") != poll_id:
         return   # not the question we're tracking for this user right now
 
     chosen     = answer.option_ids[0] if answer.option_ids else None
@@ -2151,8 +2218,14 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     session["answered"] += 1
     session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
 
-    sent_next = await _deliver_next_lecture_question(context, user_id, session)
-    is_last   = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
+    if session.get("mode") == "batch":
+        # Everything was already sent up front — "last" means every
+        # dispatched question has now been answered, not that the queue is
+        # dry (the queue was already drained back at dispatch time).
+        is_last = session["answered"] >= session["total"]
+    else:
+        sent_next = await _deliver_next_lecture_question(context, user_id, session)
+        is_last   = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
 
     per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
     xp_delta         = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
@@ -2856,7 +2929,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not nickname:
             await update.message.reply_text(
                 "⚠️ الاسم فاضي — جرب تاني.",
-                reply_markup=settings_menu_keyboard(),
+                reply_markup=settings_menu_keyboard(real_uid),
             )
             return
         entry = _get_settings_entry(real_uid)
@@ -2866,7 +2939,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ اتسجل! هنناديك <b>{html.escape(nickname)}</b> دلوقتي.",
             parse_mode=ParseMode.HTML,
-            reply_markup=settings_menu_keyboard(),
+            reply_markup=settings_menu_keyboard(real_uid),
         )
         return
 
@@ -3176,19 +3249,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if get_randomize_enabled(user_id):
+            ready_ids = list(ready_ids)
+            random.shuffle(ready_ids)
+
+        auto_next = get_auto_next_enabled(user_id)
+
         session = {
             "module": module, "subject": subject, "lecture_key": lecture_key,
             "queue": list(ready_ids), "current_poll_id": None, "current_correct_id": None,
             "total": len(ready_ids), "answered": 0, "correct": 0,
+            "mode": "auto" if auto_next else "batch",
+            "pending_polls": {},
         }
         LECTURE_SESSIONS[user_id] = session
 
         await query.edit_message_text(
-            f"🎓 <b>{module} - {subject}: {entry['name']}</b> — {len(ready_ids)} سؤال، هيتبعتولك واحد واحد 👇",
+            f"🎓 <b>{module} - {subject}: {entry['name']}</b> — {len(ready_ids)} سؤال، "
+            + ("هيتبعتولك واحد واحد 👇" if auto_next else "هيتبعتولك كلهم دلوقتي 👇"),
             parse_mode=ParseMode.HTML,
         )
 
-        sent = await _deliver_next_lecture_question(context, user_id, session)
+        if auto_next:
+            sent = await _deliver_next_lecture_question(context, user_id, session)
+        else:
+            session["total"] = 0  # corrected below to how many actually go out
+            sent_count = await _deliver_all_lecture_questions(context, user_id, session)
+            session["total"] = sent_count
+            sent = sent_count > 0
         if not sent:
             LECTURE_SESSIONS.pop(user_id, None)
             await context.bot.send_message(
@@ -3437,6 +3525,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings"),
             ]]),
         )
+        return
+
+    if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize"):
+        key = {
+            "toggle_reactions": "reactions",
+            "toggle_auto_next": "auto_next",
+            "toggle_randomize": "randomize",
+        }[query.data]
+        entry = _get_settings_entry(user_id)
+        entry[key] = not entry.get(key, True)
+        save_settings()
+        await backup_settings_to_channel(context)
+        await _send_settings(context, user_id, query.message, edit=True)
         return
 
     if query.data == "menu_quizzes":
@@ -3884,7 +3985,7 @@ async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
         f"⚙️ <b>الإعدادات</b>\n\n"
         f"👤 الاسم المستعار: {nick_line}",
         parse_mode=ParseMode.HTML,
-        reply_markup=settings_menu_keyboard(),
+        reply_markup=settings_menu_keyboard(user_id),
     )
 
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
