@@ -80,6 +80,46 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — n
 IMG_BASE_DIR  = os.path.join(tempfile.gettempdir(), "quizician_imgs")
 FONT_BASE_DIR = os.path.join(tempfile.gettempdir(), "quizician_fonts")
 
+# Preset fonts bundled with the bot itself (not user-uploaded) — put the
+# Preset fonts bundled with the bot itself (not user-uploaded) — put the
+# actual font files in a `fonts/` folder next to bot.py in the repo. Either
+# .ttf or .otf works fine (reportlab and Word both handle either format
+# equally well) — just match the base filename below, extension doesn't
+# matter. Path is anchored to this script's own location, not the working
+# directory, so it resolves correctly regardless of where the process is
+# launched from.
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+FONTS_DIR = os.path.join(BASE_DIR, "fonts")
+
+def _find_font_file(base_name: str):
+    """Looks for base_name with either extension in FONTS_DIR. Returns the
+    path if found, else None — a missing file is handled gracefully
+    wherever this is used, not treated as an error at import time."""
+    for ext in (".otf", ".ttf", ".OTF", ".TTF"):
+        path = os.path.join(FONTS_DIR, base_name + ext)
+        if os.path.exists(path):
+            return path
+    return None
+
+BUNDLED_FONTS = {
+    "Comic Sans": {
+        "regular": _find_font_file("ComicSans"),
+        "bold":    _find_font_file("ComicSans-Bold"),
+    },
+    "Canva Sans": {
+        "regular": _find_font_file("CanvaSans"),
+        "bold":    _find_font_file("CanvaSans-Bold"),
+    },
+    "Times New Roman": {
+        "regular": _find_font_file("TimesNewRoman"),
+        "bold":    _find_font_file("TimesNewRoman-Bold"),
+    },
+    "Amaranth": {
+        "regular": _find_font_file("Amaranth"),
+        "bold":    _find_font_file("Amaranth-Bold"),
+    },
+}
+
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
 ADMIN_ID = 940770584
@@ -869,7 +909,9 @@ async def restore_quiz_from_channel(app):
 PDF_BUFFER             = {}    # user_id -> list of item dicts
 PDF_NAMES              = {}    # user_id -> str
 AWAITING_NAME          = {}    # user_id -> True
-PDF_FONT_PATH          = {}    # user_id -> path to an uploaded .ttf/.otf, or absent for the default font
+PDF_FONT_PATH          = {}    # user_id -> path to a regular-weight .ttf/.otf, or absent for the default font
+PDF_FONT_BOLD_PATH     = {}    # user_id -> path to that font's bold weight, if one's available (presets only —
+                                # a single user upload has no bold companion, so bold text just reuses it)
 PDF_BG_IMAGE_PATH      = {}    # user_id -> path to an uploaded per-page background image, or absent for none
 AWAITING_FONT          = {}    # user_id -> True, while the PDF-setup flow is waiting on a font file/skip
 AWAITING_BG            = {}    # user_id -> True, while the PDF-setup flow is waiting on a background image/skip
@@ -1257,6 +1299,17 @@ def edit_pick_keyboard(items: list) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="edit_pick_back")])
     return InlineKeyboardMarkup(rows)
 
+def font_prompt_keyboard() -> InlineKeyboardMarkup:
+    """Preset font buttons (bundled .otf files, see BUNDLED_FONTS) plus
+    Skip — shown alongside the option to just upload a font file instead."""
+    names = list(BUNDLED_FONTS.keys())
+    rows  = [
+        [InlineKeyboardButton(names[i], callback_data=f"font_preset:{i}") for i in range(0, 2)],
+        [InlineKeyboardButton(names[i], callback_data=f"font_preset:{i}") for i in range(2, 4)],
+        [InlineKeyboardButton("⏭ Skip", callback_data="font_skip")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
 def start_menu_keyboard():
     return InlineKeyboardMarkup([
         [
@@ -1296,20 +1349,28 @@ HOW_TO_USE_TEXT = (
 # ═══════════════════════════════════════════════════════════════
 # PDF BUILDER
 # ═══════════════════════════════════════════════════════════════
-def build_pdf(items: list, doc_title: str = "questions", font_path: str = None, bg_image_path: str = None) -> BytesIO:
+def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
+              font_bold_path: str = None, bg_image_path: str = None) -> BytesIO:
     buffer = BytesIO()
 
     # Custom font: registered under a name unique to this call so two users'
     # uploaded fonts (built around the same time) can never clobber each
-    # other in reportlab's global font registry. Falls back to the bot's
-    # normal default font on any registration failure — same font used for
-    # both regular and bold, since we only ever have the one uploaded file.
+    # other in reportlab's global font registry. If a genuine bold weight
+    # file is available (bundled presets only), register it separately so
+    # bold text — the question itself — actually renders heavier than the
+    # options, not just as the same glyphs relabeled "bold". Falls back to
+    # reusing the regular file for bold otherwise (e.g. a plain user
+    # upload, which never comes with a bold companion).
     font_name, font_name_bold = FONT_NAME, FONT_NAME_BOLD
     if font_path and os.path.exists(font_path):
         try:
             custom_name = f"CustomFont_{abs(hash(font_path)) % 10**8}"
             pdfmetrics.registerFont(TTFont(custom_name, font_path))
             font_name = font_name_bold = custom_name
+            if font_bold_path and os.path.exists(font_bold_path):
+                custom_bold_name = f"CustomFontBold_{abs(hash(font_bold_path)) % 10**8}"
+                pdfmetrics.registerFont(TTFont(custom_bold_name, font_bold_path))
+                font_name_bold = custom_bold_name
         except Exception as e:
             print(f"Custom PDF font load error: {e} — using default")
 
@@ -1433,7 +1494,7 @@ def _hex_to_rgb(hex_color: str):
 def _add_paragraph(doc, text: str, bold=False, size_pt=11,
                    color_hex="1A1A2E", indent_cm=0,
                    space_before=0, space_after=6,
-                   align=WD_ALIGN_PARAGRAPH.LEFT) -> None:
+                   align=WD_ALIGN_PARAGRAPH.LEFT, font_name: str = None) -> None:
     p   = doc.add_paragraph()
     p.alignment = align
     pf  = p.paragraph_format
@@ -1445,6 +1506,20 @@ def _add_paragraph(doc, text: str, bold=False, size_pt=11,
     run.bold        = bold
     run.font.size   = Pt(size_pt)
     run.font.color.rgb = _hex_to_rgb(color_hex)
+    if font_name:
+        # Explicit override — used when this run's weight (bold, e.g. the
+        # question text) needs a genuinely different font file than the
+        # rest of the document's base 'Normal' style, not just a fake-bold
+        # of the same face. Same w:cs handling as _set_style_font, since
+        # Arabic renders off the complex-script slot specifically.
+        run.font.name = font_name
+        rpr = run._element.get_or_add_rPr()
+        rFonts = rpr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rpr.append(rFonts)
+        for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+            rFonts.set(qn(attr), font_name)
     return p
 
 def _add_horizontal_rule(doc):
@@ -1547,17 +1622,26 @@ def _add_docx_page_background(doc, image_path: str) -> None:
         drawing.remove(inline)
         drawing.append(anchor)
 
-def build_docx(items: list, doc_title: str = "questions", font_path: str = None, bg_image_path: str = None) -> BytesIO:
+def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
+               font_bold_path: str = None, bg_image_path: str = None) -> BytesIO:
     doc = DocxDocument()
 
     # Custom font: unlike the PDF export, .docx can't embed the actual font
     # file — Word only renders this correctly if the reader's own machine
     # happens to already have a font by this exact name installed. Best
-    # effort: apply it as the doc's base style so everything inherits it.
+    # effort: apply the regular weight as the doc's base style so everything
+    # inherits it, and — if a genuine bold weight file is available (bundled
+    # presets only) — pass its name through to the specific bold call sites
+    # below so the question text renders as an actually different, heavier
+    # face rather than just a fake-bold of the regular one.
+    font_bold_display_name = None
     if font_path and os.path.exists(font_path):
         try:
             font_display_name = TTFont("Probe", font_path).face.name or os.path.splitext(os.path.basename(font_path))[0]
             _set_style_font(doc.styles["Normal"], font_display_name)
+            if font_bold_path and os.path.exists(font_bold_path):
+                font_bold_display_name = TTFont("Probe", font_bold_path).face.name \
+                    or os.path.splitext(os.path.basename(font_bold_path))[0]
         except Exception as e:
             print(f"Custom DOCX font apply error: {e}")
 
@@ -1585,11 +1669,13 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
         # Q-number label
         q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
         _add_paragraph(doc, q_num_label, bold=True, size_pt=8,
-                       color_hex="90A4AE", space_before=10, space_after=2)
+                       color_hex="90A4AE", space_before=10, space_after=2,
+                       font_name=font_bold_display_name)
 
         if item["type"] == "mcq":
             _add_paragraph(doc, item["q"], bold=True, size_pt=12,
-                           color_hex="1A1A2E", space_before=0, space_after=4)
+                           color_hex="1A1A2E", space_before=0, space_after=4,
+                           font_name=font_bold_display_name)
             if item.get("image") and os.path.exists(item["image"]):
                 try:
                     p = doc.add_paragraph()
@@ -1609,11 +1695,13 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                     bold=correct, size_pt=11,
                     color_hex="1B5E20" if correct else "1A1A2E",
                     indent_cm=0.7, space_after=3,
+                    font_name=(font_bold_display_name if correct else None),
                 )
 
         elif item["type"] == "written":
             _add_paragraph(doc, item["title"], bold=True, size_pt=12,
-                           color_hex="1A1A2E", space_before=0, space_after=4)
+                           color_hex="1A1A2E", space_before=0, space_after=4,
+                           font_name=font_bold_display_name)
             for line in item["content"].split("\n"):
                 line = line.strip()
                 if line:
@@ -2228,6 +2316,7 @@ async def handle_font_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await tg_file.download_to_drive(font_path)
 
     PDF_FONT_PATH[user_id] = font_path
+    PDF_FONT_BOLD_PATH.pop(user_id, None)   # single upload has no bold companion — clear any stale preset one
     del AWAITING_FONT[user_id]
     AWAITING_BG[user_id] = True
     await update.message.reply_text(
@@ -2598,12 +2687,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         AWAITING_FONT[user_id] = True
         await update.message.reply_text(
             f"📥 <b>الاسم اتسجل:</b> <i>{name}</i>\n\n"
-            "دلوقتي ابعت ملف الخط (.ttf أو .otf) اللي عايز تستخدمه في الـ PDF/DOCX، "
-            "أو دوس Skip لو عايز الخط الافتراضي.",
+            "اختار خط جاهز، أو ابعت ملف خط (.ttf أو .otf) بنفسك، أو دوس Skip لو عايز الخط الافتراضي.",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⏭ Skip", callback_data="font_skip"),
-            ]]),
+            reply_markup=font_prompt_keyboard(),
         )
         return
 
@@ -2612,7 +2698,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #    user sends plain text instead) ─────────────────────────────
     if AWAITING_FONT.get(user_id):
         await update.message.reply_text(
-            "⚠️ محتاج ملف خط (.ttf أو .otf) كـ Document، أو دوس Skip فوق.",
+            "⚠️ اختار خط من الأزرار فوق، ابعت ملف خط (.ttf أو .otf)، أو دوس Skip.",
         )
         return
 
@@ -3039,9 +3125,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── PDF SETUP FLOW: font/background skip buttons ────────────────
+    if query.data.startswith("font_preset:"):
+        if not AWAITING_FONT.get(user_id):
+            return
+        idx   = int(query.data.split(":")[1])
+        names = list(BUNDLED_FONTS.keys())
+        if idx >= len(names):
+            return
+        name      = names[idx]
+        font_path = BUNDLED_FONTS[name]["regular"]
+        if not font_path or not os.path.exists(font_path):
+            await query.answer(f"⚠️ ملف {name} مش موجود على السيرفر دلوقتي.", show_alert=True)
+            return
+        bold_path = BUNDLED_FONTS[name]["bold"]
+        PDF_FONT_PATH[user_id] = font_path
+        # Bold companion is optional — if it's missing, bold text just
+        # reuses the regular weight (same as a plain user upload does).
+        if bold_path and os.path.exists(bold_path):
+            PDF_FONT_BOLD_PATH[user_id] = bold_path
+        else:
+            PDF_FONT_BOLD_PATH.pop(user_id, None)
+        del AWAITING_FONT[user_id]
+        AWAITING_BG[user_id] = True
+        await query.edit_message_text(
+            f"✅ خط <b>{name}</b> اتحدد!\n\n"
+            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF/DOCX، أو دوس Skip لو مش عايز خلفية.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
+            ]]),
+        )
+        return
+
     if query.data == "font_skip":
         if not AWAITING_FONT.get(user_id):
             return
+        PDF_FONT_PATH.pop(user_id, None)
+        PDF_FONT_BOLD_PATH.pop(user_id, None)
         del AWAITING_FONT[user_id]
         AWAITING_BG[user_id] = True
         await query.edit_message_text(
@@ -3165,11 +3285,15 @@ def _reset_pdf_session(user_id: int) -> None:
     AWAITING_BG.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
     font_path = PDF_FONT_PATH.pop(user_id, None)
-    if font_path and os.path.exists(font_path):
+    # Only delete it if it's a per-user upload (under FONT_BASE_DIR) — never
+    # a bundled preset (under FONTS_DIR), which is a shared asset every
+    # future user picks from, not something owned by this one session.
+    if font_path and font_path.startswith(FONT_BASE_DIR) and os.path.exists(font_path):
         try:
             os.remove(font_path)
         except Exception:
             pass
+    PDF_FONT_BOLD_PATH.pop(user_id, None)   # always a bundled preset path (or absent) — never a per-user file, nothing to delete
     bg_path = PDF_BG_IMAGE_PATH.pop(user_id, None)
     if bg_path and os.path.exists(bg_path):
         try:
@@ -3185,15 +3309,16 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
     session_id. Returns False (having already replied with the reason) if
     DOCX isn't available or the build blew up."""
     safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
-    font_path = PDF_FONT_PATH.get(session_id)
-    bg_path   = PDF_BG_IMAGE_PATH.get(session_id)
+    font_path      = PDF_FONT_PATH.get(session_id)
+    font_bold_path = PDF_FONT_BOLD_PATH.get(session_id)
+    bg_path        = PDF_BG_IMAGE_PATH.get(session_id)
 
     if fmt == "docx":
         if not DOCX_AVAILABLE:
             await message.reply_text(MSG_DOCX_UNAVAILABLE)
             return False
         try:
-            doc_bytes = build_docx(items, name, font_path=font_path, bg_image_path=bg_path)
+            doc_bytes = build_docx(items, name, font_path=font_path, font_bold_path=font_bold_path, bg_image_path=bg_path)
         except Exception as e:
             print("DOCX ERROR:", e)
             await message.reply_text(
@@ -3207,7 +3332,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             parse_mode=ParseMode.HTML,
         )
     else:
-        pdf_bytes = build_pdf(items, name, font_path=font_path, bg_image_path=bg_path)
+        pdf_bytes = build_pdf(items, name, font_path=font_path, font_bold_path=font_bold_path, bg_image_path=bg_path)
         await message.reply_document(
             document=pdf_bytes, filename=f"{safe}.pdf",
             caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
