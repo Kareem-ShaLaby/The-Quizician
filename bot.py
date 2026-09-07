@@ -144,6 +144,11 @@ QUIZ_CHANNEL_ID = -1004402622263
 # and deletes the previous one — always exactly one file in the group.
 ANALYTICS_GROUP_ID = -1003767364410
 
+# ── Dedicated group for user-settings JSON backups ─────────────
+# Same pin-and-replace pattern as ANALYTICS_GROUP_ID, but for
+# per-user personalization settings (nickname, etc).
+SETTINGS_GROUP_ID = -1004423684829
+
 # ── Curriculum structure for the quiz channel ─────────────────────
 # Add new modules/subjects here as they come up. Lecture titles posted in
 # the quiz channel must be formatted as:
@@ -581,6 +586,115 @@ async def restore_analytics_from_channel(app):
         print("ANALYTICS RESTORE ERROR:", e)
 
 # ═══════════════════════════════════════════════════════════════
+# SETTINGS — per-user personalization (nickname, etc.)
+#
+# settings.json schema per user:
+# {
+#   "nickname": str | None
+# }
+#
+# Mirrors the ANALYTICS system exactly: local JSON file, plus a pinned
+# backup in SETTINGS_GROUP_ID that gets replaced (upload + pin + delete
+# old pin) on every change and restored from on startup.
+# ═══════════════════════════════════════════════════════════════
+SETTINGS_FILE          = "settings.json"
+SETTINGS_BACKUP_MARKER = "⚙️ QUIZICIAN_SETTINGS_BACKUP"
+
+def _blank_settings_entry() -> dict:
+    return {
+        "nickname": None,
+    }
+
+def load_settings() -> dict:
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_settings():
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(SETTINGS, f, indent=2)
+
+SETTINGS: dict = load_settings()
+
+# Message ID of the currently pinned settings backup in SETTINGS_GROUP_ID.
+# Populated on startup by restore_settings_from_channel; the pin is the
+# source of truth — no separate state file needed.
+_settings_backup_msg_id: int | None = None
+
+# Same debounce pattern as analytics — local save_settings() always
+# happens immediately; only the channel mirror is throttled.
+_last_settings_backup_at: float = 0.0
+SETTINGS_BACKUP_MIN_INTERVAL = 5  # seconds
+
+def _get_settings_entry(user_id: int) -> dict:
+    key   = str(user_id)
+    entry = SETTINGS.setdefault(key, _blank_settings_entry())
+    # backfill missing keys for users created before this system
+    for k, v in _blank_settings_entry().items():
+        entry.setdefault(k, v)
+    return entry
+
+def get_nickname(user_id: int) -> str | None:
+    return SETTINGS.get(str(user_id), {}).get("nickname")
+
+async def backup_settings_to_channel(context):
+    global _settings_backup_msg_id, _last_settings_backup_at
+    if not SETTINGS_GROUP_ID:
+        return
+    now = time.monotonic()
+    if now - _last_settings_backup_at < SETTINGS_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_settings() already has the latest data
+    _last_settings_backup_at = now
+    data = json.dumps(SETTINGS, indent=2).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=SETTINGS_GROUP_ID,
+            document=InputFile(BytesIO(data), filename="settings.json"),
+            caption=SETTINGS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("SETTINGS BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=SETTINGS_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("SETTINGS PIN ERROR:", e)
+    if _settings_backup_msg_id and _settings_backup_msg_id != sent.message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=SETTINGS_GROUP_ID,
+                message_id=_settings_backup_msg_id,
+            )
+        except Exception:
+            pass
+    _settings_backup_msg_id = sent.message_id
+
+async def restore_settings_from_channel(app):
+    global _settings_backup_msg_id
+    if not SETTINGS_GROUP_ID:
+        return
+    try:
+        chat   = await app.bot.get_chat(SETTINGS_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document:
+            return
+        if (pinned.caption or "") != SETTINGS_BACKUP_MARKER:
+            return
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        SETTINGS.update(json.loads(bytes(raw).decode("utf-8")))
+        save_settings()
+        _settings_backup_msg_id = pinned.message_id
+        print(f"Restored settings: {len(SETTINGS)} user(s).")
+    except Exception as e:
+        print("SETTINGS RESTORE ERROR:", e)
+
+# ═══════════════════════════════════════════════════════════════
 # PASSWORD-GATED STORAGE (private group)
 # ═══════════════════════════════════════════════════════════════
 # STORAGE_GROUP_ID is the vault: post any photo/video/document/album there
@@ -924,6 +1038,7 @@ PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/
                                 # awaiting free-text replacement for one field of a just-added question
 LECTURE_SESSIONS       = {}    # user_id -> {"module","subject","lecture_key","queue":[mid,...],
                                 #             "current_poll_id","total","answered"} — active one-at-a-time delivery
+AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is waiting on a nickname reply
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -1318,7 +1433,14 @@ def start_menu_keyboard():
         ],
         [
             InlineKeyboardButton("📊 My Stats", callback_data="menu_mystats"),
+            InlineKeyboardButton("⚙️ Settings",  callback_data="menu_settings"),
         ],
+    ])
+
+def settings_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
+        [InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home")],
     ])
 
 # ═══════════════════════════════════════════════════════════════
@@ -2653,6 +2775,29 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
+    # ── AWAITING NICKNAME (Settings) ─────────────────────────────
+    # Keyed by real_uid (the person's Telegram user id, same key SETTINGS
+    # uses), not the chat id, so this works the same in DMs and groups.
+    if AWAITING_NICKNAME.get(real_uid):
+        del AWAITING_NICKNAME[real_uid]
+        nickname = text[:32].strip()
+        if not nickname:
+            await update.message.reply_text(
+                "⚠️ الاسم فاضي — جرب تاني.",
+                reply_markup=settings_menu_keyboard(),
+            )
+            return
+        entry = _get_settings_entry(real_uid)
+        entry["nickname"] = nickname
+        save_settings()
+        await backup_settings_to_channel(context)
+        await update.message.reply_text(
+            f"✅ اتسجل! هنناديك <b>{html.escape(nickname)}</b> دلوقتي.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_menu_keyboard(),
+        )
+        return
+
     # ── AWAITING A QUESTION EDIT (from the review/edit prompt) ───
     pending_edit = PENDING_EDIT.pop(user_id, None)
     if pending_edit:
@@ -3207,6 +3352,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_mystats(context, user_id, query.message, edit=True)
         return
 
+    if query.data == "menu_settings":
+        AWAITING_NICKNAME.pop(user_id, None)
+        await _send_settings(context, user_id, query.message, edit=True)
+        return
+
+    if query.data == "edit_nickname":
+        AWAITING_NICKNAME[user_id] = True
+        await query.edit_message_text(
+            "✏️ ابعت الاسم المستعار اللي عايزه (حتى 32 حرف).",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings"),
+            ]]),
+        )
+        return
+
     if query.data == "menu_quizzes":
         # Same as typing /quiz — sends a fresh message (not an edit) so the
         # welcome message with its buttons stays intact above it.
@@ -3398,9 +3558,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_users()
         await backup_storage_to_channel(context)
 
+    real_uid = update.effective_user.id if update.effective_user else chat_id
+    nickname = get_nickname(real_uid)
+    greeting = f"يا {html.escape(nickname)}! " if nickname else ""
+
     await update.message.reply_text(
         f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
-        "تحب تعمل أي؟!:",
+        f"{greeting}تحب تعمل أي؟!:",
         parse_mode=ParseMode.HTML,
         reply_markup=start_menu_keyboard(),
     )
@@ -3412,6 +3576,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("/start — main menu")
     lines.append("/sleep — pauses the bot temporarily in this chat")
     lines.append("/mystats — your stats (questions created, day streak, lecture quiz results)")
+    lines.append("⚙️ Settings — from the /start menu: set your nickname")
     lines.append("/pdf_start — starts a session collecting images for a PDF")
     lines.append("/pdf_generate — builds a PDF from the images you've collected")
     lines.append("/pdf_clear — clears the current PDF session")
@@ -3634,6 +3799,22 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         ]]),
     )
 
+async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
+    """Builds and sends the Settings screen to reply_target (an
+    update.message or a callback_query.message). Mirrors _send_mystats:
+    edit=True rewrites reply_target in place (button flow), edit=False
+    sends a fresh reply."""
+    nickname = get_nickname(user_id)
+    nick_line = f"<b>{html.escape(nickname)}</b>" if nickname else "<i>مش متسجل — دوس تحت تحطه</i>"
+
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(
+        f"⚙️ <b>الإعدادات</b>\n\n"
+        f"👤 الاسم المستعار: {nick_line}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=settings_menu_keyboard(),
+    )
+
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Analytics are keyed by the person's real Telegram user id — not the
     # chat id — so this shows the same numbers whether /mystats is run in
@@ -3718,6 +3899,7 @@ async def _post_init(app):
     await restore_storage_from_channel(app)
     await restore_quiz_from_channel(app)
     await restore_analytics_from_channel(app)
+    await restore_settings_from_channel(app)
 
 app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
