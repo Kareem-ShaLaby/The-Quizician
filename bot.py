@@ -529,9 +529,68 @@ async def _announce_events(context, chat_id: int, events: dict):
             chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML
         )
 
+RESTORE_MAX_ATTEMPTS      = 3   # attempts before giving up on a startup restore
+RESTORE_RETRY_DELAY_BASE  = 4   # seconds; multiplied by attempt number (4s, then 8s)
+
+# Whether each system's channel restore succeeded this run. False blocks
+# that system's backup_*_to_channel from firing — if the restore never
+# got the real data locally, we must NOT let a later backup push a
+# fresh/empty local file over the good backup still sitting in the
+# channel. Fixed by a restart once the underlying Telegram/network issue
+# clears (or manually via /restore_analytics etc. for analytics).
+RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "quiz": True}
+
+async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_found_hint: str | None = None):
+    """Runs do_restore() (an async no-arg callable doing the actual
+    get_chat/get_file/parse work for one system) up to
+    RESTORE_MAX_ATTEMPTS times with a short backoff between attempts —
+    these failures are almost always a transient Telegram API timeout,
+    so a couple retries clear most of them without ever bothering the
+    admin. Only if every attempt fails do we DM the admin and mark this
+    system unsynced for the session (see RESTORE_OK)."""
+    for attempt in range(1, RESTORE_MAX_ATTEMPTS + 1):
+        try:
+            await do_restore()
+            RESTORE_OK[key] = True
+            return
+        except Exception as e:
+            hint = not_found_hint if (not_found_hint and "chat not found" in str(e).lower()) else None
+            print(f"{label.upper()} RESTORE ERROR (attempt {attempt}/{RESTORE_MAX_ATTEMPTS}):", hint or e)
+            if attempt < RESTORE_MAX_ATTEMPTS:
+                await asyncio.sleep(RESTORE_RETRY_DELAY_BASE * attempt)
+            else:
+                RESTORE_OK[key] = False
+                await _notify_admin_sync_failure(app, label, hint or e)
+
+async def _notify_admin_sync_failure(app, what: str, error):
+    """Best-effort DM to ADMIN_ID once every retry has been exhausted.
+    Never raises — this runs inside _post_init, and a failure here (bot
+    blocked, admin never DM'd it, etc.) must not crash startup."""
+    if not ADMIN_ID:
+        return
+    try:
+        await app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"<pre>{html.escape(QUIZZY_OOPS_ART)}</pre>"
+                f"⚠️ <b>Error: failed to fetch {html.escape(what)} — try again later.</b>\n"
+                f"<code>{html.escape(str(error))}</code>\n\n"
+                f"Gave up after {RESTORE_MAX_ATTEMPTS} attempts. Local data was left as-is — "
+                f"I won't touch or re-save the {html.escape(what.lower())} file(s), and I won't "
+                f"push a new backup to the channel either, so nothing gets overwritten. "
+                f"Restart me once things look stable to retry."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as notify_err:
+        print(f"ADMIN SYNC-FAILURE NOTIFY ERROR ({what}):", notify_err)
+
 async def backup_analytics_to_channel(context):
     global _analytics_backup_msg_id, _last_analytics_backup_at
     if not ANALYTICS_GROUP_ID:
+        return
+    if not RESTORE_OK["analytics"]:
+        print("ANALYTICS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return
     now = time.monotonic()
     if now - _last_analytics_backup_at < ANALYTICS_BACKUP_MIN_INTERVAL:
@@ -569,7 +628,9 @@ async def restore_analytics_from_channel(app):
     global _analytics_backup_msg_id
     if not ANALYTICS_GROUP_ID:
         return
-    try:
+
+    async def _do():
+        global _analytics_backup_msg_id
         chat   = await app.bot.get_chat(ANALYTICS_GROUP_ID)
         pinned = chat.pinned_message
         if not pinned or not pinned.document:
@@ -582,8 +643,10 @@ async def restore_analytics_from_channel(app):
         save_analytics()
         _analytics_backup_msg_id = pinned.message_id
         print(f"Restored analytics: {len(ANALYTICS)} user(s).")
-    except Exception as e:
-        print("ANALYTICS RESTORE ERROR:", e)
+
+    await _run_restore_with_retries(app, "analytics", "Analytics", _do)
+
+
 
 # ═══════════════════════════════════════════════════════════════
 # SETTINGS — per-user personalization (nickname, etc.)
@@ -642,6 +705,9 @@ async def backup_settings_to_channel(context):
     global _settings_backup_msg_id, _last_settings_backup_at
     if not SETTINGS_GROUP_ID:
         return
+    if not RESTORE_OK["settings"]:
+        print("SETTINGS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
     now = time.monotonic()
     if now - _last_settings_backup_at < SETTINGS_BACKUP_MIN_INTERVAL:
         return   # backed up recently enough — local save_settings() already has the latest data
@@ -678,7 +744,9 @@ async def restore_settings_from_channel(app):
     global _settings_backup_msg_id
     if not SETTINGS_GROUP_ID:
         return
-    try:
+
+    async def _do():
+        global _settings_backup_msg_id
         chat   = await app.bot.get_chat(SETTINGS_GROUP_ID)
         pinned = chat.pinned_message
         if not pinned or not pinned.document:
@@ -691,8 +759,8 @@ async def restore_settings_from_channel(app):
         save_settings()
         _settings_backup_msg_id = pinned.message_id
         print(f"Restored settings: {len(SETTINGS)} user(s).")
-    except Exception as e:
-        print("SETTINGS RESTORE ERROR:", e)
+
+    await _run_restore_with_retries(app, "settings", "Settings", _do)
 
 # ═══════════════════════════════════════════════════════════════
 # PASSWORD-GATED STORAGE (private group)
@@ -746,6 +814,9 @@ STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": in
 async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
     if not STORAGE_GROUP_ID:
         return
+    if not RESTORE_OK["storage"]:
+        print("STORAGE BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
     payload = {"users": list(USERS), "storage_index": STORAGE_INDEX}
     data    = json.dumps(payload).encode("utf-8")
     # A pinned document instead of a pinned text message: Bot API caps
@@ -792,7 +863,8 @@ async def restore_storage_from_channel(app):
     storage group's pinned backup if the local cache is missing/stale."""
     if not STORAGE_GROUP_ID:
         return
-    try:
+
+    async def _do():
         chat   = await app.bot.get_chat(STORAGE_GROUP_ID)
         pinned = chat.pinned_message
         if pinned and pinned.document and (pinned.caption or "") == STORAGE_BACKUP_MARKER:
@@ -806,16 +878,14 @@ async def restore_storage_from_channel(app):
             STORAGE_BACKUP_STATE["backup_msg_id"] = pinned.message_id
             save_storage_backup_state()
             print(f"Restored storage backup: {len(USERS)} user(s), {len(STORAGE_INDEX)} password(s).")
-    except Exception as e:
-        if "chat not found" in str(e).lower():
-            print(
-                "STORAGE RESTORE ERROR: Chat not found — STORAGE_GROUP_ID "
-                f"({STORAGE_GROUP_ID}) isn't a real group this bot knows about. "
-                "Still the template placeholder, wrong ID, or the bot was never "
-                "added to that group. See the setup comment above STORAGE_GROUP_ID."
-            )
-        else:
-            print("STORAGE RESTORE ERROR:", e)
+
+    not_found_hint = (
+        f"Chat not found — STORAGE_GROUP_ID ({STORAGE_GROUP_ID}) isn't a real "
+        "group this bot knows about. Still the template placeholder, wrong ID, "
+        "or the bot was never added to that group. See the setup comment above "
+        "STORAGE_GROUP_ID."
+    )
+    await _run_restore_with_retries(app, "storage", "Storage", _do, not_found_hint=not_found_hint)
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZ CHANNEL (interactive quiz storage, organized by lecture)
@@ -948,6 +1018,9 @@ QUIZ_BACKUP_STATE: dict = load_quiz_backup_state()  # {"backup_msg_id": int}
 async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE):
     if not QUIZ_CHANNEL_ID:
         return
+    if not RESTORE_OK["quiz"]:
+        print("QUIZ BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
     payload  = {"quiz_index": QUIZ_INDEX, "quiz_state": QUIZ_STATE, "quiz_poll_status": QUIZ_POLL_STATUS}
     data     = json.dumps(payload).encode("utf-8")
     filename = "quizician_quiz_backup.json"
@@ -990,7 +1063,8 @@ async def restore_quiz_from_channel(app):
     channel's pinned backup if the local cache is missing/stale."""
     if not QUIZ_CHANNEL_ID:
         return
-    try:
+
+    async def _do():
         chat   = await app.bot.get_chat(QUIZ_CHANNEL_ID)
         pinned = chat.pinned_message
         if pinned and pinned.document and (pinned.caption or "") == QUIZ_BACKUP_MARKER:
@@ -1006,16 +1080,14 @@ async def restore_quiz_from_channel(app):
             QUIZ_BACKUP_STATE["backup_msg_id"] = pinned.message_id
             save_quiz_backup_state()
             print(f"Restored quiz backup: {len(QUIZ_INDEX)} lecture(s).")
-    except Exception as e:
-        if "chat not found" in str(e).lower():
-            print(
-                "QUIZ RESTORE ERROR: Chat not found — QUIZ_CHANNEL_ID "
-                f"({QUIZ_CHANNEL_ID}) isn't a real channel this bot knows about. "
-                "Still the template placeholder, wrong ID, or the bot was never "
-                "added as an admin there. See the setup comment above QUIZ_CHANNEL_ID."
-            )
-        else:
-            print("QUIZ RESTORE ERROR:", e)
+
+    not_found_hint = (
+        f"Chat not found — QUIZ_CHANNEL_ID ({QUIZ_CHANNEL_ID}) isn't a real "
+        "channel this bot knows about. Still the template placeholder, wrong "
+        "ID, or the bot was never added as an admin there. See the setup "
+        "comment above QUIZ_CHANNEL_ID."
+    )
+    await _run_restore_with_retries(app, "quiz", "Quiz index", _do, not_found_hint=not_found_hint)
 
 # ═══════════════════════════════════════════════════════════════
 # STATE
