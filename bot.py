@@ -9,6 +9,53 @@ import html
 import tempfile
 from io import BytesIO
 
+# ═══════════════════════════════════════════════════════════════
+# FILE INDEX — where to find things (line numbers approximate;
+# section banners below are exact and searchable).
+# ═══════════════════════════════════════════════════════════════
+#   47   FONT SETUP
+#  164   QUIZZY — The Quizician's cat friend (persona/flavor text)
+#  208   BOT MESSAGES — every user-facing string, in one place
+#  239   USERS STORAGE
+#  256   ANALYTICS — XP · LEVELS · ACHIEVEMENTS
+#  651   SETTINGS — per-user personalization (nickname, reactions,
+#                    auto_next, randomize)
+#  786   PASSWORD-GATED STORAGE (private group)
+#  911   QUIZ CHANNEL (interactive quiz storage, organized by lecture)
+# 1113   STATE (in-memory dicts: LECTURE_SESSIONS, QUIZ_POLL_STATUS, etc.)
+# 1136   CONSTANTS
+# 1145   HELPERS
+# 1307   QUIZ DELIVERY (single source of truth for sending a live quiz poll)
+# 1409   PROGRESS MESSAGE BUILDER
+# 1473   KEYBOARD HELPERS (main menu, settings menu, etc.)
+# 1547   MENU TEXT CONTENT
+# 1572   PDF BUILDER
+# 1709   DOCX BUILDER
+# 1968   REACTIONS (react_random, lecture-answer streak reactions)
+# 2024   SLEEP / WAKE COMMANDS
+# 2036   PASSIVE ANSWER BACKFILL / LECTURE DELIVERY + SESSION LOGIC
+#          — _deliver_next_lecture_question, _deliver_all_lecture_questions,
+#            handle_poll_answer, _advance_lecture_session
+# 2339   FORWARDED POLL HANDLER
+# 2378   QUESTION REVIEW / EDIT (after a question lands in the PDF buffer)
+# 2524   IMAGE HANDLER (PDF mode only)
+# 2687   STORAGE GROUP — AUTO-INDEXING
+# 2768   QUIZ CHANNEL — AUTO-INDEXING
+# 2959   TEXT MESSAGE HANDLER
+# 3191   INLINE BUTTON HANDLER (button_handler — all callback_data routing,
+#          including lecture selection/start and settings toggles)
+# 3630   PDF/DOCX EXPORT (single source of truth, called from both PDF
+#          commands and quiz-channel exports)
+# 3732   PDF COMMANDS
+# 3772   START (also wakes bot from sleep)
+# 3822   ADMIN HELPERS
+# 3843   BROADCAST COMMAND (admin only)
+# 3920   MAIN
+#
+# NOTE: line numbers drift as the file grows — treat them as "roughly
+# here", and confirm with a grep for the section banner text if unsure.
+# ═══════════════════════════════════════════════════════════════
+
 
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile
 from telegram.error import Forbidden
@@ -427,6 +474,56 @@ def _get_entry(user_id: int) -> dict:
     for k in ACHIEVEMENTS:
         entry["achievements"].setdefault(k, 0)
     return entry
+
+# ── Per-lecture results, for the leaderboard shown before a user confirms
+# they want to start a lecture. Lives under a reserved key inside
+# ANALYTICS (rather than its own file) purely so it rides along on the
+# exact same save/backup/restore machinery as everything else here — no
+# separate persistence path to keep in sync.
+#   ANALYTICS["_lecture_results"][lecture_key][str(user_id)] = {
+#       "best_correct": int, "best_total": int, "best_pct": int,
+#       "attempts": int, "last_at": "YYYY-MM-DD",
+#   }
+def _get_lecture_results(lecture_key: str) -> dict:
+    store = ANALYTICS.setdefault("_lecture_results", {})
+    return store.setdefault(lecture_key, {})
+
+def _record_lecture_result(user_id: int, lecture_key: str, correct: int, total: int) -> None:
+    if total <= 0:
+        return
+    results = _get_lecture_results(lecture_key)
+    key     = str(user_id)
+    pct     = round(correct / total * 100)
+    prev    = results.get(key)
+    if prev is None or pct > prev.get("best_pct", -1) or (
+        pct == prev.get("best_pct", -1) and correct > prev.get("best_correct", -1)
+    ):
+        best_correct, best_total, best_pct = correct, total, pct
+    else:
+        best_correct, best_total, best_pct = prev["best_correct"], prev["best_total"], prev["best_pct"]
+    results[key] = {
+        "best_correct": best_correct,
+        "best_total":   best_total,
+        "best_pct":     best_pct,
+        "attempts":     (prev.get("attempts", 0) if prev else 0) + 1,
+        "last_at":      _today(),
+    }
+
+def _lecture_leaderboard(lecture_key: str, limit: int = 10) -> list[dict]:
+    """Top attempts for this lecture, best % first (ties broken by more
+    correct answers, then earlier last_at). Each row also carries the
+    nickname (falling back to a generic label if the user never set one)."""
+    results = _get_lecture_results(lecture_key)
+    rows = []
+    for uid_str, r in results.items():
+        uid = int(uid_str)
+        rows.append({
+            "user_id":  uid,
+            "nickname": get_nickname(uid) or f"مستخدم #{uid % 10000}",
+            **r,
+        })
+    rows.sort(key=lambda r: (-r["best_pct"], -r["best_correct"], r["last_at"]))
+    return rows[:limit]
 
 def _award_xp(entry: dict, amount: int) -> int:
     """Add XP, recalculate level. Returns new level if levelled up, else 0."""
@@ -1984,6 +2081,43 @@ async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+async def _react_to_lecture_answer(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, message_id: int | None,
+    is_correct: bool, new_streak: int, streak_broken: bool,
+) -> None:
+    """Quizzy's reaction to a single lecture-quiz poll answer, based on
+    correctness and the user's current lecture correct-streak:
+      - correct, streak > 15  → 🏆
+      - correct, streak > 10  → 😍
+      - correct, streak > 5   → ❤️‍🔥
+      - correct, otherwise    → ❤️
+      - wrong, broke a streak → 💔
+      - wrong, no streak lost → 😢
+    Respects the Reactions setting and no-ops if there's no message to
+    react to (e.g. the poll message couldn't be sent/found)."""
+    if message_id is None or not get_reactions_enabled(user_id):
+        return
+    if is_correct:
+        if new_streak > 15:
+            emoji = "🏆"
+        elif new_streak > 10:
+            emoji = "😍"
+        elif new_streak > 5:
+            emoji = "❤️‍🔥"
+        else:
+            emoji = "❤️"
+    else:
+        emoji = "💔" if streak_broken else "😢"
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=user_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji)],
+            is_big=False,
+        )
+    except Exception:
+        pass
+
 # ═══════════════════════════════════════════════════════════════
 # SLEEP / WAKE COMMANDS
 # ═══════════════════════════════════════════════════════════════
@@ -2148,17 +2282,19 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
 
         session["current_poll_id"]    = msg.poll.id
         session["current_correct_id"] = correct_id
+        session["current_message_id"] = msg.message_id
         return True
 
     session["current_poll_id"]    = None
     session["current_correct_id"] = None
+    session["current_message_id"] = None
     return False
 
 async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> int:
     """Auto-Next OFF path: sends every remaining question in session['queue']
     up front instead of one at a time. Reuses _deliver_next_lecture_question
     for the actual send/skip-dead-poll/legacy-recovery logic, just calling it
-    repeatedly and recording each poll_id -> correct_option_id in
+    repeatedly and recording each poll_id -> (correct_option_id, message_id) in
     session['pending_polls'] so handle_poll_answer can match any of them,
     not just a single 'current' one. Returns how many were actually sent."""
     session.setdefault("pending_polls", {})
@@ -2167,12 +2303,15 @@ async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, use
         sent = await _deliver_next_lecture_question(context, user_id, session)
         if not sent:
             break
-        session["pending_polls"][session["current_poll_id"]] = session["current_correct_id"]
+        session["pending_polls"][session["current_poll_id"]] = (
+            session["current_correct_id"], session["current_message_id"],
+        )
         sent_count += 1
     # These are meaningless in batch mode (there's no single "current"
     # question) — clear them so nothing downstream mistakes this for auto mode.
     session["current_poll_id"]    = None
     session["current_correct_id"] = None
+    session["current_message_id"] = None
     return sent_count
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2194,10 +2333,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pending = session.get("pending_polls", {})
         if poll_id not in pending:
             return   # not one of this lecture's questions (or already answered)
-        correct_id = pending.pop(poll_id)
+        correct_id, message_id = pending.pop(poll_id)
         chosen     = answer.option_ids[0] if answer.option_ids else None
         is_correct = chosen is not None and chosen == correct_id
-        await _advance_lecture_session(context, user_id, session, is_correct)
+        await _advance_lecture_session(context, user_id, session, is_correct, message_id)
         return
 
     if session.get("current_poll_id") != poll_id:
@@ -2205,10 +2344,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     chosen     = answer.option_ids[0] if answer.option_ids else None
     is_correct = chosen is not None and chosen == session.get("current_correct_id")
-    await _advance_lecture_session(context, user_id, session, is_correct)
+    await _advance_lecture_session(context, user_id, session, is_correct, session.get("current_message_id"))
 
 
-async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool):
+async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None = None):
     """Called once handle_poll_answer confirms the user answered their
     current lecture question, and whether it was right. Awards XP —
     15 correct, 5 incorrect — silently (no per-question message) and
@@ -2229,10 +2368,13 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
 
     per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
     xp_delta         = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    if not session.get("award_xp", True):
+        xp_delta = 0   # repeat attempt at a lecture already completed once — no XP farming
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
     events     = _record_activity(user_id)
     user_entry = _get_entry(user_id)
+    prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
     user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
     user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
@@ -2242,6 +2384,13 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
             user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
     else:
         user_entry["lecture_correct_streak_current"] = 0
+
+    await _react_to_lecture_answer(
+        context, user_id, message_id,
+        is_correct=is_correct,
+        new_streak=user_entry["lecture_correct_streak_current"],
+        streak_broken=(not is_correct and prev_streak > 0),
+    )
 
     events["achievements"] += _check_achievements(user_entry, "lecture_questions")
     events["achievements"] += _check_achievements(user_entry, "lecture_streak")
@@ -2265,6 +2414,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         incorrect = session["answered"] - correct
         pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
         lecture_name = QUIZ_INDEX.get(session["lecture_key"], {}).get("name", session["lecture_key"])
+        _record_lecture_result(user_id, session["lecture_key"], correct, session["answered"])
         summary = (
             f"🎓 <b>خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!</b>\n\n"
             f"✅ صح: {correct}\n"
@@ -2920,27 +3070,50 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    # ── AWAITING NICKNAME (Settings) ─────────────────────────────
+    # ── AWAITING NICKNAME (Settings, or first-ever /start) ───────
     # Keyed by real_uid (the person's Telegram user id, same key SETTINGS
     # uses), not the chat id, so this works the same in DMs and groups.
-    if AWAITING_NICKNAME.get(real_uid):
+    awaiting = AWAITING_NICKNAME.get(real_uid)
+    if awaiting:
+        onboarding = (awaiting == "onboarding")
         del AWAITING_NICKNAME[real_uid]
         nickname = text[:32].strip()
         if not nickname:
-            await update.message.reply_text(
-                "⚠️ الاسم فاضي — جرب تاني.",
-                reply_markup=settings_menu_keyboard(real_uid),
-            )
+            if onboarding:
+                # Still no nickname on file — re-ask instead of falling
+                # through to the settings menu, since there isn't a main
+                # menu to fall back to yet.
+                AWAITING_NICKNAME[real_uid] = "onboarding"
+                await update.message.reply_text(
+                    "⚠️ الاسم فاضي — اكتب اسم تحب أتنادي بيه عليك.",
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ الاسم فاضي — جرب تاني.",
+                    reply_markup=settings_menu_keyboard(real_uid),
+                )
             return
         entry = _get_settings_entry(real_uid)
         entry["nickname"] = nickname
         save_settings()
         await backup_settings_to_channel(context)
-        await update.message.reply_text(
-            f"✅ اتسجل! هنناديك <b>{html.escape(nickname)}</b> دلوقتي.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=settings_menu_keyboard(real_uid),
-        )
+        if onboarding:
+            await update.message.reply_text(
+                f"✅ اتسجل! هنناديك <b>{html.escape(nickname)}</b> دلوقتي.",
+                parse_mode=ParseMode.HTML,
+            )
+            await update.message.reply_text(
+                f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+                f"يا {html.escape(nickname)}! تحب تعمل أي؟!:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=start_menu_keyboard(),
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ اتسجل! هنناديك <b>{html.escape(nickname)}</b> دلوقتي.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=settings_menu_keyboard(real_uid),
+            )
         return
 
     # ── AWAITING A QUESTION EDIT (from the review/edit prompt) ───
@@ -3211,8 +3384,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── LECTURE: start one-at-a-time delivery of a closed lecture's ready quizzes ──
+    # ── LECTURE: show a preview (leaderboard + your stats) before starting ──
     if query.data.startswith("lecture:"):
+        _, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+
+        modules = ready_modules()
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(module)
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+        names = ready_lecture_keys(module, subject)
+        if lec_idx >= len(names):
+            await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
+            return
+        lecture_key = names[lec_idx]
+        entry = QUIZ_INDEX[lecture_key]
+
+        board = _lecture_leaderboard(lecture_key)
+        lines = [f"🎓 <b>{module} - {subject}: {entry['name']}</b>\n"]
+        if board:
+            medals = ["🥇", "🥈", "🥉"]
+            lines.append("🏆 <b>أفضل النتائج:</b>")
+            for i, row in enumerate(board):
+                medal = medals[i] if i < len(medals) else f"{i + 1}."
+                lines.append(
+                    f"{medal} {html.escape(row['nickname'])} — "
+                    f"{row['best_correct']}/{row['best_total']} ({row['best_pct']}%)"
+                )
+        else:
+            lines.append("🏆 محدش خد المحاضرة دي لسه — يلا كن أول واحد!")
+
+        my_result = _get_lecture_results(lecture_key).get(str(user_id))
+        if my_result:
+            lines.append(
+                f"\n📌 أحسن نتيجة ليك: {my_result['best_correct']}/{my_result['best_total']} "
+                f"({my_result['best_pct']}%) — حاولت {my_result['attempts']} مرة"
+            )
+
+        buttons = [
+            [InlineKeyboardButton("▶️ ابدأ المحاضرة", callback_data=f"lecturego:{mod_idx}:{subj_idx}:{lec_idx}")],
+            [InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"subject:{mod_idx}:{subj_idx}")],
+        ]
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── LECTUREGO: start one-at-a-time delivery of a closed lecture's ready quizzes ──
+    if query.data.startswith("lecturego:"):
         _, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
 
@@ -3254,6 +3480,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             random.shuffle(ready_ids)
 
         auto_next = get_auto_next_enabled(user_id)
+        already_attempted = str(user_id) in _get_lecture_results(lecture_key)
 
         session = {
             "module": module, "subject": subject, "lecture_key": lecture_key,
@@ -3261,12 +3488,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "total": len(ready_ids), "answered": 0, "correct": 0,
             "mode": "auto" if auto_next else "batch",
             "pending_polls": {},
+            "award_xp": not already_attempted,   # no XP farming on repeat attempts
         }
         LECTURE_SESSIONS[user_id] = session
 
         await query.edit_message_text(
             f"🎓 <b>{module} - {subject}: {entry['name']}</b> — {len(ready_ids)} سؤال، "
-            + ("هيتبعتولك واحد واحد 👇" if auto_next else "هيتبعتولك كلهم دلوقتي 👇"),
+            + ("هيتبعتولك واحد واحد 👇" if auto_next else "هيتبعتولك كلهم دلوقتي 👇")
+            + ("\n\n(محاولة تانية — من غير XP)" if already_attempted else ""),
             parse_mode=ParseMode.HTML,
         )
 
@@ -3733,7 +3962,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     real_uid = update.effective_user.id if update.effective_user else chat_id
     nickname = get_nickname(real_uid)
-    greeting = f"يا {html.escape(nickname)}! " if nickname else ""
+
+    if nickname is None:
+        # First-ever /start (no nickname on file yet, for this specific
+        # person): ask for one before showing the main menu at all. Marked
+        # "onboarding" (rather than True, same as the Settings ✏️ flow) so
+        # the text handler knows to continue into the welcome menu
+        # afterwards instead of bouncing back to the Settings screen.
+        AWAITING_NICKNAME[real_uid] = "onboarding"
+        await update.message.reply_text(
+            "👋 Hello! What's your name? (Set a Nickname - it can be changed later)",
+        )
+        return
+
+    greeting = f"يا {html.escape(nickname)}! "
 
     await update.message.reply_text(
         f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
