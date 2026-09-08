@@ -3,3 +3,4 @@ reportlab
 python-docx
 requests
 PyMuPDF
+python-telegram-bot[job-queue]
