@@ -7,6 +7,7 @@ import time
 import asyncio
 import html
 import tempfile
+import traceback
 from io import BytesIO
 
 # ═══════════════════════════════════════════════════════════════
@@ -77,6 +78,7 @@ from telegram.ext import (
     PollAnswerHandler,
     filters,
     ContextTypes,
+    AIORateLimiter,
 )
 from telegram.constants import ParseMode
 
@@ -129,6 +131,9 @@ else:
     print()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — never hardcode it
+# NOTE: AIORateLimiter (used below when building `app`) needs the extra:
+#   pip install "python-telegram-bot[rate-limiter]"
+# Add that to requirements.txt too, or the import at the top of this file fails.
 
 # Portable temp dir: tempfile.gettempdir() respects $TMPDIR, so this resolves
 # to a writable path on both Railway (/tmp) and Termux ($PREFIX/tmp) — a
@@ -211,7 +216,13 @@ SETTINGS_GROUP_ID = -1004423684829
 # leaderboard file never risks the analytics backup itself, and vice
 # versa. Set this up the same way as the others: create a group, add
 # the bot as admin, send /storage_id inside it, paste the ID below.
-LECTURE_RESULTS_GROUP_ID = 0  # ⚠️ set this to your group's chat ID
+LECTURE_RESULTS_GROUP_ID = -1004292587669
+
+# ── Dedicated group the bot posts crash/error reports to ────────────
+# Not a backup destination like the ones above — just a plain group the
+# bot sends a message to whenever an update handler raises an
+# unhandled exception. See the global error handler near app setup.
+ERROR_LOG_GROUP_ID = -1003732733553
 
 # ── Curriculum structure for the quiz channel ─────────────────────
 # Add new modules/subjects here as they come up. Lecture titles posted in
@@ -582,17 +593,25 @@ def _record_activity(user_id: int, questions_delta: int = 0,
     save_analytics()
     return {"achievements": newly_unlocked, "level_up": new_level}
 
-async def _announce_events(context, chat_id: int, events: dict):
-    """Send achievement unlocks and level-up notifications to the user's DM."""
+async def _announce_events(context, chat_id: int, events: dict, settings_uid: int | None = None):
+    """Send achievement unlocks and level-up notifications to chat_id (the
+    delivery target — a DM or, for a PDF export, possibly a group chat).
+    settings_uid is whose achievement_notifs setting to check; defaults to
+    chat_id itself, since every call site except the PDF exporter has the
+    delivery target and the real Telegram user be the same id. Level-ups
+    are a separate, more significant event and always sent regardless."""
+    if settings_uid is None:
+        settings_uid = chat_id
     msgs = []
 
-    for ach in events.get("achievements", []):
-        stars = "⭐" * ach["tier"]
-        msgs.append(
-            f"{ach['emoji']} <b>إنجاز جديد!</b>\n"
-            f"<b>{ach['name']}</b> {stars}\n"
-            f"<i>+{ach['xp_bonus']} XP</i>"
-        )
+    if get_achievement_notifs_enabled(settings_uid):
+        for ach in events.get("achievements", []):
+            stars = "⭐" * ach["tier"]
+            msgs.append(
+                f"{ach['emoji']} <b>إنجاز جديد!</b>\n"
+                f"<b>{ach['name']}</b> {stars}\n"
+                f"<i>+{ach['xp_bonus']} XP</i>"
+            )
 
     if events.get("level_up"):
         lvl   = events["level_up"]
@@ -736,6 +755,8 @@ async def restore_analytics_from_channel(app):
 #   "auto_next":  bool,  # sends lecture questions one by one, waiting for
 #                        # each answer, instead of all at once
 #   "randomize":  bool,  # shuffles question order within a lecture
+#   "achievement_notifs": bool,  # DMs a message when an achievement unlocks
+#                                # (level-up messages are separate and always sent)
 # }
 #
 # Mirrors the ANALYTICS system exactly: local JSON file, plus a pinned
@@ -751,6 +772,9 @@ def _blank_settings_entry() -> dict:
         "reactions": True,
         "auto_next": True,
         "randomize": True,
+        "achievement_notifs": True,
+        "question_timer": 0,   # seconds a live quiz poll stays open before
+                                # auto-closing; 0 = off. Cycles 0 -> 60 -> 30 -> 0.
     }
 
 def load_settings() -> dict:
@@ -799,6 +823,14 @@ def get_auto_next_enabled(user_id: int) -> bool:
 
 def get_randomize_enabled(user_id: int) -> bool:
     return _get_bool_setting(user_id, "randomize")
+
+def get_achievement_notifs_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "achievement_notifs")
+
+def get_question_timer_seconds(user_id: int) -> int:
+    # Defaults to 0 (off) for anyone not yet in SETTINGS — matches
+    # _blank_settings_entry()'s default, no backfill required to read.
+    return SETTINGS.get(str(user_id), {}).get("question_timer", 0)
 
 async def backup_settings_to_channel(context):
     global _settings_backup_msg_id, _last_settings_backup_at
@@ -1357,6 +1389,9 @@ PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/
                                 # awaiting free-text replacement for one field of a just-added question
 LECTURE_SESSIONS       = {}    # user_id -> {"module","subject","lecture_key","queue":[mid,...],
                                 #             "current_poll_id","total","answered"} — active one-at-a-time delivery
+RETAKE_STAGING         = {}    # user_id -> {"module","subject","lecture_key","mids":[mid,...]}
+                                # — wrong-question mids from a just-finished lecture, offered via the
+                                # "🔁 Retake incorrect questions!" button; consumed (popped) once tapped
 AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is waiting on a nickname reply
 
 # ═══════════════════════════════════════════════════════════════
@@ -1576,6 +1611,10 @@ async def deliver_quiz(
     q_fits      = len(question) <= TELEGRAM_Q_LIMIT
     answers_fit = not options_too_long(labeled_options)
 
+    # chat_id is always the user's own DM here, so it doubles as their user_id.
+    timer_seconds = get_question_timer_seconds(chat_id)
+    open_period   = timer_seconds if timer_seconds else None
+
     if q_fits and answers_fit:
         main_q, desc_overflow = split_question_for_telegram(question)
 
@@ -1594,6 +1633,7 @@ async def deliver_quiz(
         poll_kwargs = dict(
             chat_id=chat_id, question=main_q, options=labeled_options,
             type="quiz", correct_option_id=correct_index, is_anonymous=True,
+            open_period=open_period,
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
@@ -1607,6 +1647,7 @@ async def deliver_quiz(
         poll_kwargs = dict(
             chat_id=chat_id, question=".", options=labeled_options,
             type="quiz", correct_option_id=correct_index, is_anonymous=True,
+            open_period=open_period,
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
@@ -1627,6 +1668,7 @@ async def deliver_quiz(
         poll_kwargs = dict(
             chat_id=chat_id, question=".", options=letter_opts,
             type="quiz", correct_option_id=correct_index, is_anonymous=True,
+            open_period=open_period,
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
@@ -1759,14 +1801,19 @@ def start_menu_keyboard():
 def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     def _tag(on: bool) -> str:
         return "🟢 On" if on else "🔴 Off"
-    reactions = get_reactions_enabled(user_id)
-    auto_next = get_auto_next_enabled(user_id)
-    randomize = get_randomize_enabled(user_id)
+    reactions  = get_reactions_enabled(user_id)
+    auto_next  = get_auto_next_enabled(user_id)
+    randomize  = get_randomize_enabled(user_id)
+    ach_notifs = get_achievement_notifs_enabled(user_id)
+    timer      = get_question_timer_seconds(user_id)
+    timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
         [InlineKeyboardButton(f"🎭 Reactions: {_tag(reactions)}", callback_data="toggle_reactions")],
         [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
         [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
+        [InlineKeyboardButton(f"🏆 Achievement Alerts: {_tag(ach_notifs)}", callback_data="toggle_achievement_notifs")],
+        [InlineKeyboardButton(f"⏱️ Question Timer: {timer_tag}", callback_data="toggle_question_timer")],
         [InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home")],
     ])
 
@@ -2399,11 +2446,13 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
             if not (question and options and correct_id is not None):
                 continue  # still couldn't recover real quiz content — skip it
 
+        timer_seconds = get_question_timer_seconds(user_id)
         try:
             msg = await context.bot.send_poll(
                 chat_id=user_id, question=question, options=options,
                 type="quiz", correct_option_id=correct_id, is_anonymous=False,
                 explanation=(explanation or None),
+                open_period=(timer_seconds or None),
             )
         except Exception as e:
             print(f"Couldn't send lecture question {mid}: {e}")
@@ -2412,20 +2461,22 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         session["current_poll_id"]    = msg.poll.id
         session["current_correct_id"] = correct_id
         session["current_message_id"] = msg.message_id
+        session["current_mid"]        = mid
         return True
 
     session["current_poll_id"]    = None
     session["current_correct_id"] = None
     session["current_message_id"] = None
+    session["current_mid"]        = None
     return False
 
 async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> int:
     """Auto-Next OFF path: sends every remaining question in session['queue']
     up front instead of one at a time. Reuses _deliver_next_lecture_question
     for the actual send/skip-dead-poll/legacy-recovery logic, just calling it
-    repeatedly and recording each poll_id -> (correct_option_id, message_id) in
-    session['pending_polls'] so handle_poll_answer can match any of them,
-    not just a single 'current' one. Returns how many were actually sent."""
+    repeatedly and recording each poll_id -> (correct_option_id, message_id,
+    mid) in session['pending_polls'] so handle_poll_answer can match any of
+    them, not just a single 'current' one. Returns how many were actually sent."""
     session.setdefault("pending_polls", {})
     sent_count = 0
     while session["queue"]:
@@ -2433,7 +2484,7 @@ async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, use
         if not sent:
             break
         session["pending_polls"][session["current_poll_id"]] = (
-            session["current_correct_id"], session["current_message_id"],
+            session["current_correct_id"], session["current_message_id"], session["current_mid"],
         )
         sent_count += 1
     # These are meaningless in batch mode (there's no single "current"
@@ -2441,6 +2492,7 @@ async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, use
     session["current_poll_id"]    = None
     session["current_correct_id"] = None
     session["current_message_id"] = None
+    session["current_mid"]        = None
     return sent_count
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2463,10 +2515,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pending = session.get("pending_polls", {})
         if poll_id not in pending:
             return   # not one of this lecture's questions (or already answered)
-        correct_id, message_id = pending.pop(poll_id)
+        correct_id, message_id, mid = pending.pop(poll_id)
         chosen     = answer.option_ids[0] if answer.option_ids else None
         is_correct = chosen is not None and chosen == correct_id
-        await _advance_lecture_session(context, user_id, session, is_correct, message_id)
+        await _advance_lecture_session(context, user_id, session, is_correct, message_id, mid)
         return
 
     if session.get("current_poll_id") != poll_id:
@@ -2474,10 +2526,13 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     chosen     = answer.option_ids[0] if answer.option_ids else None
     is_correct = chosen is not None and chosen == session.get("current_correct_id")
-    await _advance_lecture_session(context, user_id, session, is_correct, session.get("current_message_id"))
+    await _advance_lecture_session(
+        context, user_id, session, is_correct,
+        session.get("current_message_id"), session.get("current_mid"),
+    )
 
 
-async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None = None):
+async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None = None, mid: int | None = None):
     """Called once handle_poll_answer confirms the user answered their
     current lecture question, and whether it was right. Awards XP —
     15 correct, 5 incorrect — silently (no per-question message) and
@@ -2486,6 +2541,8 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     right/wrong count and the XP total accumulated across the lecture."""
     session["answered"] += 1
     session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    if not is_correct and mid is not None:
+        session.setdefault("wrong_mids", []).append(mid)
 
     if session.get("mode") == "batch":
         # Everything was already sent up front — "last" means every
@@ -2544,20 +2601,35 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         incorrect = session["answered"] - correct
         pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
         lecture_name = QUIZ_INDEX.get(session["lecture_key"], {}).get("name", session["lecture_key"])
-        _record_lecture_result(user_id, session["lecture_key"], correct, session["answered"])
-        await backup_lecture_results_to_channel(context)
+        is_retake = session.get("is_retake", False)
+        if not is_retake:
+            # Retakes are practice, not a new attempt at the lecture proper —
+            # they never touch the leaderboard or best-score file.
+            _record_lecture_result(user_id, session["lecture_key"], correct, session["answered"])
+            await backup_lecture_results_to_channel(context)
+        title = "خلصت مراجعة الأسئلة الغلط!" if is_retake else f"خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!"
         summary = (
-            f"🎓 <b>خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!</b>\n\n"
+            f"🎓 <b>{title}</b>\n\n"
             f"✅ صح: {correct}\n"
             f"❌ غلط: {incorrect}\n"
             f"📊 نسبة: {pct}%\n"
             f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
             f"✨ XP: <b>+{session['xp_earned']}</b>"
         )
-        result_keyboard = InlineKeyboardMarkup([[
+        result_buttons = [[
             InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
             InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_modules"),
-        ]])
+        ]]
+        wrong_mids = session.get("wrong_mids", [])
+        if wrong_mids:
+            RETAKE_STAGING[user_id] = {
+                "module": session["module"], "subject": session["subject"],
+                "lecture_key": session["lecture_key"], "mids": wrong_mids,
+            }
+            result_buttons.insert(0, [
+                InlineKeyboardButton(f"🔁 Retake incorrect questions! ({len(wrong_mids)})", callback_data="retake_wrong"),
+            ])
+        result_keyboard = InlineKeyboardMarkup(result_buttons)
         try:
             await context.bot.send_message(
                 chat_id=user_id, text=summary, parse_mode=ParseMode.HTML, reply_markup=result_keyboard,
@@ -3046,11 +3118,44 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         return
     text = msg.text.strip()
 
-    if text.upper() == "-END":
+    if text.upper() in ("-END", "-FIN"):
+        is_fin = text.upper() == "-FIN"
         current = QUIZ_STATE.get("current_lecture")
         if not current or current not in QUIZ_INDEX:
             await context.bot.send_message(QUIZ_CHANNEL_ID, "⚠️ مفيش محاضرة مفتوحة دلوقتي.")
             return
+
+        open_message_ids = [
+            p["message_id"] for p in QUIZ_POLL_STATUS.values()
+            if p["lecture"] == current and not p["closed"]
+        ]
+
+        # -FIN: best-effort auto-stop of any question still open. NOTE:
+        # Telegram's stopPoll only works on a poll the *bot itself* sent —
+        # these quiz polls are posted directly by admins in the channel, so
+        # the bot has no API-level way to close them on its own; this loop
+        # will normally close nothing and every question will still need a
+        # manual Stop Poll, exactly like -END. It's left in as a harmless
+        # no-op in case that ever changes (e.g. polls start being relayed
+        # through the bot), rather than silently pretending to finalize
+        # something it technically can't.
+        auto_stopped = 0
+        if is_fin:
+            for mid in list(open_message_ids):
+                try:
+                    stopped_poll = await context.bot.stop_poll(chat_id=QUIZ_CHANNEL_ID, message_id=mid)
+                except Exception:
+                    continue
+                for p in QUIZ_POLL_STATUS.values():
+                    if p["message_id"] == mid:
+                        p["closed"]            = True
+                        p["correct_option_id"] = stopped_poll.correct_option_id
+                        break
+                open_message_ids.remove(mid)
+                auto_stopped += 1
+            if auto_stopped:
+                save_quiz_poll_status()
+
         QUIZ_INDEX[current]["closed"] = True
         save_quiz_index()
         QUIZ_STATE["current_lecture"] = None
@@ -3059,10 +3164,6 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         # Batched now, once, instead of one reaction call per question:
         # mark every still-open (forgot to Stop Poll) question in this
         # lecture with 😢.
-        open_message_ids = [
-            p["message_id"] for p in QUIZ_POLL_STATUS.values()
-            if p["lecture"] == current and not p["closed"]
-        ]
         for mid in open_message_ids:
             try:
                 await context.bot.set_message_reaction(
@@ -3082,9 +3183,12 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             f"قبل ما يبقى ممكن يتبعت للطلاب."
             if open_count else "\n✅ كل الأسئلة جاهزة للإرسال."
         )
+        if is_fin and auto_stopped:
+            note += f"\n🤖 اتقفل {auto_stopped} سؤال تلقائي."
+        verb = "اتخلصت" if is_fin else "اتقفلت"
         await context.bot.send_message(
             QUIZ_CHANNEL_ID,
-            f"✅ اتقفلت محاضرة <b>{current}</b> — {count} سؤال.{note}",
+            f"✅ {verb} محاضرة <b>{current}</b> — {count} سؤال.{note}",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3113,8 +3217,8 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
     await context.bot.send_message(
         QUIZ_CHANNEL_ID,
         f"🆕 <b>{module} - {subject} Lecture {lecture_number}: {name}</b>\n"
-        f"ابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> لما تخلص.\n"
-        f"⚠️ لازم توقف كل سؤال (Stop Poll) قبل الـ -END عشان يبقى قابل للإرسال.",
+        f"ابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> أو <code>-FIN</code> لما تخلص.\n"
+        f"⚠️ لازم توقف كل سؤال (Stop Poll) الأول عشان يبقى قابل للإرسال.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -3659,6 +3763,57 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # ── RETAKE_WRONG: practice round of just the questions missed in the ──
+    # most recently finished lecture. Always awards XP (no already_attempted
+    # gating — a retake isn't "the lecture", it's remedial practice), and
+    # explicitly never touches the leaderboard/best-score file: see the
+    # is_retake branch in _advance_lecture_session.
+    if query.data == "retake_wrong":
+        staged = RETAKE_STAGING.pop(user_id, None)
+        if not staged or not staged["mids"]:
+            await query.edit_message_text("⚠️ مفيش أسئلة غلط اتسجلت — يمكن خلصت المراجعة دي قبل كده.")
+            return
+
+        module, subject, lecture_key = staged["module"], staged["subject"], staged["lecture_key"]
+        entry = QUIZ_INDEX.get(lecture_key, {})
+        mids  = staged["mids"]
+
+        auto_next = get_auto_next_enabled(user_id)
+
+        session = {
+            "module": module, "subject": subject, "lecture_key": lecture_key,
+            "queue": list(mids), "current_poll_id": None, "current_correct_id": None,
+            "total": len(mids), "answered": 0, "correct": 0,
+            "mode": "auto" if auto_next else "batch",
+            "pending_polls": {},
+            "award_xp": True,      # retakes always earn XP
+            "is_retake": True,     # ...but never touch the leaderboard/results file
+        }
+        LECTURE_SESSIONS[user_id] = session
+
+        await query.edit_message_text(
+            f"🔁 <b>مراجعة الأسئلة الغلط — {module} - {subject}: {entry.get('name', lecture_key)}</b> — "
+            f"{len(mids)} سؤال، "
+            + ("هيتبعتولك واحد واحد 👇" if auto_next else "هيتبعتولك كلهم دلوقتي 👇"),
+            parse_mode=ParseMode.HTML,
+        )
+
+        if auto_next:
+            sent = await _deliver_next_lecture_question(context, user_id, session)
+        else:
+            session["total"] = 0
+            sent_count = await _deliver_all_lecture_questions(context, user_id, session)
+            session["total"] = sent_count
+            sent = sent_count > 0
+        if not sent:
+            LECTURE_SESSIONS.pop(user_id, None)
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⚠️ الأسئلة دي اتحذفت من القناة، فاتشالت من قايمة المراجعة.",
+            )
+            await backup_quiz_to_channel(context)
+        return
+
     # ── CLARIFY: manual correct-answer button tap ────────────────
     if query.data.startswith("clarify:"):
         _, item_index_str, choice_str = query.data.split(":")
@@ -3890,14 +4045,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize"):
+    if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize", "toggle_achievement_notifs"):
         key = {
             "toggle_reactions": "reactions",
             "toggle_auto_next": "auto_next",
             "toggle_randomize": "randomize",
+            "toggle_achievement_notifs": "achievement_notifs",
         }[query.data]
         entry = _get_settings_entry(user_id)
         entry[key] = not entry.get(key, True)
+        save_settings()
+        await backup_settings_to_channel(context)
+        await _send_settings(context, user_id, query.message, edit=True)
+        return
+
+    if query.data == "toggle_question_timer":
+        # 3-way cycle: Off -> 60s -> 30s -> Off
+        entry = _get_settings_entry(user_id)
+        current = entry.get("question_timer", 0)
+        entry["question_timer"] = {0: 60, 60: 30, 30: 0}.get(current, 0)
         save_settings()
         await backup_settings_to_channel(context)
         await _send_settings(context, user_id, query.message, edit=True)
@@ -4014,7 +4180,10 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             await message.reply_text(MSG_DOCX_UNAVAILABLE)
             return False
         try:
-            doc_bytes = build_docx(items, name, font_path=font_path, font_bold_path=font_bold_path, bg_image_path=bg_path)
+            doc_bytes = await asyncio.to_thread(
+                build_docx, items, name, font_path=font_path,
+                font_bold_path=font_bold_path, bg_image_path=bg_path,
+            )
         except Exception as e:
             print("DOCX ERROR:", e)
             await message.reply_text(
@@ -4028,7 +4197,18 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             parse_mode=ParseMode.HTML,
         )
     else:
-        pdf_bytes = build_pdf(items, name, font_path=font_path, font_bold_path=font_bold_path, bg_image_path=bg_path)
+        try:
+            pdf_bytes = await asyncio.to_thread(
+                build_pdf, items, name, font_path=font_path,
+                font_bold_path=font_bold_path, bg_image_path=bg_path,
+            )
+        except Exception as e:
+            print("PDF ERROR:", e)
+            await message.reply_text(
+                f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{e}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
         await message.reply_document(
             document=pdf_bytes, filename=f"{safe}.pdf",
             caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
@@ -4038,7 +4218,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
     q_count = sum(1 for it in items if it.get("type") in ("mcq", "written"))
     events  = _record_activity(analytics_uid, questions_delta=q_count, pdfs_delta=1, session_questions=q_count)
     _update_telegram_name(analytics_uid, getattr(message, "from_user", None))
-    await _announce_events(context, session_id, events)
+    await _announce_events(context, session_id, events, settings_uid=analytics_uid)
     await backup_analytics_to_channel(context)
     _reset_pdf_session(session_id)
     return True
@@ -4511,7 +4691,73 @@ async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"BACKUP RECONCILE — re-backup of {key} failed: {e}")
 
-app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
+# ═══════════════════════════════════════════════════════════════
+# PIN SERVICE-MESSAGE CLEANUP
+#
+# Every pin_chat_message() call in the backup system (and the pins made
+# when quiz-channel questions/lectures get pinned) causes Telegram to post
+# a "The Quizician pinned a file" service message in that chat.
+# disable_notification only silences the push notification, it doesn't
+# stop the message itself — so we delete it on sight in the bot's own
+# chats. Restricted to chats the bot actually pins in; if a human admin
+# pins something else in one of these, its service message gets deleted
+# too, since Telegram doesn't tell us who did the pinning.
+# ═══════════════════════════════════════════════════════════════
+BACKUP_CHAT_IDS = [c for c in (
+    STORAGE_GROUP_ID, QUIZ_CHANNEL_ID, ANALYTICS_GROUP_ID,
+    SETTINGS_GROUP_ID, LECTURE_RESULTS_GROUP_ID,
+) if c]
+
+async def delete_pin_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.channel_post or update.message
+    if not msg:
+        return
+    try:
+        await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
+    except Exception as e:
+        print(f"PIN SERVICE MESSAGE DELETE ERROR: {e}")
+
+app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).post_init(_post_init).build()
+
+# ═══════════════════════════════════════════════════════════════
+# GLOBAL ERROR HANDLER
+#
+# PTB already catches exceptions per-update internally so one bad update
+# can't take down the whole bot — but without this, the traceback just
+# goes to stderr and nobody finds out. This posts a compact report to
+# ERROR_LOG_GROUP_ID instead. Wrapped in its own try/except since the
+# last thing an error handler should do is raise another error.
+# ═══════════════════════════════════════════════════════════════
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    tb_string = "".join(traceback.format_exception(
+        None, context.error, context.error.__traceback__
+    ))
+    print("UNHANDLED ERROR:", tb_string)
+
+    if not ERROR_LOG_GROUP_ID:
+        return
+
+    update_str = update.to_dict() if isinstance(update, Update) else str(update)
+    # Telegram messages cap at 4096 chars — keep well under that.
+    report = (
+        f"🚨 <b>Bot error</b>\n"
+        f"<b>{type(context.error).__name__}:</b> {html.escape(str(context.error))}\n\n"
+        f"<b>Update:</b>\n<code>{html.escape(str(update_str))[:1200]}</code>\n\n"
+        f"<b>Traceback:</b>\n<code>{html.escape(tb_string)[-2000:]}</code>"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ERROR_LOG_GROUP_ID, text=report, parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        print(f"ERROR LOG GROUP SEND FAILED: {e}")
+
+app.add_error_handler(global_error_handler)
+
+app.add_handler(MessageHandler(
+    filters.StatusUpdate.PINNED_MESSAGE & filters.Chat(BACKUP_CHAT_IDS),
+    delete_pin_service_message,
+))
 
 app.add_handler(CommandHandler("start",          start))
 app.add_handler(CommandHandler("c",              commands_cmd))
