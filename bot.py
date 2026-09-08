@@ -9,6 +9,8 @@ import html
 import tempfile
 import traceback
 from io import BytesIO
+from datetime import time as dt_time
+from zoneinfo import ZoneInfo
 
 # ═══════════════════════════════════════════════════════════════
 # FILE INDEX — where to find things (line numbers approximate;
@@ -342,6 +344,11 @@ SETTINGS_GROUP_ID = -1004423684829
 # versa. Set this up the same way as the others: create a group, add
 # the bot as admin, send /storage_id inside it, paste the ID below.
 LECTURE_RESULTS_GROUP_ID = -1004292587669
+
+# ── Mistakes bank: every wrong lecture answer, pooled across all users ──
+# Feeds the "3 questions you got wrong before" slice of the Daily Quiz.
+# Given by the user directly (already an existing group/channel).
+MISTAKES_BANK_GROUP_ID = -1004394139690
 
 # ── Dedicated group the bot posts crash/error reports to ────────────
 # Not a backup destination like the ones above — just a plain group the
@@ -761,7 +768,7 @@ RESTORE_RETRY_DELAY_BASE  = 4   # seconds; multiplied by attempt number (4s, the
 # fresh/empty local file over the good backup still sitting in the
 # channel. Fixed by a restart once the underlying Telegram/network issue
 # clears (or manually via /restore_analytics etc. for analytics).
-RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "lecture_results": True}
+RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "lecture_results": True, "mistakes_bank": True}
 RESTORE_OK.update({f"quiz_{y}": True for y in YEARS})  # one flag per year's quiz index
 
 async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_found_hint: str | None = None):
@@ -884,6 +891,13 @@ async def restore_analytics_from_channel(app):
 #   "randomize":  bool,  # shuffles question order within a lecture
 #   "achievement_notifs": bool,  # DMs a message when an achievement unlocks
 #                                # (level-up messages are separate and always sent)
+#   "year_class": str | None,  # one of YEAR_CLASS_NUMBER's keys ("y1"/"y2"/"y3") —
+#                              # asked once during onboarding, editable later
+#                              # in Settings. Not the quiz year picker (YEARS) —
+#                              # this is who the person is, for future features
+#                              # that need to know their class/cohort.
+#   "daily_quiz_last_date": str | None,  # "YYYY-MM-DD" — once-per-day gate for
+#                                        # the 💥Daily Quiz💥 button
 # }
 #
 # Mirrors the ANALYTICS system exactly: local JSON file, plus a pinned
@@ -892,6 +906,17 @@ async def restore_analytics_from_channel(app):
 # ═══════════════════════════════════════════════════════════════
 SETTINGS_FILE          = "settings.json"
 SETTINGS_BACKUP_MARKER = "⚙️ QUIZICIAN_SETTINGS_BACKUP"
+
+# Class numbers per academic year, for the onboarding "which year/class are
+# you in?" question. Keyed the same as YEARS ("y1"/"y2"/"y3") so this can
+# reuse year_label() for display, but kept as its own dict since a person's
+# class/cohort is who they are, not which quiz year they're browsing right
+# now — those happen to share y1/y2/y3 today but are conceptually separate.
+YEAR_CLASS_NUMBER = {
+    "y1": 46,
+    "y2": 45,
+    "y3": 44,
+}
 
 def _blank_settings_entry() -> dict:
     return {
@@ -902,6 +927,8 @@ def _blank_settings_entry() -> dict:
         "achievement_notifs": True,
         "question_timer": 0,   # seconds a live quiz poll stays open before
                                 # auto-closing; 0 = off. Cycles 0 -> 60 -> 30 -> 0.
+        "year_class": None,    # "y1"/"y2"/"y3" — see YEAR_CLASS_NUMBER above
+        "daily_quiz_last_date": None,   # "YYYY-MM-DD" (UTC) of the last completed Daily Quiz
     }
 
 def load_settings() -> dict:
@@ -958,6 +985,26 @@ def get_question_timer_seconds(user_id: int) -> int:
     # Defaults to 0 (off) for anyone not yet in SETTINGS — matches
     # _blank_settings_entry()'s default, no backfill required to read.
     return SETTINGS.get(str(user_id), {}).get("question_timer", 0)
+
+def get_year_class(user_id: int) -> str | None:
+    return SETTINGS.get(str(user_id), {}).get("year_class")
+
+def year_class_label(year_class: str | None) -> str:
+    """'Year 1 (Class 46)' style label for a year_class value, or a
+    placeholder if the person hasn't set one yet."""
+    if year_class not in YEAR_CLASS_NUMBER:
+        return "لسه محدد"
+    return f"{year_label(year_class)} (Class {YEAR_CLASS_NUMBER[year_class]})"
+
+def year_class_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
+    """The Year 1/2/3 (Class 46/45/44) picker, reused for both onboarding
+    and the Settings edit flow. callback_prefix distinguishes the two so
+    the button_handler branch knows whether to continue into the welcome
+    menu afterwards or just confirm and return to Settings."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(year_class_label(yc), callback_data=f"{callback_prefix}:{yc}")]
+        for yc in YEAR_ORDER
+    ])
 
 async def backup_settings_to_channel(context):
     global _settings_backup_msg_id, _last_settings_backup_at
@@ -1173,6 +1220,415 @@ async def restore_lecture_results_from_channel(app):
         print(f"Restored lecture results: {len(LECTURE_RESULTS)} lecture(s).")
 
     await _run_restore_with_retries(app, "lecture_results", "Lecture results", _do)
+
+# ═══════════════════════════════════════════════════════════════
+# MISTAKES BANK — every lecture question anyone's ever gotten wrong,
+# pooled across all users/years/subjects, used to seed the "3 questions
+# you got wrong before" slice of the Daily Quiz (see DAILY QUIZ section).
+#
+# mistakes_bank.json schema:
+# [
+#   {
+#     "question": str, "options": [str, ...], "correct_option_id": int,
+#     "explanation": str | None, "year": str, "module": str, "subject": str,
+#   },
+#   ...
+# ]
+#
+# Snapshots are self-contained (full question/options/answer baked in) —
+# deliberately NOT a list of mid/lecture_key references, since a mistake
+# needs to keep working even if the original lecture is later edited or
+# deleted, and it needs to be deliverable without depending on any one
+# year's channel/state at all.
+#
+# Mirrors LECTURE_RESULTS exactly: local JSON file, plus a pinned backup
+# in MISTAKES_BANK_GROUP_ID that gets replaced (upload + pin + delete old
+# pin) on every change and restored from on startup.
+# ═══════════════════════════════════════════════════════════════
+MISTAKES_BANK_FILE          = "mistakes_bank.json"
+MISTAKES_BANK_BACKUP_MARKER = "🗑 QUIZICIAN_MISTAKES_BANK_BACKUP"
+
+def load_mistakes_bank() -> list:
+    if os.path.exists(MISTAKES_BANK_FILE):
+        with open(MISTAKES_BANK_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def save_mistakes_bank():
+    with open(MISTAKES_BANK_FILE, "w", encoding="utf-8") as f:
+        json.dump(MISTAKES_BANK, f, indent=2, ensure_ascii=False)
+
+MISTAKES_BANK: list = load_mistakes_bank()
+
+# Message ID of the currently pinned mistakes-bank backup in
+# MISTAKES_BANK_GROUP_ID. Populated on startup by
+# restore_mistakes_bank_from_channel; the pin is the source of truth.
+_mistakes_bank_backup_msg_id: int | None = None
+
+# Same debounce pattern as lecture results — local save always happens
+# immediately; only the channel mirror is throttled.
+_last_mistakes_bank_backup_at: float = 0.0
+MISTAKES_BANK_BACKUP_MIN_INTERVAL = 5  # seconds
+
+def record_mistake(question: str, options: list, correct_option_id: int,
+                    explanation: str | None, year: str, module: str, subject: str) -> bool:
+    """Adds a wrong-answer snapshot to the bank, deduped by question text +
+    options (so the same question missed by 50 different people over time
+    only ever occupies one slot). Returns whether a new entry was added
+    (False if it was already there — nothing to save/back up in that case)."""
+    for m in MISTAKES_BANK:
+        if m["question"] == question and m["options"] == options:
+            return False
+    MISTAKES_BANK.append({
+        "question": question, "options": options, "correct_option_id": correct_option_id,
+        "explanation": explanation, "year": year, "module": module, "subject": subject,
+    })
+    save_mistakes_bank()
+    return True
+
+async def backup_mistakes_bank_to_channel(context):
+    global _mistakes_bank_backup_msg_id, _last_mistakes_bank_backup_at
+    if not MISTAKES_BANK_GROUP_ID:
+        return
+    if not RESTORE_OK["mistakes_bank"]:
+        print("MISTAKES BANK BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if now - _last_mistakes_bank_backup_at < MISTAKES_BANK_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_mistakes_bank() already has the latest data
+    _last_mistakes_bank_backup_at = now
+    data = json.dumps(MISTAKES_BANK, indent=2).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=MISTAKES_BANK_GROUP_ID,
+            document=InputFile(BytesIO(data), filename="mistakes_bank.json"),
+            caption=MISTAKES_BANK_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("MISTAKES BANK BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=MISTAKES_BANK_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("MISTAKES BANK PIN ERROR:", e)
+    if _mistakes_bank_backup_msg_id and _mistakes_bank_backup_msg_id != sent.message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=MISTAKES_BANK_GROUP_ID,
+                message_id=_mistakes_bank_backup_msg_id,
+            )
+        except Exception:
+            pass
+    _mistakes_bank_backup_msg_id = sent.message_id
+
+async def restore_mistakes_bank_from_channel(app):
+    global _mistakes_bank_backup_msg_id
+    if not MISTAKES_BANK_GROUP_ID:
+        return
+
+    async def _do():
+        global _mistakes_bank_backup_msg_id
+        chat   = await app.bot.get_chat(MISTAKES_BANK_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document:
+            return
+        if (pinned.caption or "") != MISTAKES_BANK_BACKUP_MARKER:
+            return
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        MISTAKES_BANK[:] = json.loads(bytes(raw).decode("utf-8"))
+        save_mistakes_bank()
+        _mistakes_bank_backup_msg_id = pinned.message_id
+        print(f"Restored mistakes bank: {len(MISTAKES_BANK)} question(s).")
+
+    await _run_restore_with_retries(app, "mistakes_bank", "Mistakes bank", _do)
+
+# ═══════════════════════════════════════════════════════════════
+# DAILY QUIZ — 💥Daily Quiz💥: 7 random questions from 7 different
+# subjects (across every configured year), plus 3 random questions from
+# the shared MISTAKES_BANK. Pushed to everyone at 2pm Cairo time once a
+# day (see the job_queue.run_daily call in MAIN); the push itself is just
+# a button — tapping it is what actually starts the quiz and is gated to
+# once per person per day via each user's settings "daily_quiz_last_date".
+#
+# Deliberately its own session type (DAILY_QUIZ_SESSIONS), separate from
+# LECTURE_SESSIONS, rather than shoehorned into the lecture-session shape:
+# a lecture session's dead-poll pruning, legacy-content recovery, and
+# result-recording are all keyed to one specific year+lecture_key, which
+# doesn't make sense for a session mixing many years/lectures/subjects at
+# once. A Daily Quiz question is fully self-contained (question/options/
+# correct_id baked in directly, same shape as a MISTAKES_BANK entry) so
+# delivery never needs to touch any year's live channel/state at all.
+# ═══════════════════════════════════════════════════════════════
+DAILY_QUIZ_SESSIONS = {}   # user_id -> {"queue": [question dict, ...], "current_poll_id",
+                           #             "current_correct_id", "current_message_id",
+                           #             "total", "answered", "correct", "xp_earned"}
+
+DAILY_QUIZ_SUBJECT_COUNT  = 7   # distinct-subject questions
+DAILY_QUIZ_MISTAKES_COUNT = 3   # questions pulled from MISTAKES_BANK
+
+def _daily_quiz_subject_pool() -> dict:
+    """One ready (closed-poll) question per distinct (year, module,
+    subject) group — the pool build_daily_quiz_questions draws its 7
+    "different subjects" slice from. Normally spans every configured
+    year/module; if an admin has set a scope via /daily_module, narrowed
+    to just that one module (still one entry per subject within it, so
+    "7 different subjects" still means what it says). Picks one random
+    mid per subject group from whichever ready lectures have it, so
+    re-running this later in the same process naturally reshuffles which
+    lecture represents a subject if new ones have closed since."""
+    scope = get_daily_quiz_scope()
+    years = [scope["year"]] if scope else configured_years()
+
+    pool = {}   # (year, module, subject) -> [mid, ...]
+    for year in years:
+        if year not in configured_years():
+            continue   # scoped year's channel got unconfigured since — skip rather than crash
+        closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS[year].values() if v["closed"]}
+        modules = [scope["module"]] if scope else ready_modules(year)
+        for module in modules:
+            for subject in ready_subjects(year, module):
+                mids = []
+                for lecture_key in ready_lecture_keys(year, module, subject):
+                    ids = QUIZ_INDEX[year][lecture_key]["ids"]
+                    mids.extend(mid for mid in ids if mid in closed_message_ids)
+                if mids:
+                    pool[(year, module, subject)] = mids
+    return pool
+
+async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid: int, module: str, subject: str) -> dict | None:
+    """Builds a self-contained question dict (same shape as a
+    MISTAKES_BANK entry) from a channel poll's captured content. Returns
+    None if the content was never captured and couldn't be recovered
+    (very old lecture, or the message is gone) — callers skip it."""
+    status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
+    question    = status.get("question")           if status else None
+    options     = status.get("options")             if status else None
+    correct_id  = status.get("correct_option_id")   if status else None
+    explanation = status.get("explanation")         if status else None
+    if not (question and options and correct_id is not None):
+        return None   # legacy/uncaptured content — skip rather than spend a forward+delete recovering it here
+    return {
+        "question": question, "options": options, "correct_option_id": correct_id,
+        "explanation": explanation, "year": year, "module": module, "subject": subject,
+    }
+
+async def build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE) -> list:
+    """The full 10-question set for one Daily Quiz run: up to 7 from
+    distinct subjects (one per subject, so no subject repeats) plus up to
+    3 from MISTAKES_BANK. Falls short of 10 gracefully if there isn't
+    enough ready content yet — callers just get a shorter (or empty) list."""
+    subject_pool = _daily_quiz_subject_pool()
+    subject_keys = list(subject_pool.keys())
+    random.shuffle(subject_keys)
+
+    questions = []
+    for (year, module, subject) in subject_keys[:DAILY_QUIZ_SUBJECT_COUNT]:
+        mid = random.choice(subject_pool[(year, module, subject)])
+        snap = await _snapshot_from_mid(context, year, mid, module, subject)
+        if snap:
+            questions.append(snap)
+
+    if MISTAKES_BANK:
+        questions.extend(random.sample(MISTAKES_BANK, k=min(DAILY_QUIZ_MISTAKES_COUNT, len(MISTAKES_BANK))))
+
+    random.shuffle(questions)
+    return questions
+
+async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
+    """Same idea as _deliver_next_lecture_question, but for a self-
+    contained Daily Quiz question dict — no mid/channel lookups needed,
+    everything required is already sitting in the queue entry. Sets
+    session['current_*']. Returns whether a question went out."""
+    if not session["queue"]:
+        session["current_poll_id"] = None
+        session["current_correct_id"] = None
+        session["current_message_id"] = None
+        return False
+    q = session["queue"].pop(0)
+    timer_seconds = get_question_timer_seconds(user_id)
+    try:
+        msg = await context.bot.send_poll(
+            chat_id=user_id, question=q["question"], options=q["options"],
+            type="quiz", correct_option_id=q["correct_option_id"], is_anonymous=False,
+            explanation=(q.get("explanation") or None),
+            open_period=(timer_seconds or None),
+        )
+    except Exception as e:
+        print(f"Couldn't send daily quiz question: {e}")
+        return await _deliver_next_daily_question(context, user_id, session)   # try the next one
+    session["current_poll_id"]    = msg.poll.id
+    session["current_correct_id"] = q["correct_option_id"]
+    session["current_message_id"] = msg.message_id
+    return True
+
+async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None):
+    """Daily Quiz's counterpart to _advance_lecture_session: same XP
+    (15/5/+25 completion) and same lecture_questions/lecture_streak
+    achievement tracking (a Daily Quiz question is still practice, so it
+    counts toward those same stats) — but no lecture_key, so no dead-poll
+    pruning, no legacy-content recovery, and no _record_lecture_result/
+    leaderboard involvement at all; there's no single lecture for this to
+    be an "attempt" of."""
+    session["answered"] += 1
+    session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+
+    sent_next = await _deliver_next_daily_question(context, user_id, session)
+    is_last   = not sent_next
+
+    per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
+    xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
+
+    events     = _record_activity(user_id)
+    user_entry = _get_entry(user_id)
+    prev_streak = user_entry.get("lecture_correct_streak_current", 0)
+    user_entry["lecture_questions_answered"]  += 1
+    user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
+    user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    if is_correct:
+        user_entry["lecture_correct_streak_current"] += 1
+        if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
+            user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
+    else:
+        user_entry["lecture_correct_streak_current"] = 0
+
+    await _react_to_lecture_answer(
+        context, user_id, message_id,
+        is_correct=is_correct,
+        new_streak=user_entry["lecture_correct_streak_current"],
+        streak_broken=(not is_correct and prev_streak > 0),
+    )
+
+    events["achievements"] += _check_achievements(user_entry, "lecture_questions")
+    events["achievements"] += _check_achievements(user_entry, "lecture_streak")
+
+    _award_xp(user_entry, xp_delta)
+    final_level = _xp_to_level(user_entry["xp"])
+    if final_level > user_entry["level"]:
+        user_entry["level"] = final_level
+        events["level_up"] = final_level
+    save_analytics()
+    await _announce_events(context, user_id, events)
+    await backup_analytics_to_channel(context)
+
+    if is_last:
+        total     = session["total"]
+        correct   = session["correct"]
+        incorrect = session["answered"] - correct
+        pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+        summary = (
+            f"💥 <b>خلصت الـ Daily Quiz!</b>\n\n"
+            f"✅ صح: {correct}\n"
+            f"❌ غلط: {incorrect}\n"
+            f"📊 نسبة: {pct}%\n"
+            f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
+            f"✨ XP: <b>+{session['xp_earned']}</b>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, text=summary, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+                ]]),
+            )
+        except Exception:
+            pass
+        DAILY_QUIZ_SESSIONS.pop(user_id, None)
+
+def get_daily_quiz_last_date(user_id: int) -> str | None:
+    return SETTINGS.get(str(user_id), {}).get("daily_quiz_last_date")
+
+# ── Admin-set Daily Quiz scope ──────────────────────────────────
+# By default the "7 different subjects" slice draws from every configured
+# year/module (see _daily_quiz_subject_pool). An admin can narrow that to
+# one specific module (e.g. whatever's currently being taught) via
+# /daily_module — the 3-mistakes-bank slice is untouched either way, since
+# that's meant to resurface old material regardless of what's current.
+#
+# Stored under a reserved key in SETTINGS (not a per-user key — this is a
+# single global switch) so it rides on the exact same backup/restore path
+# as everything else there, with no new infrastructure needed.
+def get_daily_quiz_scope() -> dict | None:
+    """{"year": ..., "module": ...} to restrict the subject pool to one
+    module, or None for the default (every configured year/module)."""
+    return SETTINGS.get("_daily_quiz_scope")
+
+def set_daily_quiz_scope(year: str | None, module: str | None) -> None:
+    if year and module:
+        SETTINGS["_daily_quiz_scope"] = {"year": year, "module": module}
+    else:
+        SETTINGS.pop("_daily_quiz_scope", None)
+    save_settings()
+
+async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """Shared by the 💥Daily Quiz💥 button and (if ever wanted) any other
+    entry point. message, if given, gets edited with the "starting..."
+    line instead of a fresh message being sent (matches the lecture-start
+    button pattern). Once-per-day gating happens here, keyed off the
+    caller's local calendar date at the time they tap — not the push
+    time — so someone who gets the 2pm ping but taps it at 11pm still
+    only gets today's quiz once."""
+    today = _today()
+    if get_daily_quiz_last_date(user_id) == today:
+        text = "⏳ خلصت الـ Daily Quiz بتاعت النهاردة خلاص — تعالى تاني بكرة!"
+        if message:
+            await message.edit_text(text)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text)
+        return
+
+    questions = await build_daily_quiz_questions(context)
+    if not questions:
+        text = "📭 مفيش أسئلة كفاية جاهزة لعمل Daily Quiz دلوقتي — جرب تاني قريب."
+        if message:
+            await message.edit_text(text)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text)
+        return
+
+    entry = _get_settings_entry(user_id)
+    entry["daily_quiz_last_date"] = today
+    save_settings()
+    await backup_settings_to_channel(context)
+
+    session = {
+        "queue": questions, "current_poll_id": None, "current_correct_id": None,
+        "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
+    }
+    DAILY_QUIZ_SESSIONS[user_id] = session
+
+    text = f"💥 <b>Daily Quiz</b> — {len(questions)} سؤال من مواد مختلفة، هيتبعتولك واحد واحد 👇"
+    if message:
+        await message.edit_text(text, parse_mode=ParseMode.HTML)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
+
+    sent = await _deliver_next_daily_question(context, user_id, session)
+    if not sent:
+        DAILY_QUIZ_SESSIONS.pop(user_id, None)
+        await context.bot.send_message(chat_id=user_id, text="⚠️ حصلت مشكلة في تجهيز الأسئلة — جرب تاني.")
+
+async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
+    """The 2pm-Cairo push (see job_queue.run_daily in MAIN): just a
+    button in each user's chat, not an auto-started quiz — tapping it is
+    what calls start_daily_quiz and applies the once-per-day gate."""
+    for uid in list(USERS):
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text="💥 <b>Daily Quiz</b> جاهزة! جرب 10 أسئلة سريعة.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
+                ]]),
+            )
+        except Exception:
+            pass   # blocked the bot, deactivated account, etc. — skip silently, same as broadcast_cmd
 
 # ═══════════════════════════════════════════════════════════════
 # PASSWORD-GATED STORAGE (private group)
@@ -1952,6 +2408,9 @@ def start_menu_keyboard():
             InlineKeyboardButton("📊 My Stats", callback_data="menu_mystats"),
             InlineKeyboardButton("⚙️ Settings",  callback_data="menu_settings"),
         ],
+        [
+            InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
+        ],
     ])
 
 def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -1963,8 +2422,10 @@ def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     ach_notifs = get_achievement_notifs_enabled(user_id)
     timer      = get_question_timer_seconds(user_id)
     timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
+    yc_label   = year_class_label(get_year_class(user_id))
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
+        [InlineKeyboardButton(f"📚 Year/Class: {yc_label}", callback_data="edit_year_class")],
         [InlineKeyboardButton(f"🎭 Reactions: {_tag(reactions)}", callback_data="toggle_reactions")],
         [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
         [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
@@ -2669,6 +3130,15 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = answer.user.id
     _update_telegram_name(user_id, answer.user)
 
+    daily_session = DAILY_QUIZ_SESSIONS.get(user_id)
+    if daily_session and daily_session.get("current_poll_id") == poll_id:
+        chosen     = answer.option_ids[0] if answer.option_ids else None
+        is_correct = chosen is not None and chosen == daily_session.get("current_correct_id")
+        await _advance_daily_quiz_session(
+            context, user_id, daily_session, is_correct, daily_session.get("current_message_id"),
+        )
+        return
+
     session = LECTURE_SESSIONS.get(user_id)
     if not session:
         return
@@ -2705,6 +3175,19 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
     if not is_correct and mid is not None:
         session.setdefault("wrong_mids", []).append(mid)
+        # Also pool this question into the cross-user mistakes bank, for
+        # the Daily Quiz's "questions you got wrong before" slice. Uses
+        # whatever QUIZ_POLL_STATUS already captured for this poll — the
+        # same content _deliver_next_lecture_question just used to build
+        # the poll the user answered, so it's always present here.
+        year   = session["year"]
+        status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
+        if status and status.get("question") and status.get("options") and status.get("correct_option_id") is not None:
+            if record_mistake(
+                status["question"], status["options"], status["correct_option_id"], status.get("explanation"),
+                year, session["module"], session["subject"],
+            ):
+                await backup_mistakes_bank_to_channel(context)
 
     if session.get("mode") == "batch":
         # Everything was already sent up front — "last" means every
@@ -3422,6 +3905,31 @@ async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
+async def daily_module_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: pick a year, then a module, to restrict the Daily Quiz's
+    "7 different subjects" slice to just that module (e.g. whatever's
+    currently being taught) instead of the whole curriculum. Own
+    callback_data namespace (dqy:/dqm:/dq_scope_off) — deliberately
+    separate from the yr:/module: user-facing browsing flow, since this
+    is a one-time admin scope pick, not lecture navigation."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    years = configured_years()
+    if not years:
+        await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
+        return
+    scope = get_daily_quiz_scope()
+    current = f"\n\nدلوقتي محدد: {year_label(scope['year'])} — {scope['module']}" if scope else "\n\nدلوقتي: كل المنهج (مفيش تحديد)"
+    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"dqy:{y}")] for y in years]
+    if scope:
+        buttons.append([InlineKeyboardButton("🔓 شيل التحديد (رجّع كل المنهج)", callback_data="dq_scope_off")])
+    await update.message.reply_text(
+        f"📚 <b>Daily Quiz — اختار الموديول اللي هيتحدد عليه:</b>{current}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
 def _quiz_year_arg(context) -> tuple[str | None, str | None]:
     """Shared arg-parsing for /quiz_list and /quiz_delete: expects the
     year key as the first arg. Returns (year, error_message)."""
@@ -3546,10 +4054,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
             )
             await update.message.reply_text(
-                f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
-                f"يا {html.escape(nickname)}! تحب تعمل أي؟!:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=start_menu_keyboard(),
+                "📚 وانت في انهي سنة/فرقة؟",
+                reply_markup=year_class_keyboard("onboard_yc"),
             )
         else:
             await update.message.reply_text(
@@ -4285,6 +4791,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if query.data == "edit_year_class":
+        await query.edit_message_text(
+            "📚 وانت في انهي سنة/فرقة؟",
+            reply_markup=year_class_keyboard("set_yc"),
+        )
+        return
+
+    # ── set_yc: / onboard_yc: — year/class picker tap, from Settings or ──
+    # from the onboarding flow (right after the first-ever nickname save).
+    if query.data.startswith("set_yc:") or query.data.startswith("onboard_yc:"):
+        prefix, year_class = query.data.split(":")
+        is_onboarding = (prefix == "onboard_yc")
+        if year_class not in YEAR_CLASS_NUMBER:
+            await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
+            return
+        entry = _get_settings_entry(user_id)
+        entry["year_class"] = year_class
+        save_settings()
+        await backup_settings_to_channel(context)
+        if is_onboarding:
+            nickname = get_nickname(user_id)
+            greeting = f"يا {html.escape(nickname)}! " if nickname else ""
+            await query.edit_message_text(
+                f"✅ تمام، {year_class_label(year_class)}.",
+            )
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+                    f"{greeting}تحب تعمل أي؟!:"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=start_menu_keyboard(),
+            )
+        else:
+            await _send_settings(context, user_id, query.message, edit=True)
+        return
+
     if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize", "toggle_achievement_notifs"):
         key = {
             "toggle_reactions": "reactions",
@@ -4321,6 +4865,75 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
+        return
+
+    if query.data == "daily_quiz":
+        await start_daily_quiz(context, user_id, message=query.message)
+        return
+
+    # ── Admin: /daily_module picker (dqy:/dqm:/dq_scope_off) ─────────
+    if query.data.startswith("dqy:"):
+        if not is_admin(update):
+            await query.edit_message_text(MSG_ADMIN_ONLY)
+            return
+        year = query.data.split(":")[1]
+        if year not in configured_years():
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if not modules:
+            await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
+            return
+        buttons = [[InlineKeyboardButton(module_label(m), callback_data=f"dqm:{year}:{i}")] for i, m in enumerate(modules)]
+        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="daily_module_years")])
+        await query.edit_message_text(
+            f"📚 <b>{year_label(year)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data == "daily_module_years":
+        if not is_admin(update):
+            await query.edit_message_text(MSG_ADMIN_ONLY)
+            return
+        years = configured_years()
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"dqy:{y}")] for y in years]
+        scope = get_daily_quiz_scope()
+        if scope:
+            buttons.append([InlineKeyboardButton("🔓 شيل التحديد (رجّع كل المنهج)", callback_data="dq_scope_off")])
+        await query.edit_message_text(
+            "📚 <b>Daily Quiz — اختار الموديول اللي هيتحدد عليه:</b>",
+            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("dqm:"):
+        if not is_admin(update):
+            await query.edit_message_text(MSG_ADMIN_ONLY)
+            return
+        _, year, mod_idx_str = query.data.split(":")
+        mod_idx = int(mod_idx_str)
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        set_daily_quiz_scope(year, module)
+        await backup_settings_to_channel(context)
+        await query.edit_message_text(
+            f"✅ Daily Quiz دلوقتي محدد على: {year_label(year)} — {module_label(module)}\n\n"
+            f"(الـ 3 أسئلة من الأخطاء القديمة لسه بتيجي من كل حاجة زي ما هي)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if query.data == "dq_scope_off":
+        if not is_admin(update):
+            await query.edit_message_text(MSG_ADMIN_ONLY)
+            return
+        set_daily_quiz_scope(None, None)
+        await backup_settings_to_channel(context)
+        await query.edit_message_text("✅ اتشال التحديد — Daily Quiz دلوقتي بيسحب من المنهج كله تاني.")
         return
 
     # ── EXPORT BUTTONS ──────────────────────────────────────────
@@ -4564,6 +5177,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("/backup_now — instantly refreshes every pinned backup (storage + each year's quiz index)")
         lines.append("/quiz_list &lt;year&gt; — numbered list of every lecture (open and closed) in that year")
         lines.append("/quiz_delete &lt;year&gt; &lt;number&gt; — removes a lecture from that year's index")
+        lines.append("/daily_module — restrict the Daily Quiz's subject pool to one module (or clear the restriction)")
         years_line = ", ".join(f"{y} ({year_label(y)})" for y in YEAR_ORDER)
         lines.append(f"    year keys: {years_line}")
 
@@ -4875,15 +5489,20 @@ async def _post_init(app):
     await restore_analytics_from_channel(app)
     await restore_settings_from_channel(app)
     await restore_lecture_results_from_channel(app)
+    await restore_mistakes_bank_from_channel(app)
 
     if app.job_queue is None:
         print(
-            "⚠️ No JobQueue available — periodic backup reconciliation is "
-            "disabled. Install with: pip install \"python-telegram-bot[job-queue]\""
+            "⚠️ No JobQueue available — periodic backup reconciliation and "
+            "the Daily Quiz push are disabled. Install with: "
+            "pip install \"python-telegram-bot[job-queue]\""
         )
     else:
         app.job_queue.run_repeating(
             _reconcile_backups_job, interval=BACKUP_RECONCILE_INTERVAL, first=BACKUP_RECONCILE_INTERVAL,
+        )
+        app.job_queue.run_daily(
+            _daily_quiz_push_job, time=dt_time(hour=14, minute=0, tzinfo=ZoneInfo("Africa/Cairo")),
         )
 
 # ── Backup reconciliation ────────────────────────────────────────
@@ -4915,6 +5534,7 @@ async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
         ("analytics",       ANALYTICS_GROUP_ID,       ANALYTICS_BACKUP_MARKER,       backup_analytics_to_channel),
         ("settings",        SETTINGS_GROUP_ID,        SETTINGS_BACKUP_MARKER,        backup_settings_to_channel),
         ("lecture_results", LECTURE_RESULTS_GROUP_ID, LECTURE_RESULTS_BACKUP_MARKER, backup_lecture_results_to_channel),
+        ("mistakes_bank",   MISTAKES_BANK_GROUP_ID,   MISTAKES_BANK_BACKUP_MARKER,   backup_mistakes_bank_to_channel),
         ("storage",         STORAGE_GROUP_ID,         STORAGE_BACKUP_MARKER,         backup_storage_to_channel),
     ]
     # One quiz check per configured year, each hitting its own channel.
@@ -5027,6 +5647,7 @@ app.add_handler(CommandHandler("backup_now",     backup_now_cmd))
 # Quiz channel
 app.add_handler(CommandHandler("quiz_channel_id", quiz_channel_id_cmd))
 app.add_handler(CommandHandler("quiz",            quiz_lectures_cmd))
+app.add_handler(CommandHandler("daily_module",     daily_module_cmd))
 app.add_handler(CommandHandler("quiz_list",       quiz_list_cmd))
 app.add_handler(CommandHandler("quiz_delete",     quiz_delete_cmd))
 
