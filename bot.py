@@ -25,7 +25,9 @@ from io import BytesIO
 #  855   LECTURE RESULTS — per-lecture leaderboard (own file + own
 #          backup channel: LECTURE_RESULTS_GROUP_ID)
 # 1003   PASSWORD-GATED STORAGE (private group)
-# 1128   QUIZ CHANNEL (interactive quiz storage, organized by lecture)
+# 1128   QUIZ CHANNELS (per-year: YEARS registry near the top of the file
+#          controls channel_id + curriculum per year; index/state/poll-status/
+#          backup are all keyed by year, e.g. QUIZ_INDEX[year])
 # 1330   STATE (in-memory dicts: LECTURE_SESSIONS, QUIZ_POLL_STATUS, etc.)
 # 1353   CONSTANTS
 # 1362   HELPERS
@@ -44,7 +46,7 @@ from io import BytesIO
 # 2600   QUESTION REVIEW / EDIT (after a question lands in the PDF buffer)
 # 2746   IMAGE HANDLER (PDF mode only)
 # 2911   STORAGE GROUP — AUTO-INDEXING
-# 2992   QUIZ CHANNEL — AUTO-INDEXING
+# 2992   QUIZ CHANNELS — AUTO-INDEXING (year resolved per-message via year_for_chat)
 # 3183   TEXT MESSAGE HANDLER (includes /start's onboarding nickname prompt)
 # 3439   INLINE BUTTON HANDLER (button_handler — all callback_data routing,
 #          including lecture preview/leaderboard, lecture start, and
@@ -193,12 +195,94 @@ ADMIN_ID = 940770584
 #    e.g. -1001234567890). Paste it below.
 STORAGE_GROUP_ID = -1004447646576
 
-# ── Replace with your quiz CHANNEL's chat ID ─────────────────────
-# 1. Create a channel, add this bot as an ADMIN (channels require admin
-#    rights for the bot to receive posts at all).
-# 2. Forward any message from that channel to the bot in a private DM,
-#    then send /quiz_channel_id right after — the bot replies with the ID.
-QUIZ_CHANNEL_ID = -1004402622263
+# ── YEARS — one quiz channel + curriculum per academic year ──────────
+# /quiz now asks "which year?" first, then drills into that year's own
+# modules -> subjects -> lectures, exactly like before. Each year is
+# completely isolated: its own Telegram channel, its own quiz index, its
+# own backup document. That isolation is the whole point — a single
+# combined index/backup eventually outgrows Telegram's practical JSON
+# document size as more years/lectures pile in, so splitting by year
+# keeps each backup small indefinitely instead of one ever-growing file.
+#
+# To add/wire up a year's channel:
+#   1. Create a channel, add this bot as an ADMIN (channels require admin
+#      rights for the bot to receive posts at all).
+#   2. Forward any message from that channel to the bot in a private DM,
+#      then send /quiz_channel_id right after — the bot replies with the ID.
+#   3. Paste that ID below as that year's "channel_id".
+#
+# The old single-channel setup (channel -1004402622263) is kept as Year 3
+# below, repurposed and started fresh — its lecture index/state/poll-status
+# are stored under new "_y3" files, so nothing from the old combined
+# quiz_index.json/quiz_state.json/quiz_poll_status.json carries over.
+YEARS = {
+    "y1": {
+        "label": "Year 1",
+        "channel_id": -1004491934509,
+        "modules": {
+            "Foundation (1)": [
+                "Anatomy 🩻", "Embryology 👶🏼", "Biochemistry 🧬",
+                "Histology 🔬", "Physiology 🧠",
+            ],
+            "Foundation (2)": [
+                "Pathology 🩸", "Pharmacology 💊", "Microbiology 🦠",
+                "Parasitology 🪱", "Communication skills 💬",
+            ],
+            "MSK": [
+                "Anatomy 🩻", "Biochemistry 🧬", "Histology 🔬",
+                "Physiology 🧠", "Pathology 🩸",
+            ],
+            "CVS": [
+                "Physiology 🧠", "Anatomy 🩻", "Pharmacology 💊",
+                "Pathology 🩸", "Histology 🔬", "MP 👨‍⚕️",
+            ],
+        },
+    },
+    "y2": {
+        "label": "Year 2",
+        "channel_id": -1004370807195,
+        "modules": {
+            # TODO: fill in Year 2's modules/subjects, same shape as Year 1/3.
+        },
+    },
+    "y3": {
+        "label": "Year 3",
+        # This is the existing channel, repurposed — starting fresh.
+        "channel_id": -1004402622263,
+        "modules": {
+            "Endocrine":      ["Bio", "Physio", "Patho", "Histo", "Pharma"],
+            "Genitourinary":  ["Anatomy", "Physio", "Histo", "Patho", "Micro"],
+        },
+    },
+}
+# Display order for the /quiz year picker.
+YEAR_ORDER = ["y1", "y2", "y3"]
+
+def year_channel_id(year: str):
+    return YEARS.get(year, {}).get("channel_id")
+
+def year_label(year: str) -> str:
+    return YEARS.get(year, {}).get("label", year)
+
+def year_modules(year: str) -> dict:
+    return YEARS.get(year, {}).get("modules", {})
+
+def year_for_chat(chat_id: int):
+    """Which year (if any) a given chat/channel ID belongs to."""
+    for y, cfg in YEARS.items():
+        if cfg.get("channel_id") == chat_id:
+            return y
+    return None
+
+def configured_years() -> list:
+    """Years that actually have a channel_id set — unset ones (TODOs above)
+    are silently skipped everywhere (year picker, filters, backups, etc.)
+    until someone fills them in."""
+    return [y for y in YEAR_ORDER if YEARS.get(y, {}).get("channel_id")]
+
+# Every configured year's channel ID, e.g. for filters.Chat(...) which
+# accepts either a single ID or a list of them.
+QUIZ_CHANNEL_IDS = [cid for cid in (YEARS[y]["channel_id"] for y in YEARS) if cid]
 
 # ── Dedicated group for analytics JSON backups ────────────────
 # The bot pins the latest analytics.json here after every change
@@ -224,17 +308,13 @@ LECTURE_RESULTS_GROUP_ID = -1004292587669
 # unhandled exception. See the global error handler near app setup.
 ERROR_LOG_GROUP_ID = -1003732733553
 
-# ── Curriculum structure for the quiz channel ─────────────────────
-# Add new modules/subjects here as they come up. Lecture titles posted in
-# the quiz channel must be formatted as:
+# ── Curriculum structure for the quiz channels ─────────────────────
+# Each year in YEARS (above) has its own "modules" dict in this same shape.
+# Lecture titles posted in a year's quiz channel must be formatted as:
 #   "<Module> - <Subject> Lecture <number>: <name>"
 #   e.g. "Endocrine - Physio Lecture 3: Insulin Signaling"
-# Matching against this dict is case-insensitive; the canonical spelling
-# below is what gets stored/displayed.
-MODULES = {
-    "Endocrine":      ["Bio", "Physio", "Patho", "Histo", "Pharma"],
-    "Genitourinary":  ["Anatomy", "Physio", "Histo", "Patho", "Micro"],
-}
+# Matching is case-insensitive; the canonical spelling from that year's
+# "modules" dict is what gets stored/displayed.
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — The Quizician's cat friend 🐾
@@ -318,13 +398,13 @@ USERS_FILE = "users.json"
 
 def load_users():
     if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
     return set()
 
 def save_users():
-    with open(USERS_FILE, "w") as f:
-        json.dump(list(USERS), f)
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(USERS), f, ensure_ascii=False)
 
 USERS = load_users()
 
@@ -462,6 +542,10 @@ def _blank_entry() -> dict:
         "achievements":      {k: 0 for k in ACHIEVEMENTS},
         "telegram_name":     None,   # full display name (first + last), Telegram side
         "telegram_username": None,   # @handle, without the @, or None if not set
+        "nickname":          None,   # bot-side nickname (see SETTINGS/get_nickname) —
+                                      # duplicated here so the analytics backup is
+                                      # readable on its own without cross-referencing
+                                      # the settings backup.
     }
 
 def load_analytics() -> dict:
@@ -471,8 +555,8 @@ def load_analytics() -> dict:
     return {}
 
 def save_analytics():
-    with open(ANALYTICS_FILE, "w") as f:
-        json.dump(ANALYTICS, f, indent=2)
+    with open(ANALYTICS_FILE, "w", encoding="utf-8") as f:
+        json.dump(ANALYTICS, f, indent=2, ensure_ascii=False)
 
 ANALYTICS: dict = load_analytics()
 
@@ -506,16 +590,17 @@ def _get_entry(user_id: int) -> dict:
     return entry
 
 def _update_telegram_name(user_id: int, tg_user) -> None:
-    """Keeps the Telegram display name/username on the analytics entry
-    fresh — people rename themselves on Telegram all the time, so this
-    just overwrites rather than only filling blanks. tg_user is a
-    telegram.User (update.effective_user); no-ops if that's missing."""
+    """Keeps the Telegram display name/username (and bot nickname) on the
+    analytics entry fresh — people rename themselves on Telegram all the
+    time, so this just overwrites rather than only filling blanks. tg_user
+    is a telegram.User (update.effective_user); no-ops if that's missing."""
     if tg_user is None:
         return
     name = " ".join(p for p in (tg_user.first_name, tg_user.last_name) if p).strip() or None
     entry = _get_entry(user_id)
     entry["telegram_name"]     = name
     entry["telegram_username"] = tg_user.username or None
+    entry["nickname"]          = get_nickname(user_id)
 
 def _award_xp(entry: dict, amount: int) -> int:
     """Add XP, recalculate level. Returns new level if levelled up, else 0."""
@@ -635,7 +720,8 @@ RESTORE_RETRY_DELAY_BASE  = 4   # seconds; multiplied by attempt number (4s, the
 # fresh/empty local file over the good backup still sitting in the
 # channel. Fixed by a restart once the underlying Telegram/network issue
 # clears (or manually via /restore_analytics etc. for analytics).
-RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "quiz": True, "lecture_results": True}
+RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "lecture_results": True}
+RESTORE_OK.update({f"quiz_{y}": True for y in YEARS})  # one flag per year's quiz index
 
 async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_found_hint: str | None = None):
     """Runs do_restore() (an async no-arg callable doing the actual
@@ -784,8 +870,8 @@ def load_settings() -> dict:
     return {}
 
 def save_settings():
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(SETTINGS, f, indent=2)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(SETTINGS, f, indent=2, ensure_ascii=False)
 
 SETTINGS: dict = load_settings()
 
@@ -924,8 +1010,8 @@ def load_lecture_results() -> dict:
     return {}
 
 def save_lecture_results():
-    with open(LECTURE_RESULTS_FILE, "w") as f:
-        json.dump(LECTURE_RESULTS, f, indent=2)
+    with open(LECTURE_RESULTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(LECTURE_RESULTS, f, indent=2, ensure_ascii=False)
 
 LECTURE_RESULTS: dict = load_lecture_results()
 
@@ -938,6 +1024,12 @@ _lecture_results_backup_msg_id: int | None = None
 # happens immediately; only the channel mirror is throttled.
 _last_lecture_results_backup_at: float = 0.0
 LECTURE_RESULTS_BACKUP_MIN_INTERVAL = 5  # seconds
+
+def _lr_key(year: str, lecture_key: str) -> str:
+    """LECTURE_RESULTS is one shared file across all years — prefix with
+    the year so two different years never collide even if they happen to
+    reuse the same module/subject/lecture-number/name text."""
+    return f"{year}:{lecture_key}"
 
 def _get_lecture_results(lecture_key: str) -> dict:
     return LECTURE_RESULTS.setdefault(lecture_key, {})
@@ -1051,13 +1143,13 @@ STORAGE_INDEX_FILE = "storage_index.json"
 
 def load_storage_index():
     if os.path.exists(STORAGE_INDEX_FILE):
-        with open(STORAGE_INDEX_FILE, "r") as f:
+        with open(STORAGE_INDEX_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 def save_storage_index():
-    with open(STORAGE_INDEX_FILE, "w") as f:
-        json.dump(STORAGE_INDEX, f)
+    with open(STORAGE_INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump(STORAGE_INDEX, f, ensure_ascii=False)
 
 # password (lowercased) -> list of items; each item is a list of message_ids
 # (a single-message item is [id], an album is [id1, id2, ...]). Reusing the
@@ -1080,13 +1172,13 @@ STORAGE_BACKUP_STATE_FILE = "storage_backup_state.json"
 
 def load_storage_backup_state():
     if os.path.exists(STORAGE_BACKUP_STATE_FILE):
-        with open(STORAGE_BACKUP_STATE_FILE, "r") as f:
+        with open(STORAGE_BACKUP_STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 def save_storage_backup_state():
-    with open(STORAGE_BACKUP_STATE_FILE, "w") as f:
-        json.dump(STORAGE_BACKUP_STATE, f)
+    with open(STORAGE_BACKUP_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(STORAGE_BACKUP_STATE, f, ensure_ascii=False)
 
 STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
 
@@ -1167,36 +1259,47 @@ async def restore_storage_from_channel(app):
     await _run_restore_with_retries(app, "storage", "Storage", _do, not_found_hint=not_found_hint)
 
 # ═══════════════════════════════════════════════════════════════
-# QUIZ CHANNEL (interactive quiz storage, organized by lecture)
+# QUIZ CHANNELS (interactive quiz storage, organized by year -> lecture)
 # ═══════════════════════════════════════════════════════════════
-# Post plain text in QUIZ_CHANNEL_ID to open/resume a lecture (that text
-# becomes the lecture's name), then post quiz polls one by one — each gets
-# filed under the currently-open lecture, in posting order. Post "-END" to
-# close the lecture. Users pick a closed lecture via /quiz and the bot
-# delivers the ORIGINAL polls via copy_messages (fresh, unattributed,
-# independently answerable — no send_poll(), no need to know the answer).
-QUIZ_INDEX_FILE = "quiz_index.json"
+# Post plain text in a year's quiz channel to open/resume a lecture (that
+# text becomes the lecture's name), then post quiz polls one by one — each
+# gets filed under the currently-open lecture, in posting order. Post
+# "-END" to close the lecture. Users pick Year -> Module -> Subject ->
+# Lecture via /quiz and the bot delivers the ready questions as fresh,
+# independently-answerable polls (see _deliver_next_lecture_question).
+#
+# Everything below is keyed by year (one of YEARS' keys, e.g. "y1"/"y3"),
+# with a separate on-disk file and a separate pinned backup document per
+# year — that's the fix for the combined index eventually outgrowing
+# Telegram's practical JSON document size as lectures pile up.
+QUIZ_INDEX_FILE_TMPL = "quiz_index_{year}.json"
 
-def load_quiz_index():
-    if os.path.exists(QUIZ_INDEX_FILE):
-        with open(QUIZ_INDEX_FILE, "r") as f:
+def load_quiz_index(year: str) -> dict:
+    path = QUIZ_INDEX_FILE_TMPL.format(year=year)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-def save_quiz_index():
-    with open(QUIZ_INDEX_FILE, "w") as f:
-        json.dump(QUIZ_INDEX, f)
+def save_quiz_index(year: str):
+    path = QUIZ_INDEX_FILE_TMPL.format(year=year)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(QUIZ_INDEX[year], f, ensure_ascii=False)
 
-QUIZ_INDEX: dict = load_quiz_index()  # lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}
+# year -> {lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}}
+QUIZ_INDEX: dict = {y: load_quiz_index(y) for y in YEARS}
 
 # Matches "<Subject> Lecture <number>", e.g. "Physio Lecture 3"
 _LECTURE_TITLE_RE = re.compile(r"^(.*?)\s+Lecture\s+(\d+)\s*$", re.IGNORECASE)
 
-def parse_lecture_title(text: str):
-    """Parses "<Module> - <Subject> Lecture <number>: <name>" against the
-    MODULES curriculum. Returns (module, subject, lecture_number, name) on
-    success, or (None, None, None, error_message) on failure — matching is
-    case-insensitive but the canonical spelling from MODULES is returned."""
+def parse_lecture_title(year: str, text: str):
+    """Parses "<Module> - <Subject> Lecture <number>: <name>" against this
+    year's curriculum (YEARS[year]["modules"]). Returns
+    (module, subject, lecture_number, name) on success, or
+    (None, None, None, error_message) on failure — matching is
+    case-insensitive but the canonical spelling from that year's modules
+    dict is returned."""
+    modules = year_modules(year)
     if " - " not in text or ":" not in text:
         return None, None, None, (
             "⚠️ الصيغة غلط. لازم تكون:\n"
@@ -1207,9 +1310,9 @@ def parse_lecture_title(text: str):
     subj_lec_part, name = rest.split(":", 1)
     module_part, subj_lec_part, name = module_part.strip(), subj_lec_part.strip(), name.strip()
 
-    module_match = next((m for m in MODULES if m.lower() == module_part.lower()), None)
+    module_match = next((m for m in modules if m.lower() == module_part.lower()), None)
     if not module_match:
-        valid = ", ".join(MODULES.keys())
+        valid = ", ".join(modules.keys())
         return None, None, None, f"⚠️ الموديول \"{module_part}\" مش معروف. الموديولات المتاحة: {valid}"
 
     m = _LECTURE_TITLE_RE.match(subj_lec_part)
@@ -1220,153 +1323,165 @@ def parse_lecture_title(text: str):
             "مثال: <code>Physio Lecture 3</code>"
         )
     subject_part, lecture_number = m.group(1).strip(), m.group(2).strip()
-    subject_match = next((s for s in MODULES[module_match] if s.lower() == subject_part.lower()), None)
+    subject_match = next((s for s in modules[module_match] if s.lower() == subject_part.lower()), None)
     if not subject_match:
-        valid = ", ".join(MODULES[module_match])
+        valid = ", ".join(modules[module_match])
         return None, None, None, f"⚠️ المادة \"{subject_part}\" مش من موديول {module_match}. المواد المتاحة: {valid}"
 
     return module_match, subject_match, lecture_number, name
 
-def ready_modules():
+def ready_modules(year: str):
     # Always show every configured module — even ones with zero lectures
     # posted yet — so the curriculum structure is visible from day one.
-    return list(MODULES.keys())
+    return list(year_modules(year).keys())
 
-def ready_subjects(module: str):
+def ready_subjects(year: str, module: str):
     # Same idea: every subject defined for this module shows up, regardless
     # of whether any lecture has been posted for it yet.
-    return list(MODULES.get(module, []))
+    return list(year_modules(year).get(module, []))
 
-def ready_lecture_keys(module: str, subject: str):
+def ready_lecture_keys(year: str, module: str, subject: str):
     return [
-        name for name, v in QUIZ_INDEX.items()
+        name for name, v in QUIZ_INDEX[year].items()
         if v["closed"] and v["ids"] and v["module"] == module and v["subject"] == subject
     ]  # insertion order = numbering order
 
-QUIZ_STATE_FILE = "quiz_state.json"
+QUIZ_STATE_FILE_TMPL = "quiz_state_{year}.json"
 
-def load_quiz_state():
-    if os.path.exists(QUIZ_STATE_FILE):
-        with open(QUIZ_STATE_FILE, "r") as f:
+def load_quiz_state(year: str) -> dict:
+    path = QUIZ_STATE_FILE_TMPL.format(year=year)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {"current_lecture": None}
 
-def save_quiz_state():
-    with open(QUIZ_STATE_FILE, "w") as f:
-        json.dump(QUIZ_STATE, f)
+def save_quiz_state(year: str):
+    path = QUIZ_STATE_FILE_TMPL.format(year=year)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(QUIZ_STATE[year], f, ensure_ascii=False)
 
-QUIZ_STATE: dict = load_quiz_state()  # survives restarts mid-lecture
+QUIZ_STATE: dict = {y: load_quiz_state(y) for y in YEARS}  # survives restarts mid-lecture, per year
 
-QUIZ_POLL_STATUS_FILE = "quiz_poll_status.json"
+QUIZ_POLL_STATUS_FILE_TMPL = "quiz_poll_status_{year}.json"
 
-def load_quiz_poll_status():
-    if os.path.exists(QUIZ_POLL_STATUS_FILE):
-        with open(QUIZ_POLL_STATUS_FILE, "r") as f:
+def load_quiz_poll_status(year: str) -> dict:
+    path = QUIZ_POLL_STATUS_FILE_TMPL.format(year=year)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-def save_quiz_poll_status():
-    with open(QUIZ_POLL_STATUS_FILE, "w") as f:
-        json.dump(QUIZ_POLL_STATUS, f)
+def save_quiz_poll_status(year: str):
+    path = QUIZ_POLL_STATUS_FILE_TMPL.format(year=year)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(QUIZ_POLL_STATUS[year], f, ensure_ascii=False)
 
-# poll_id -> {"lecture": str, "message_id": int, "closed": bool}
+# year -> {poll_id -> {"lecture": str, "message_id": int, "closed": bool, ...}}
 # Tracks whether each quiz-channel poll has been stopped yet — Telegram
 # only allows copying a quiz poll once its correct answer is known, i.e.
 # once it's been stopped, so this is what /quiz delivery checks against.
-QUIZ_POLL_STATUS: dict = load_quiz_poll_status()
+QUIZ_POLL_STATUS: dict = {y: load_quiz_poll_status(y) for y in YEARS}
 
 # ── Durable backup: same pinned-message trick as the storage group, so
-# the lecture/quiz index survives a host switch or wiped local disk —
-# only the local JSON cache is fragile, the channel content itself never
-# was.
-QUIZ_BACKUP_MARKER     = "🗄 QUIZICIAN_QUIZ_BACKUP"
-QUIZ_BACKUP_STATE_FILE = "quiz_backup_state.json"
+# each year's lecture/quiz index survives a host switch or wiped local
+# disk — only the local JSON cache is fragile, the channel content itself
+# never was. One pinned backup document per year's own channel.
+QUIZ_BACKUP_MARKER          = "🗄 QUIZICIAN_QUIZ_BACKUP"
+QUIZ_BACKUP_STATE_FILE_TMPL = "quiz_backup_state_{year}.json"
 
-def load_quiz_backup_state():
-    if os.path.exists(QUIZ_BACKUP_STATE_FILE):
-        with open(QUIZ_BACKUP_STATE_FILE, "r") as f:
+def load_quiz_backup_state(year: str) -> dict:
+    path = QUIZ_BACKUP_STATE_FILE_TMPL.format(year=year)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-def save_quiz_backup_state():
-    with open(QUIZ_BACKUP_STATE_FILE, "w") as f:
-        json.dump(QUIZ_BACKUP_STATE, f)
+def save_quiz_backup_state(year: str):
+    path = QUIZ_BACKUP_STATE_FILE_TMPL.format(year=year)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(QUIZ_BACKUP_STATE[year], f, ensure_ascii=False)
 
-QUIZ_BACKUP_STATE: dict = load_quiz_backup_state()  # {"backup_msg_id": int}
+QUIZ_BACKUP_STATE: dict = {y: load_quiz_backup_state(y) for y in YEARS}  # year -> {"backup_msg_id": int}
 
-async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE):
-    if not QUIZ_CHANNEL_ID:
+async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE, year: str):
+    channel_id = year_channel_id(year)
+    if not channel_id:
         return
-    if not RESTORE_OK["quiz"]:
-        print("QUIZ BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+    if not RESTORE_OK.get(f"quiz_{year}", True):
+        print(f"QUIZ BACKUP ({year}) SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return
-    payload  = {"quiz_index": QUIZ_INDEX, "quiz_state": QUIZ_STATE, "quiz_poll_status": QUIZ_POLL_STATUS}
+    payload  = {
+        "quiz_index":       QUIZ_INDEX[year],
+        "quiz_state":       QUIZ_STATE[year],
+        "quiz_poll_status": QUIZ_POLL_STATUS[year],
+    }
     data     = json.dumps(payload).encode("utf-8")
-    filename = "quizician_quiz_backup.json"
+    filename = f"quizician_quiz_backup_{year}.json"
 
     # Same approach as storage backup: editing the existing pinned document
     # in place reliably failed with "Can't parse inputmedia: media not
     # found", so instead we send a new one, pin it, then delete the old —
     # still exactly one backup document in the channel at any time.
-    old_msg_id = QUIZ_BACKUP_STATE.get("backup_msg_id")
+    old_msg_id = QUIZ_BACKUP_STATE[year].get("backup_msg_id")
 
     try:
         sent = await context.bot.send_document(
-            chat_id=QUIZ_CHANNEL_ID,
+            chat_id=channel_id,
             document=InputFile(BytesIO(data), filename=filename),
             caption=QUIZ_BACKUP_MARKER,
         )
     except Exception as e:
-        print("QUIZ BACKUP ERROR:", e)
+        print(f"QUIZ BACKUP ({year}) ERROR:", e)
         return
 
     # Same fix as storage backup: persist the message id regardless of
     # whether pinning/deleting-old succeed, so we don't resend a fresh
     # document on every single addition.
-    QUIZ_BACKUP_STATE["backup_msg_id"] = sent.message_id
-    save_quiz_backup_state()
+    QUIZ_BACKUP_STATE[year]["backup_msg_id"] = sent.message_id
+    save_quiz_backup_state(year)
 
     try:
-        await context.bot.pin_chat_message(chat_id=QUIZ_CHANNEL_ID, message_id=sent.message_id, disable_notification=True)
+        await context.bot.pin_chat_message(chat_id=channel_id, message_id=sent.message_id, disable_notification=True)
     except Exception as e:
-        print("QUIZ BACKUP PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
+        print(f"QUIZ BACKUP ({year}) PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
 
     if old_msg_id and old_msg_id != sent.message_id:
         try:
-            await context.bot.delete_message(chat_id=QUIZ_CHANNEL_ID, message_id=old_msg_id)
+            await context.bot.delete_message(chat_id=channel_id, message_id=old_msg_id)
         except Exception as e:
-            print("QUIZ BACKUP OLD-MESSAGE DELETE ERROR (probably already gone, harmless):", e)
+            print(f"QUIZ BACKUP ({year}) OLD-MESSAGE DELETE ERROR (probably already gone, harmless):", e)
 
-async def restore_quiz_from_channel(app):
-    """Runs once on startup — rebuilds the lecture/quiz index from the quiz
-    channel's pinned backup if the local cache is missing/stale."""
-    if not QUIZ_CHANNEL_ID:
+async def restore_quiz_from_channel(app, year: str):
+    """Runs once on startup per year — rebuilds that year's lecture/quiz
+    index from its quiz channel's pinned backup if the local cache is
+    missing/stale."""
+    channel_id = year_channel_id(year)
+    if not channel_id:
         return
 
     async def _do():
-        chat   = await app.bot.get_chat(QUIZ_CHANNEL_ID)
+        chat   = await app.bot.get_chat(channel_id)
         pinned = chat.pinned_message
         if pinned and pinned.document and (pinned.caption or "") == QUIZ_BACKUP_MARKER:
             tg_file = await app.bot.get_file(pinned.document.file_id)
             raw     = await tg_file.download_as_bytearray()
             payload = json.loads(bytes(raw).decode("utf-8"))
-            QUIZ_INDEX.update(payload.get("quiz_index", {}))
-            QUIZ_STATE.update(payload.get("quiz_state", {}))
-            QUIZ_POLL_STATUS.update(payload.get("quiz_poll_status", {}))
-            save_quiz_index()
-            save_quiz_state()
-            save_quiz_poll_status()
-            QUIZ_BACKUP_STATE["backup_msg_id"] = pinned.message_id
-            save_quiz_backup_state()
-            print(f"Restored quiz backup: {len(QUIZ_INDEX)} lecture(s).")
+            QUIZ_INDEX[year].update(payload.get("quiz_index", {}))
+            QUIZ_STATE[year].update(payload.get("quiz_state", {}))
+            QUIZ_POLL_STATUS[year].update(payload.get("quiz_poll_status", {}))
+            save_quiz_index(year)
+            save_quiz_state(year)
+            save_quiz_poll_status(year)
+            QUIZ_BACKUP_STATE[year]["backup_msg_id"] = pinned.message_id
+            save_quiz_backup_state(year)
+            print(f"Restored quiz backup ({year}): {len(QUIZ_INDEX[year])} lecture(s).")
 
     not_found_hint = (
-        f"Chat not found — QUIZ_CHANNEL_ID ({QUIZ_CHANNEL_ID}) isn't a real "
-        "channel this bot knows about. Still the template placeholder, wrong "
-        "ID, or the bot was never added as an admin there. See the setup "
-        "comment above QUIZ_CHANNEL_ID."
+        f"Chat not found — {year}'s channel_id ({channel_id}) isn't a real "
+        "channel this bot knows about. Wrong ID, or the bot was never added "
+        "as an admin there. See the YEARS setup comment near the top of the file."
     )
-    await _run_restore_with_retries(app, "quiz", "Quiz index", _do, not_found_hint=not_found_hint)
+    await _run_restore_with_retries(app, f"quiz_{year}", f"Quiz index ({year})", _do, not_found_hint=not_found_hint)
 
 # ═══════════════════════════════════════════════════════════════
 # STATE
@@ -1387,9 +1502,9 @@ CLARIFY_QUEUE          = {}    # user_id -> list of PDF_BUFFER indices awaiting 
 POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive auto-detection
 PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/"content"/"option", "opt_index": int?}
                                 # awaiting free-text replacement for one field of a just-added question
-LECTURE_SESSIONS       = {}    # user_id -> {"module","subject","lecture_key","queue":[mid,...],
+LECTURE_SESSIONS       = {}    # user_id -> {"year","module","subject","lecture_key","queue":[mid,...],
                                 #             "current_poll_id","total","answered"} — active one-at-a-time delivery
-RETAKE_STAGING         = {}    # user_id -> {"module","subject","lecture_key","mids":[mid,...]}
+RETAKE_STAGING         = {}    # user_id -> {"year","module","subject","lecture_key","mids":[mid,...]}
                                 # — wrong-question mids from a just-finished lecture, offered via the
                                 # "🔁 Retake incorrect questions!" button; consumed (popped) once tapped
 AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is waiting on a nickname reply
@@ -2317,8 +2432,13 @@ async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     poll = update.poll
 
     # ── Quiz-channel poll tracking: mark it closed once stopped ──
-    if poll is not None and poll.id in QUIZ_POLL_STATUS and poll.is_closed:
-        entry = QUIZ_POLL_STATUS[poll.id]
+    # poll.id is a Telegram-generated UUID, unique across all years, so a
+    # linear check across each year's QUIZ_POLL_STATUS is safe/cheap.
+    poll_year = None
+    if poll is not None:
+        poll_year = next((y for y in YEARS if poll.id in QUIZ_POLL_STATUS[y]), None)
+    if poll_year is not None and poll.is_closed:
+        entry = QUIZ_POLL_STATUS[poll_year][poll.id]
         if not entry["closed"]:
             entry["closed"] = True
             if poll.correct_option_ids and entry.get("correct_option_id") is None:
@@ -2331,10 +2451,10 @@ async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             entry["question"]    = poll.question
             entry["options"]     = [o.text for o in poll.options]
             entry["explanation"] = poll.explanation
-            save_quiz_poll_status()
+            save_quiz_poll_status(poll_year)
             try:
                 await context.bot.set_message_reaction(
-                    chat_id=QUIZ_CHANNEL_ID, message_id=entry["message_id"],
+                    chat_id=year_channel_id(poll_year), message_id=entry["message_id"],
                     reaction=[ReactionTypeEmoji("✅")], is_big=False,
                 )
             except Exception:
@@ -2396,21 +2516,22 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
     delivered.
 
     Sets session['current_poll_id']. Returns whether a question went out."""
-    entry = QUIZ_INDEX.get(session["lecture_key"])
+    year  = session["year"]
+    entry = QUIZ_INDEX[year].get(session["lecture_key"])
 
     def _drop_dead(mid: int):
         if entry and mid in entry.get("ids", []):
             entry["ids"].remove(mid)
             if not entry["ids"]:
-                QUIZ_INDEX.pop(session["lecture_key"], None)  # whole lecture was deleted
-        for pid in [pid for pid, v in QUIZ_POLL_STATUS.items() if v["message_id"] == mid]:
-            QUIZ_POLL_STATUS.pop(pid, None)
-        save_quiz_index()
-        save_quiz_poll_status()
+                QUIZ_INDEX[year].pop(session["lecture_key"], None)  # whole lecture was deleted
+        for pid in [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
+            QUIZ_POLL_STATUS[year].pop(pid, None)
+        save_quiz_index(year)
+        save_quiz_poll_status(year)
 
     while session["queue"]:
         mid = session["queue"].pop(0)
-        status = next((v for v in QUIZ_POLL_STATUS.values() if v["message_id"] == mid), None)
+        status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
 
         question    = status.get("question")    if status else None
         options     = status.get("options")      if status else None
@@ -2425,9 +2546,9 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
             # response is just a bare message_id with no poll content at
             # all, so there'd be nothing here to read.
             try:
-                probe = await context.bot.forward_message(chat_id=user_id, from_chat_id=QUIZ_CHANNEL_ID, message_id=mid)
+                probe = await context.bot.forward_message(chat_id=user_id, from_chat_id=year_channel_id(year), message_id=mid)
             except Exception as e:
-                print(f"Quiz question {mid} in lecture '{session['lecture_key']}' unreachable (likely deleted): {e}")
+                print(f"Quiz question {mid} in lecture '{session['lecture_key']}' ({year}) unreachable (likely deleted): {e}")
                 _drop_dead(mid)
                 continue
             if probe.poll and probe.poll.correct_option_ids:
@@ -2438,7 +2559,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
                 if status is not None:
                     status.update(question=question, options=options,
                                    correct_option_id=correct_id, explanation=explanation)
-                    save_quiz_poll_status()
+                    save_quiz_poll_status(year)
             try:
                 await context.bot.delete_message(chat_id=user_id, message_id=probe.message_id)
             except Exception:
@@ -2600,12 +2721,13 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         correct   = session["correct"]
         incorrect = session["answered"] - correct
         pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
-        lecture_name = QUIZ_INDEX.get(session["lecture_key"], {}).get("name", session["lecture_key"])
+        year = session["year"]
+        lecture_name = QUIZ_INDEX[year].get(session["lecture_key"], {}).get("name", session["lecture_key"])
         is_retake = session.get("is_retake", False)
         if not is_retake:
             # Retakes are practice, not a new attempt at the lecture proper —
             # they never touch the leaderboard or best-score file.
-            _record_lecture_result(user_id, session["lecture_key"], correct, session["answered"])
+            _record_lecture_result(user_id, _lr_key(year, session["lecture_key"]), correct, session["answered"])
             await backup_lecture_results_to_channel(context)
         title = "خلصت مراجعة الأسئلة الغلط!" if is_retake else f"خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!"
         summary = (
@@ -2618,12 +2740,12 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         )
         result_buttons = [[
             InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
-            InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_modules"),
+            InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_years"),
         ]]
         wrong_mids = session.get("wrong_mids", [])
         if wrong_mids:
             RETAKE_STAGING[user_id] = {
-                "module": session["module"], "subject": session["subject"],
+                "year": year, "module": session["module"], "subject": session["subject"],
                 "lecture_key": session["lecture_key"], "mids": wrong_mids,
             }
             result_buttons.insert(0, [
@@ -3063,33 +3185,45 @@ async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     await backup_storage_to_channel(context)
-    await backup_quiz_to_channel(context)
-    await update.message.reply_text(
-        "✅ اتعمل باك أب دلوقتي.\n"
-        f"📌 Storage group: {'تم' if STORAGE_BACKUP_STATE.get('backup_msg_id') else 'مش متظبط STORAGE_GROUP_ID'}\n"
-        f"📌 Quiz channel: {'تم' if QUIZ_BACKUP_STATE.get('backup_msg_id') else 'مش متظبط QUIZ_CHANNEL_ID'}"
-    )
+    for y in configured_years():
+        await backup_quiz_to_channel(context, y)
+    lines = [
+        "✅ اتعمل باك أب دلوقتي.",
+        f"📌 Storage group: {'تم' if STORAGE_BACKUP_STATE.get('backup_msg_id') else 'مش متظبط STORAGE_GROUP_ID'}",
+    ]
+    for y in YEAR_ORDER:
+        if not year_channel_id(y):
+            lines.append(f"📌 {year_label(y)}: مش متظبط لسه (مفيش channel_id)")
+            continue
+        ok = bool(QUIZ_BACKUP_STATE[y].get("backup_msg_id"))
+        lines.append(f"📌 {year_label(y)}: {'تم' if ok else 'فشل'}")
+    await update.message.reply_text("\n".join(lines))
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZ CHANNEL — AUTO-INDEXING
 # ═══════════════════════════════════════════════════════════════
 async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Indexes lectures + quiz polls posted in QUIZ_CHANNEL_ID."""
+    """Indexes lectures + quiz polls posted in any year's quiz channel —
+    which year is resolved from the incoming chat id (see year_for_chat)."""
     msg = update.channel_post or update.message
     if not msg:
         return
+    year = year_for_chat(msg.chat.id)
+    if year is None:
+        return  # not one of the configured quiz channels
+    channel_id = year_channel_id(year)
 
     # ── A quiz poll — file it under the currently-open lecture ──
     if msg.poll:
-        current = QUIZ_STATE.get("current_lecture")
-        if not current or current not in QUIZ_INDEX:
+        current = QUIZ_STATE[year].get("current_lecture")
+        if not current or current not in QUIZ_INDEX[year]:
             await context.bot.send_message(
-                QUIZ_CHANNEL_ID,
+                channel_id,
                 "⚠️ محتاج تبعت اسم المحاضرة الأول (أي رسالة نصية) قبل ما تبعت أسئلة."
             )
             return
-        QUIZ_INDEX[current]["ids"].append(msg.message_id)
-        save_quiz_index()
+        QUIZ_INDEX[year][current]["ids"].append(msg.message_id)
+        save_quiz_index(year)
         # Track this poll so we know once it's stopped (only then is the
         # correct answer known — needed before it can be delivered as a
         # lecture question). question/options are captured right away since
@@ -3097,7 +3231,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         # lets lecture delivery build its own poll (see
         # _deliver_next_lecture_question) without depending on a copy of
         # the original, which would stay anonymous forever.
-        QUIZ_POLL_STATUS[msg.poll.id] = {
+        QUIZ_POLL_STATUS[year][msg.poll.id] = {
             "lecture":           current,
             "message_id":        msg.message_id,
             "closed":            msg.poll.is_closed,
@@ -3106,7 +3240,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             "options":           [o.text for o in msg.poll.options],
             "explanation":       msg.poll.explanation,
         }
-        save_quiz_poll_status()
+        save_quiz_poll_status(year)
         # NOTE: the channel backup document + the "still open" reaction are
         # both deliberately deferred to -END (below) instead of happening
         # here per-question — doing them per-question was sending/pinning
@@ -3120,13 +3254,13 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
 
     if text.upper() in ("-END", "-FIN"):
         is_fin = text.upper() == "-FIN"
-        current = QUIZ_STATE.get("current_lecture")
-        if not current or current not in QUIZ_INDEX:
-            await context.bot.send_message(QUIZ_CHANNEL_ID, "⚠️ مفيش محاضرة مفتوحة دلوقتي.")
+        current = QUIZ_STATE[year].get("current_lecture")
+        if not current or current not in QUIZ_INDEX[year]:
+            await context.bot.send_message(channel_id, "⚠️ مفيش محاضرة مفتوحة دلوقتي.")
             return
 
         open_message_ids = [
-            p["message_id"] for p in QUIZ_POLL_STATUS.values()
+            p["message_id"] for p in QUIZ_POLL_STATUS[year].values()
             if p["lecture"] == current and not p["closed"]
         ]
 
@@ -3143,10 +3277,10 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         if is_fin:
             for mid in list(open_message_ids):
                 try:
-                    stopped_poll = await context.bot.stop_poll(chat_id=QUIZ_CHANNEL_ID, message_id=mid)
+                    stopped_poll = await context.bot.stop_poll(chat_id=channel_id, message_id=mid)
                 except Exception:
                     continue
-                for p in QUIZ_POLL_STATUS.values():
+                for p in QUIZ_POLL_STATUS[year].values():
                     if p["message_id"] == mid:
                         p["closed"]            = True
                         p["correct_option_id"] = stopped_poll.correct_option_id
@@ -3154,12 +3288,12 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
                 open_message_ids.remove(mid)
                 auto_stopped += 1
             if auto_stopped:
-                save_quiz_poll_status()
+                save_quiz_poll_status(year)
 
-        QUIZ_INDEX[current]["closed"] = True
-        save_quiz_index()
-        QUIZ_STATE["current_lecture"] = None
-        save_quiz_state()
+        QUIZ_INDEX[year][current]["closed"] = True
+        save_quiz_index(year)
+        QUIZ_STATE[year]["current_lecture"] = None
+        save_quiz_state(year)
 
         # Batched now, once, instead of one reaction call per question:
         # mark every still-open (forgot to Stop Poll) question in this
@@ -3167,16 +3301,16 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         for mid in open_message_ids:
             try:
                 await context.bot.set_message_reaction(
-                    chat_id=QUIZ_CHANNEL_ID, message_id=mid,
+                    chat_id=channel_id, message_id=mid,
                     reaction=[ReactionTypeEmoji("😢")], is_big=False,
                 )
             except Exception:
                 pass
 
         # Single backup for the whole lecture, once it's actually closed.
-        await backup_quiz_to_channel(context)
+        await backup_quiz_to_channel(context, year)
 
-        count = len(QUIZ_INDEX[current]["ids"])
+        count = len(QUIZ_INDEX[year][current]["ids"])
         open_count = len(open_message_ids)
         note = (
             f"\n⚠️ {open_count} سؤال لسه مفتوح — لازم توقف التصويت عليه (Stop Poll) "
@@ -3187,7 +3321,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             note += f"\n🤖 اتقفل {auto_stopped} سؤال تلقائي."
         verb = "اتخلصت" if is_fin else "اتقفلت"
         await context.bot.send_message(
-            QUIZ_CHANNEL_ID,
+            channel_id,
             f"✅ {verb} محاضرة <b>{current}</b> — {count} سؤال.{note}",
             parse_mode=ParseMode.HTML,
         )
@@ -3195,13 +3329,13 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
 
     # New lecture name (or resuming one that already exists).
     # Format: "<Module> - <Subject> Lecture <number>: <name>"
-    module, subject, lecture_number, name_or_error = parse_lecture_title(text)
+    module, subject, lecture_number, name_or_error = parse_lecture_title(year, text)
     if module is None:
-        await context.bot.send_message(QUIZ_CHANNEL_ID, name_or_error, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(channel_id, name_or_error, parse_mode=ParseMode.HTML)
         return
     name = name_or_error
 
-    entry = QUIZ_INDEX.setdefault(text, {
+    entry = QUIZ_INDEX[year].setdefault(text, {
         "ids": [], "closed": False,
         "module": module, "subject": subject, "lecture_number": lecture_number, "name": name,
     })
@@ -3210,13 +3344,13 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
     entry["subject"]        = subject
     entry["lecture_number"] = lecture_number
     entry["name"]           = name
-    save_quiz_index()
-    QUIZ_STATE["current_lecture"] = text
-    save_quiz_state()
-    await backup_quiz_to_channel(context)
+    save_quiz_index(year)
+    QUIZ_STATE[year]["current_lecture"] = text
+    save_quiz_state(year)
+    await backup_quiz_to_channel(context, year)
     await context.bot.send_message(
-        QUIZ_CHANNEL_ID,
-        f"🆕 <b>{module} - {subject} Lecture {lecture_number}: {name}</b>\n"
+        channel_id,
+        f"🆕 <b>[{year_label(year)}] {module} - {subject} Lecture {lecture_number}: {name}</b>\n"
         f"ابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> أو <code>-FIN</code> لما تخلص.\n"
         f"⚠️ لازم توقف كل سؤال (Stop Poll) الأول عشان يبقى قابل للإرسال.",
         parse_mode=ParseMode.HTML,
@@ -3236,60 +3370,88 @@ async def quiz_channel_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User-facing: pick a module, then a subject, then a lecture."""
-    modules = ready_modules()
-    if not modules:
-        await update.message.reply_text("📭 مفيش محاضرات متاحة دلوقتي.")
+    """User-facing: pick a year, then a module, then a subject, then a lecture."""
+    years = configured_years()
+    if not years:
+        await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
         return
-    buttons = [[InlineKeyboardButton(m, callback_data=f"module:{i}")] for i, m in enumerate(modules)]
+    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
     await update.message.reply_text(
-        "📚 <b>اختار الموديول:</b>", parse_mode=ParseMode.HTML,
+        "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
+def _quiz_year_arg(context) -> tuple[str | None, str | None]:
+    """Shared arg-parsing for /quiz_list and /quiz_delete: expects the
+    year key as the first arg. Returns (year, error_message)."""
+    years = configured_years()
+    valid = ", ".join(years) if years else "(مفيش سنين متظبطة)"
+    if not context.args or context.args[0] not in YEARS:
+        return None, f"استخدام: /quiz_list <سنة>\nالسنين المتاحة: {valid}"
+    year = context.args[0]
+    if not year_channel_id(year):
+        return None, f"⚠️ {year_label(year)} لسه مفيهاش channel_id متظبط."
+    return year, None
+
 async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: numbered list of ALL lectures (open + closed) for /quiz_delete."""
+    """Admin: /quiz_list <year> — numbered list of ALL lectures (open +
+    closed) in that year, for /quiz_delete."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
-    if not QUIZ_INDEX:
-        await update.message.reply_text("📭 مفيش محاضرات مسجلة لسه.")
+    year, err = _quiz_year_arg(context)
+    if err:
+        await update.message.reply_text(err)
         return
-    lines = ["📋 <b>كل المحاضرات:</b>"]
-    for i, (key, v) in enumerate(QUIZ_INDEX.items(), 1):
+    index = QUIZ_INDEX[year]
+    if not index:
+        await update.message.reply_text(f"📭 مفيش محاضرات مسجلة لسه في {year_label(year)}.")
+        return
+    lines = [f"📋 <b>كل محاضرات {year_label(year)}:</b>"]
+    for i, (key, v) in enumerate(index.items(), 1):
         status = "✅ مقفولة" if v["closed"] else "🟡 لسه مفتوحة"
         lecnum = f" {v['lecture_number']}" if v.get("lecture_number") else ""
         lines.append(f"{i}. {v['module']} - {v['subject']} Lecture{lecnum}: {v['name']} — {len(v['ids'])} سؤال — {status}")
-    lines.append("\nاستخدم /quiz_delete &lt;رقم&gt; للحذف")
+    lines.append(f"\nاستخدم /quiz_delete {year} &lt;رقم&gt; للحذف")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /quiz_delete <n> — removes a lecture from the index (does not
-    delete the actual channel messages; only stops it showing up in /quiz)."""
+    """Admin: /quiz_delete <year> <n> — removes a lecture from that year's
+    index (does not delete the actual channel messages; only stops it
+    showing up in /quiz)."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("استخدام: /quiz_delete <رقم>\nشوف الأرقام في /quiz_list")
+    years = configured_years()
+    valid = ", ".join(years) if years else "(مفيش سنين متظبطة)"
+    if len(context.args) < 2 or context.args[0] not in YEARS or not context.args[1].isdigit():
+        await update.message.reply_text(
+            f"استخدام: /quiz_delete <سنة> <رقم>\nالسنين المتاحة: {valid}\nشوف الأرقام في /quiz_list <سنة>"
+        )
         return
-    n = int(context.args[0])
-    keys = list(QUIZ_INDEX.keys())
+    year = context.args[0]
+    if not year_channel_id(year):
+        await update.message.reply_text(f"⚠️ {year_label(year)} لسه مفيهاش channel_id متظبط.")
+        return
+    n = int(context.args[1])
+    index = QUIZ_INDEX[year]
+    keys = list(index.keys())
     if n < 1 or n > len(keys):
-        await update.message.reply_text(f"❌ رقم غلط — فيه {len(keys)} محاضرة بس")
+        await update.message.reply_text(f"❌ رقم غلط — فيه {len(keys)} محاضرة بس في {year_label(year)}")
         return
     key = keys[n - 1]
-    removed = QUIZ_INDEX.pop(key)
-    save_quiz_index()
-    if QUIZ_STATE.get("current_lecture") == key:
-        QUIZ_STATE["current_lecture"] = None
-        save_quiz_state()
-    stale_polls = [pid for pid, v in QUIZ_POLL_STATUS.items() if v["lecture"] == key]
+    removed = index.pop(key)
+    save_quiz_index(year)
+    if QUIZ_STATE[year].get("current_lecture") == key:
+        QUIZ_STATE[year]["current_lecture"] = None
+        save_quiz_state(year)
+    stale_polls = [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["lecture"] == key]
     for pid in stale_polls:
-        QUIZ_POLL_STATUS.pop(pid, None)
-    save_quiz_poll_status()
-    await backup_quiz_to_channel(context)
+        QUIZ_POLL_STATUS[year].pop(pid, None)
+    save_quiz_poll_status(year)
+    await backup_quiz_to_channel(context, year)
     await update.message.reply_text(
-        f"🗑 اتشالت محاضرة: {removed['module']} - {removed['subject']}: {removed['name']}\n"
+        f"🗑 اتشالت محاضرة من {year_label(year)}: {removed['module']} - {removed['subject']}: {removed['name']}\n"
         "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)"
     )
 
@@ -3334,6 +3496,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry["nickname"] = nickname
         save_settings()
         await backup_settings_to_channel(context)
+        _get_entry(real_uid)["nickname"] = nickname
+        save_analytics()
+        await backup_analytics_to_channel(context)
         if onboarding:
             await update.message.reply_text(
                 f"✅ اتسجل! هنناديك <b>{html.escape(nickname)}</b> دلوقتي.",
@@ -3557,63 +3722,88 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
-    # ── QUIZ MODULES: top-level list ──────────────────────────────
-    if query.data == "quiz_modules":
-        modules = ready_modules()
-        if not modules:
-            await query.edit_message_text("📭 مفيش محاضرات متاحة دلوقتي.")
+    # ── QUIZ YEARS: top-level list ──────────────────────────────────
+    if query.data == "quiz_years":
+        years = configured_years()
+        if not years:
+            await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
             return
-        buttons = [[InlineKeyboardButton(m, callback_data=f"module:{i}")] for i, m in enumerate(modules)]
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
         await query.edit_message_text(
-            "📚 <b>اختار الموديول:</b>", parse_mode=ParseMode.HTML,
+            "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── YEAR: list modules within one year ──────────────────────────
+    if query.data.startswith("yr:") and query.data.count(":") == 1:
+        year = query.data.split(":")[1]
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if not modules:
+            await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
+            return
+        buttons = [[InlineKeyboardButton(m, callback_data=f"module:{year}:{i}")] for i, m in enumerate(modules)]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="quiz_years")])
+        await query.edit_message_text(
+            f"📚 <b>{year_label(year)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
 
     # ── QUIZ MODULE: list subjects within one module ───────────────
-    if query.data.startswith("module:") and query.data.count(":") == 1:
-        mod_idx = int(query.data.split(":")[1])
-        modules = ready_modules()
+    if query.data.startswith("module:") and query.data.count(":") == 2:
+        _, year, mod_idx_str = query.data.split(":")
+        mod_idx = int(mod_idx_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
         if mod_idx >= len(modules):
             await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
             return
         module = modules[mod_idx]
-        subjects = ready_subjects(module)
+        subjects = ready_subjects(year, module)
         buttons = [
-            [InlineKeyboardButton(s, callback_data=f"subject:{mod_idx}:{i}")]
+            [InlineKeyboardButton(s, callback_data=f"subject:{year}:{mod_idx}:{i}")]
             for i, s in enumerate(subjects)
         ]
-        buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data="quiz_modules")])
+        buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"yr:{year}")])
         await query.edit_message_text(
-            f"🎓 <b>{module}</b> — اختار المادة:", parse_mode=ParseMode.HTML,
+            f"🎓 <b>{year_label(year)} — {module}</b> — اختار المادة:", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
 
     # ── QUIZ SUBJECT: list lectures within one module + subject ────
     if query.data.startswith("subject:"):
-        _, mod_idx_str, subj_idx_str = query.data.split(":")
+        _, year, mod_idx_str, subj_idx_str = query.data.split(":")
         mod_idx, subj_idx = int(mod_idx_str), int(subj_idx_str)
-        modules = ready_modules()
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
         if mod_idx >= len(modules):
             await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
             return
         module = modules[mod_idx]
-        subjects = ready_subjects(module)
+        subjects = ready_subjects(year, module)
         if subj_idx >= len(subjects):
             await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
             return
         subject = subjects[subj_idx]
-        names = ready_lecture_keys(module, subject)
+        names = ready_lecture_keys(year, module, subject)
         buttons = [
             [InlineKeyboardButton(
-                f"Lecture {QUIZ_INDEX[name]['lecture_number'] or (i + 1)}: {QUIZ_INDEX[name]['name']}",
-                callback_data=f"lecture:{mod_idx}:{subj_idx}:{i}",
+                f"Lecture {QUIZ_INDEX[year][name]['lecture_number'] or (i + 1)}: {QUIZ_INDEX[year][name]['name']}",
+                callback_data=f"lecture:{year}:{mod_idx}:{subj_idx}:{i}",
             )]
             for i, name in enumerate(names)
         ]
-        buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"module:{mod_idx}")])
-        header = f"🎓 <b>{module} - {subject}</b>"
+        buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"module:{year}:{mod_idx}")])
+        header = f"🎓 <b>{year_label(year)} — {module} - {subject}</b>"
         if not names:
             header += "\n\n📭 لسه مفيش محاضرات هنا."
         await query.edit_message_text(
@@ -3624,28 +3814,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── LECTURE: show a preview (leaderboard + your stats) before starting ──
     if query.data.startswith("lecture:"):
-        _, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
 
-        modules = ready_modules()
+        modules = ready_modules(year)
         if mod_idx >= len(modules):
             await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
             return
         module = modules[mod_idx]
-        subjects = ready_subjects(module)
+        subjects = ready_subjects(year, module)
         if subj_idx >= len(subjects):
             await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
             return
         subject = subjects[subj_idx]
-        names = ready_lecture_keys(module, subject)
+        names = ready_lecture_keys(year, module, subject)
         if lec_idx >= len(names):
             await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
             return
         lecture_key = names[lec_idx]
-        entry = QUIZ_INDEX[lecture_key]
+        entry = QUIZ_INDEX[year][lecture_key]
+        lr_key = _lr_key(year, lecture_key)
 
-        board = _lecture_leaderboard(lecture_key)
-        lines = [f"🎓 <b>{module} - {subject}: {entry['name']}</b>\n"]
+        board = _lecture_leaderboard(lr_key)
+        lines = [f"🎓 <b>{year_label(year)} — {module} - {subject}: {entry['name']}</b>\n"]
         if board:
             medals = ["🥇", "🥈", "🥉"]
             lines.append("🏆 <b>أفضل النتائج:</b>")
@@ -3658,7 +3852,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append("🏆 محدش خد المحاضرة دي لسه — يلا كن أول واحد!")
 
-        my_result = _get_lecture_results(lecture_key).get(str(user_id))
+        my_result = _get_lecture_results(lr_key).get(str(user_id))
         if my_result:
             lines.append(
                 f"\n📌 أحسن نتيجة ليك: {my_result['best_correct']}/{my_result['best_total']} "
@@ -3666,8 +3860,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         buttons = [
-            [InlineKeyboardButton("▶️ ابدأ المحاضرة", callback_data=f"lecturego:{mod_idx}:{subj_idx}:{lec_idx}")],
-            [InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"subject:{mod_idx}:{subj_idx}")],
+            [InlineKeyboardButton("▶️ ابدأ المحاضرة", callback_data=f"lecturego:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
+            [InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"subject:{year}:{mod_idx}:{subj_idx}")],
         ]
         await query.edit_message_text(
             "\n".join(lines), parse_mode=ParseMode.HTML,
@@ -3677,31 +3871,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── LECTUREGO: start one-at-a-time delivery of a closed lecture's ready quizzes ──
     if query.data.startswith("lecturego:"):
-        _, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
 
-        modules = ready_modules()
+        modules = ready_modules(year)
         if mod_idx >= len(modules):
             await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
             return
         module = modules[mod_idx]
-        subjects = ready_subjects(module)
+        subjects = ready_subjects(year, module)
         if subj_idx >= len(subjects):
             await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
             return
         subject = subjects[subj_idx]
-        names = ready_lecture_keys(module, subject)
+        names = ready_lecture_keys(year, module, subject)
         if lec_idx >= len(names):
             await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
             return
         lecture_key = names[lec_idx]
-        entry = QUIZ_INDEX[lecture_key]
+        entry = QUIZ_INDEX[year][lecture_key]
         ids   = entry["ids"]
 
         # Only polls Telegram has confirmed as stopped are actually
         # deliverable — a quiz poll's correct answer isn't known until
         # it's closed, and we need that to rebuild it as our own poll.
-        closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS.values() if v["closed"]}
+        closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS[year].values() if v["closed"]}
         ready_ids     = [mid for mid in ids if mid in closed_message_ids]
         not_ready_cnt = len(ids) - len(ready_ids)
 
@@ -3718,10 +3915,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             random.shuffle(ready_ids)
 
         auto_next = get_auto_next_enabled(user_id)
-        already_attempted = str(user_id) in _get_lecture_results(lecture_key)
+        lr_key = _lr_key(year, lecture_key)
+        already_attempted = str(user_id) in _get_lecture_results(lr_key)
 
         session = {
-            "module": module, "subject": subject, "lecture_key": lecture_key,
+            "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
             "queue": list(ready_ids), "current_poll_id": None, "current_correct_id": None,
             "total": len(ready_ids), "answered": 0, "correct": 0,
             "mode": "auto" if auto_next else "batch",
@@ -3731,7 +3929,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         LECTURE_SESSIONS[user_id] = session
 
         await query.edit_message_text(
-            f"🎓 <b>{module} - {subject}: {entry['name']}</b> — {len(ready_ids)} سؤال، "
+            f"🎓 <b>{year_label(year)} — {module} - {subject}: {entry['name']}</b> — {len(ready_ids)} سؤال، "
             + ("هيتبعتولك واحد واحد 👇" if auto_next else "هيتبعتولك كلهم دلوقتي 👇")
             + ("\n\n(محاولة تانية — من غير XP)" if already_attempted else ""),
             parse_mode=ParseMode.HTML,
@@ -3750,7 +3948,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 text="⚠️ المحاضرة دي اتحذفت من القناة، فاتشالت من القايمة.",
             )
-            await backup_quiz_to_channel(context)
+            await backup_quiz_to_channel(context, year)
             return
 
         if not_ready_cnt:
@@ -3774,14 +3972,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ مفيش أسئلة غلط اتسجلت — يمكن خلصت المراجعة دي قبل كده.")
             return
 
+        year = staged["year"]
         module, subject, lecture_key = staged["module"], staged["subject"], staged["lecture_key"]
-        entry = QUIZ_INDEX.get(lecture_key, {})
+        entry = QUIZ_INDEX[year].get(lecture_key, {})
         mids  = staged["mids"]
 
         auto_next = get_auto_next_enabled(user_id)
 
         session = {
-            "module": module, "subject": subject, "lecture_key": lecture_key,
+            "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
             "queue": list(mids), "current_poll_id": None, "current_correct_id": None,
             "total": len(mids), "answered": 0, "correct": 0,
             "mode": "auto" if auto_next else "batch",
@@ -3792,7 +3991,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         LECTURE_SESSIONS[user_id] = session
 
         await query.edit_message_text(
-            f"🔁 <b>مراجعة الأسئلة الغلط — {module} - {subject}: {entry.get('name', lecture_key)}</b> — "
+            f"🔁 <b>مراجعة الأسئلة الغلط — {year_label(year)} — {module} - {subject}: {entry.get('name', lecture_key)}</b> — "
             f"{len(mids)} سؤال، "
             + ("هيتبعتولك واحد واحد 👇" if auto_next else "هيتبعتولك كلهم دلوقتي 👇"),
             parse_mode=ParseMode.HTML,
@@ -3811,7 +4010,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 text="⚠️ الأسئلة دي اتحذفت من القناة، فاتشالت من قايمة المراجعة.",
             )
-            await backup_quiz_to_channel(context)
+            await backup_quiz_to_channel(context, year)
         return
 
     # ── CLARIFY: manual correct-answer button tap ────────────────
@@ -4072,13 +4271,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "menu_quizzes":
         # Same as typing /quiz — sends a fresh message (not an edit) so the
         # welcome message with its buttons stays intact above it.
-        modules = ready_modules()
-        if not modules:
-            await query.message.reply_text("📭 مفيش محاضرات متاحة دلوقتي.")
+        years = configured_years()
+        if not years:
+            await query.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
             return
-        buttons = [[InlineKeyboardButton(m, callback_data=f"module:{i}")] for i, m in enumerate(modules)]
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
         await query.message.reply_text(
-            "📚 <b>اختار الموديول:</b>", parse_mode=ParseMode.HTML,
+            "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
@@ -4312,18 +4511,20 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("/pdf_generate — builds a PDF from the images you've collected")
     lines.append("/pdf_clear — clears the current PDF session")
     lines.append("/cancel — cancels whatever's currently in progress (PDF, pending image, etc.)")
-    lines.append("/quiz — browse lectures (module → subject → lecture) and pull their questions")
+    lines.append("/quiz — browse lectures (year → module → subject → lecture) and pull their questions")
     lines.append("/storage_id — gets this chat's ID (for setting STORAGE_GROUP_ID or LECTURE_RESULTS_GROUP_ID)")
-    lines.append("/quiz_channel_id — gets the quiz channel's chat ID (forward a message from it first)")
+    lines.append("/quiz_channel_id — gets a quiz channel's chat ID (forward a message from it first)")
     lines.append("/c — this list")
 
     if is_admin(update):
         lines.append("\n🔐 <b>Admin only</b>")
         lines.append("/admincheck — confirms you're an admin")
         lines.append("/broadcast &lt;message&gt; — sends a message to every user")
-        lines.append("/backup_now — instantly refreshes the pinned backup (storage + quiz)")
-        lines.append("/quiz_list — numbered list of every lecture (open and closed)")
-        lines.append("/quiz_delete &lt;number&gt; — removes a lecture from the index")
+        lines.append("/backup_now — instantly refreshes every pinned backup (storage + each year's quiz index)")
+        lines.append("/quiz_list &lt;year&gt; — numbered list of every lecture (open and closed) in that year")
+        lines.append("/quiz_delete &lt;year&gt; &lt;number&gt; — removes a lecture from that year's index")
+        years_line = ", ".join(f"{y} ({year_label(y)})" for y in YEAR_ORDER)
+        lines.append(f"    year keys: {years_line}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -4525,7 +4726,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🏆 Achievements", callback_data="view_achievements"),
-            InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_modules"),
+            InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_years"),
             InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home"),
         ]]),
     )
@@ -4624,11 +4825,12 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _post_init(app):
     """Runs once after the bot connects, before polling starts — restores
-    the storage-group and quiz-channel indexes from their pinned backup
-    messages, so a wiped/switched local disk doesn't orphan content that's
-    still sitting safely in the channels themselves."""
+    the storage-group and each year's quiz-channel indexes from their
+    pinned backup messages, so a wiped/switched local disk doesn't orphan
+    content that's still sitting safely in the channels themselves."""
     await restore_storage_from_channel(app)
-    await restore_quiz_from_channel(app)
+    for y in configured_years():
+        await restore_quiz_from_channel(app, y)
     await restore_analytics_from_channel(app)
     await restore_settings_from_channel(app)
     await restore_lecture_results_from_channel(app)
@@ -4654,10 +4856,11 @@ async def _post_init(app):
 # another reactive backup.
 #
 # This job runs on a short timer instead of waiting for the next change:
-# every BACKUP_RECONCILE_INTERVAL seconds, for each of the five backup
-# systems (analytics, settings, lecture results, storage, quiz index), it checks whether the channel's current pin still matches the
-# caption marker we expect. If the pin is missing, or belongs to a
-# different marker (e.g. our own backup got unpinned by someone, or a
+# every BACKUP_RECONCILE_INTERVAL seconds, for each backup system
+# (analytics, settings, lecture results, storage, and each configured
+# year's quiz index), it checks whether the channel's current pin still
+# matches the caption marker we expect. If the pin is missing, or belongs
+# to a different marker (e.g. our own backup got unpinned by someone, or a
 # delete-old-pin call left a stale one pinned instead), it just re-runs
 # that system's normal backup_*_to_channel() — which re-uploads,
 # re-pins, and cleans up the old message the same way it always does.
@@ -4672,8 +4875,13 @@ async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
         ("settings",        SETTINGS_GROUP_ID,        SETTINGS_BACKUP_MARKER,        backup_settings_to_channel),
         ("lecture_results", LECTURE_RESULTS_GROUP_ID, LECTURE_RESULTS_BACKUP_MARKER, backup_lecture_results_to_channel),
         ("storage",         STORAGE_GROUP_ID,         STORAGE_BACKUP_MARKER,         backup_storage_to_channel),
-        ("quiz",            QUIZ_CHANNEL_ID,          QUIZ_BACKUP_MARKER,            backup_quiz_to_channel),
     ]
+    # One quiz check per configured year, each hitting its own channel.
+    for y in configured_years():
+        checks.append((
+            f"quiz_{y}", year_channel_id(y), QUIZ_BACKUP_MARKER,
+            (lambda ctx, year=y: backup_quiz_to_channel(ctx, year)),
+        ))
     for key, group_id, marker, backup_fn in checks:
         if not group_id or not RESTORE_OK.get(key, True):
             continue   # not configured, or restore already failed this session — leave it alone
@@ -4704,7 +4912,7 @@ async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
 # too, since Telegram doesn't tell us who did the pinning.
 # ═══════════════════════════════════════════════════════════════
 BACKUP_CHAT_IDS = [c for c in (
-    STORAGE_GROUP_ID, QUIZ_CHANNEL_ID, ANALYTICS_GROUP_ID,
+    STORAGE_GROUP_ID, *QUIZ_CHANNEL_IDS, ANALYTICS_GROUP_ID,
     SETTINGS_GROUP_ID, LECTURE_RESULTS_GROUP_ID,
 ) if c]
 
@@ -4783,14 +4991,14 @@ app.add_handler(CommandHandler("quiz_delete",     quiz_delete_cmd))
 
 # Poll handler before text handler (forwarded OR own quiz polls) —
 # excludes the quiz channel, which has its own dedicated handler below.
-app.add_handler(MessageHandler(filters.POLL & ~filters.Chat(QUIZ_CHANNEL_ID), handle_poll))
+app.add_handler(MessageHandler(filters.POLL & ~filters.Chat(QUIZ_CHANNEL_IDS), handle_poll))
 
 # Quiz channel indexing — lecture titles, "-END", and quiz polls posted
 # there get filed by handle_quiz_channel_message, not treated as a user's
 # own quiz-building activity. Must be registered before the generic
 # text/poll handlers below.
 app.add_handler(MessageHandler(
-    filters.Chat(QUIZ_CHANNEL_ID) & (filters.POLL | filters.TEXT), handle_quiz_channel_message
+    filters.Chat(QUIZ_CHANNEL_IDS) & (filters.POLL | filters.TEXT), handle_quiz_channel_message
 ))
 
 # Storage group indexing — anything posted in the vault group gets filed by
@@ -4814,14 +5022,14 @@ app.add_handler(MessageHandler(
 # different mime/extension entirely; excludes the storage group and quiz channel.
 app.add_handler(MessageHandler(
     (filters.Document.FileExtension("ttf") | filters.Document.FileExtension("otf"))
-    & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_ID),
+    & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_IDS),
     handle_font_upload,
 ))
 
 # PDF handler — captioned PDFs in a private DM are parsed as manual MCQs;
 # excludes the storage group and quiz channel.
 app.add_handler(MessageHandler(
-    filters.Document.PDF & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_ID), handle_document
+    filters.Document.PDF & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_IDS), handle_document
 ))
 
 # Inline buttons
@@ -4831,7 +5039,7 @@ app.add_handler(PollAnswerHandler(handle_poll_answer))
 
 # Text handler last — excludes the storage group and the quiz channel
 app.add_handler(MessageHandler(
-    filters.TEXT & ~filters.COMMAND & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_ID), handle
+    filters.TEXT & ~filters.COMMAND & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_IDS), handle
 ))
 
 def _print_startup_banner():
