@@ -13,44 +13,53 @@ from io import BytesIO
 # FILE INDEX — where to find things (line numbers approximate;
 # section banners below are exact and searchable).
 # ═══════════════════════════════════════════════════════════════
-#   47   FONT SETUP
-#  164   QUIZZY — The Quizician's cat friend (persona/flavor text)
-#  208   BOT MESSAGES — every user-facing string, in one place
-#  239   USERS STORAGE
-#  256   ANALYTICS — XP · LEVELS · ACHIEVEMENTS
-#  651   SETTINGS — per-user personalization (nickname, reactions,
-#                    auto_next, randomize)
-#  786   PASSWORD-GATED STORAGE (private group)
-#  911   QUIZ CHANNEL (interactive quiz storage, organized by lecture)
-# 1113   STATE (in-memory dicts: LECTURE_SESSIONS, QUIZ_POLL_STATUS, etc.)
-# 1136   CONSTANTS
-# 1145   HELPERS
-# 1307   QUIZ DELIVERY (single source of truth for sending a live quiz poll)
-# 1409   PROGRESS MESSAGE BUILDER
-# 1473   KEYBOARD HELPERS (main menu, settings menu, etc.)
-# 1547   MENU TEXT CONTENT
-# 1572   PDF BUILDER
-# 1709   DOCX BUILDER
-# 1968   REACTIONS (react_random, lecture-answer streak reactions)
-# 2024   SLEEP / WAKE COMMANDS
-# 2036   PASSIVE ANSWER BACKFILL / LECTURE DELIVERY + SESSION LOGIC
+#   94   FONT SETUP
+#  219   QUIZZY — The Quizician's cat friend (persona/flavor text)
+#  263   BOT MESSAGES — every user-facing string, in one place
+#  294   USERS STORAGE
+#  311   ANALYTICS — XP · LEVELS · ACHIEVEMENTS (also: telegram_name /
+#          telegram_username via _update_telegram_name)
+#  720   SETTINGS — per-user personalization (nickname, reactions,
+#          auto_next, randomize)
+#  855   LECTURE RESULTS — per-lecture leaderboard (own file + own
+#          backup channel: LECTURE_RESULTS_GROUP_ID)
+# 1003   PASSWORD-GATED STORAGE (private group)
+# 1128   QUIZ CHANNEL (interactive quiz storage, organized by lecture)
+# 1330   STATE (in-memory dicts: LECTURE_SESSIONS, QUIZ_POLL_STATUS, etc.)
+# 1353   CONSTANTS
+# 1362   HELPERS
+# 1524   QUIZ DELIVERY (single source of truth for sending a live quiz poll)
+# 1626   PROGRESS MESSAGE BUILDER
+# 1690   KEYBOARD HELPERS (main menu, settings menu, etc.)
+# 1764   MENU TEXT CONTENT
+# 1789   PDF BUILDER
+# 1926   DOCX BUILDER
+# 2185   REACTIONS (react_random, lecture-answer streak reactions)
+# 2241   SLEEP / WAKE COMMANDS
+# 2253   PASSIVE ANSWER BACKFILL / LECTURE DELIVERY + SESSION LOGIC
 #          — _deliver_next_lecture_question, _deliver_all_lecture_questions,
 #            handle_poll_answer, _advance_lecture_session
-# 2339   FORWARDED POLL HANDLER
-# 2378   QUESTION REVIEW / EDIT (after a question lands in the PDF buffer)
-# 2524   IMAGE HANDLER (PDF mode only)
-# 2687   STORAGE GROUP — AUTO-INDEXING
-# 2768   QUIZ CHANNEL — AUTO-INDEXING
-# 2959   TEXT MESSAGE HANDLER
-# 3191   INLINE BUTTON HANDLER (button_handler — all callback_data routing,
-#          including lecture selection/start and settings toggles)
-# 3630   PDF/DOCX EXPORT (single source of truth, called from both PDF
+# 2561   FORWARDED POLL HANDLER
+# 2600   QUESTION REVIEW / EDIT (after a question lands in the PDF buffer)
+# 2746   IMAGE HANDLER (PDF mode only)
+# 2911   STORAGE GROUP — AUTO-INDEXING
+# 2992   QUIZ CHANNEL — AUTO-INDEXING
+# 3183   TEXT MESSAGE HANDLER (includes /start's onboarding nickname prompt)
+# 3439   INLINE BUTTON HANDLER (button_handler — all callback_data routing,
+#          including lecture preview/leaderboard, lecture start, and
+#          settings toggles)
+# 3934   PDF/DOCX EXPORT (single source of truth, called from both PDF
 #          commands and quiz-channel exports)
-# 3732   PDF COMMANDS
-# 3772   START (also wakes bot from sleep)
-# 3822   ADMIN HELPERS
-# 3843   BROADCAST COMMAND (admin only)
-# 3920   MAIN
+# 4037   PDF COMMANDS
+# 4077   START (also wakes bot from sleep; asks for a nickname on first use)
+# 4141   ADMIN HELPERS
+# 4162   BROADCAST COMMAND (admin only)
+# 4239   MAIN — also where _reconcile_backups_job lives: a
+#          job_queue.run_repeating() job (every BACKUP_RECONCILE_INTERVAL
+#          seconds) that re-checks each backup channel's pin and
+#          re-uploads if it's out of sync, so a missed pin/delete on the
+#          reactive path gets caught within a few seconds instead of
+#          waiting for the next real data change.
 #
 # NOTE: line numbers drift as the file grows — treat them as "roughly
 # here", and confirm with a grep for the section banner text if unsure.
@@ -195,6 +204,14 @@ ANALYTICS_GROUP_ID = -1003767364410
 # Same pin-and-replace pattern as ANALYTICS_GROUP_ID, but for
 # per-user personalization settings (nickname, etc).
 SETTINGS_GROUP_ID = -1004423684829
+
+# ── Dedicated group for per-lecture leaderboard/results JSON backups ──
+# Same pin-and-replace pattern as ANALYTICS_GROUP_ID, kept in its own
+# group (rather than folded into ANALYTICS_GROUP_ID) so a growing
+# leaderboard file never risks the analytics backup itself, and vice
+# versa. Set this up the same way as the others: create a group, add
+# the bot as admin, send /storage_id inside it, paste the ID below.
+LECTURE_RESULTS_GROUP_ID = 0  # ⚠️ set this to your group's chat ID
 
 # ── Curriculum structure for the quiz channel ─────────────────────
 # Add new modules/subjects here as they come up. Lecture titles posted in
@@ -432,6 +449,8 @@ def _blank_entry() -> dict:
         "xp":                0,
         "level":             0,
         "achievements":      {k: 0 for k in ACHIEVEMENTS},
+        "telegram_name":     None,   # full display name (first + last), Telegram side
+        "telegram_username": None,   # @handle, without the @, or None if not set
     }
 
 def load_analytics() -> dict:
@@ -475,55 +494,17 @@ def _get_entry(user_id: int) -> dict:
         entry["achievements"].setdefault(k, 0)
     return entry
 
-# ── Per-lecture results, for the leaderboard shown before a user confirms
-# they want to start a lecture. Lives under a reserved key inside
-# ANALYTICS (rather than its own file) purely so it rides along on the
-# exact same save/backup/restore machinery as everything else here — no
-# separate persistence path to keep in sync.
-#   ANALYTICS["_lecture_results"][lecture_key][str(user_id)] = {
-#       "best_correct": int, "best_total": int, "best_pct": int,
-#       "attempts": int, "last_at": "YYYY-MM-DD",
-#   }
-def _get_lecture_results(lecture_key: str) -> dict:
-    store = ANALYTICS.setdefault("_lecture_results", {})
-    return store.setdefault(lecture_key, {})
-
-def _record_lecture_result(user_id: int, lecture_key: str, correct: int, total: int) -> None:
-    if total <= 0:
+def _update_telegram_name(user_id: int, tg_user) -> None:
+    """Keeps the Telegram display name/username on the analytics entry
+    fresh — people rename themselves on Telegram all the time, so this
+    just overwrites rather than only filling blanks. tg_user is a
+    telegram.User (update.effective_user); no-ops if that's missing."""
+    if tg_user is None:
         return
-    results = _get_lecture_results(lecture_key)
-    key     = str(user_id)
-    pct     = round(correct / total * 100)
-    prev    = results.get(key)
-    if prev is None or pct > prev.get("best_pct", -1) or (
-        pct == prev.get("best_pct", -1) and correct > prev.get("best_correct", -1)
-    ):
-        best_correct, best_total, best_pct = correct, total, pct
-    else:
-        best_correct, best_total, best_pct = prev["best_correct"], prev["best_total"], prev["best_pct"]
-    results[key] = {
-        "best_correct": best_correct,
-        "best_total":   best_total,
-        "best_pct":     best_pct,
-        "attempts":     (prev.get("attempts", 0) if prev else 0) + 1,
-        "last_at":      _today(),
-    }
-
-def _lecture_leaderboard(lecture_key: str, limit: int = 10) -> list[dict]:
-    """Top attempts for this lecture, best % first (ties broken by more
-    correct answers, then earlier last_at). Each row also carries the
-    nickname (falling back to a generic label if the user never set one)."""
-    results = _get_lecture_results(lecture_key)
-    rows = []
-    for uid_str, r in results.items():
-        uid = int(uid_str)
-        rows.append({
-            "user_id":  uid,
-            "nickname": get_nickname(uid) or f"مستخدم #{uid % 10000}",
-            **r,
-        })
-    rows.sort(key=lambda r: (-r["best_pct"], -r["best_correct"], r["last_at"]))
-    return rows[:limit]
+    name = " ".join(p for p in (tg_user.first_name, tg_user.last_name) if p).strip() or None
+    entry = _get_entry(user_id)
+    entry["telegram_name"]     = name
+    entry["telegram_username"] = tg_user.username or None
 
 def _award_xp(entry: dict, amount: int) -> int:
     """Add XP, recalculate level. Returns new level if levelled up, else 0."""
@@ -635,7 +616,7 @@ RESTORE_RETRY_DELAY_BASE  = 4   # seconds; multiplied by attempt number (4s, the
 # fresh/empty local file over the good backup still sitting in the
 # channel. Fixed by a restart once the underlying Telegram/network issue
 # clears (or manually via /restore_analytics etc. for analytics).
-RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "quiz": True}
+RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "quiz": True, "lecture_results": True}
 
 async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_found_hint: str | None = None):
     """Runs do_restore() (an async no-arg callable doing the actual
@@ -879,6 +860,154 @@ async def restore_settings_from_channel(app):
         print(f"Restored settings: {len(SETTINGS)} user(s).")
 
     await _run_restore_with_retries(app, "settings", "Settings", _do)
+
+# ═══════════════════════════════════════════════════════════════
+# LECTURE RESULTS — per-lecture leaderboard, shown before a user
+# confirms they want to start a lecture.
+#
+# lecture_results.json schema:
+# {
+#   lecture_key: {
+#     str(user_id): {
+#       "best_correct": int, "best_total": int, "best_pct": int,
+#       "attempts": int, "last_at": "YYYY-MM-DD",
+#     }
+#   }
+# }
+#
+# Mirrors ANALYTICS/SETTINGS exactly: local JSON file, plus a pinned
+# backup in LECTURE_RESULTS_GROUP_ID that gets replaced (upload + pin +
+# delete old pin) on every change and restored from on startup. Kept in
+# its own file/channel rather than folded into ANALYTICS so this
+# leaderboard data (which will keep growing lecture over lecture) never
+# risks the analytics backup, and vice versa.
+# ═══════════════════════════════════════════════════════════════
+LECTURE_RESULTS_FILE          = "lecture_results.json"
+LECTURE_RESULTS_BACKUP_MARKER = "🏆 QUIZICIAN_LECTURE_RESULTS_BACKUP"
+
+def load_lecture_results() -> dict:
+    if os.path.exists(LECTURE_RESULTS_FILE):
+        with open(LECTURE_RESULTS_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_lecture_results():
+    with open(LECTURE_RESULTS_FILE, "w") as f:
+        json.dump(LECTURE_RESULTS, f, indent=2)
+
+LECTURE_RESULTS: dict = load_lecture_results()
+
+# Message ID of the currently pinned lecture-results backup in
+# LECTURE_RESULTS_GROUP_ID. Populated on startup by
+# restore_lecture_results_from_channel; the pin is the source of truth.
+_lecture_results_backup_msg_id: int | None = None
+
+# Same debounce pattern as analytics/settings — local save always
+# happens immediately; only the channel mirror is throttled.
+_last_lecture_results_backup_at: float = 0.0
+LECTURE_RESULTS_BACKUP_MIN_INTERVAL = 5  # seconds
+
+def _get_lecture_results(lecture_key: str) -> dict:
+    return LECTURE_RESULTS.setdefault(lecture_key, {})
+
+def _record_lecture_result(user_id: int, lecture_key: str, correct: int, total: int) -> None:
+    if total <= 0:
+        return
+    results = _get_lecture_results(lecture_key)
+    key     = str(user_id)
+    pct     = round(correct / total * 100)
+    prev    = results.get(key)
+    if prev is None or pct > prev.get("best_pct", -1) or (
+        pct == prev.get("best_pct", -1) and correct > prev.get("best_correct", -1)
+    ):
+        best_correct, best_total, best_pct = correct, total, pct
+    else:
+        best_correct, best_total, best_pct = prev["best_correct"], prev["best_total"], prev["best_pct"]
+    results[key] = {
+        "best_correct": best_correct,
+        "best_total":   best_total,
+        "best_pct":     best_pct,
+        "attempts":     (prev.get("attempts", 0) if prev else 0) + 1,
+        "last_at":      _today(),
+    }
+    save_lecture_results()
+
+def _lecture_leaderboard(lecture_key: str, limit: int = 10) -> list[dict]:
+    """Top attempts for this lecture, best % first (ties broken by more
+    correct answers, then earlier last_at). Each row also carries the
+    nickname (falling back to a generic label if the user never set one)."""
+    results = _get_lecture_results(lecture_key)
+    rows = []
+    for uid_str, r in results.items():
+        uid = int(uid_str)
+        rows.append({
+            "user_id":  uid,
+            "nickname": get_nickname(uid) or f"مستخدم #{uid % 10000}",
+            **r,
+        })
+    rows.sort(key=lambda r: (-r["best_pct"], -r["best_correct"], r["last_at"]))
+    return rows[:limit]
+
+async def backup_lecture_results_to_channel(context):
+    global _lecture_results_backup_msg_id, _last_lecture_results_backup_at
+    if not LECTURE_RESULTS_GROUP_ID:
+        return
+    if not RESTORE_OK["lecture_results"]:
+        print("LECTURE RESULTS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if now - _last_lecture_results_backup_at < LECTURE_RESULTS_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_lecture_results() already has the latest data
+    _last_lecture_results_backup_at = now
+    data = json.dumps(LECTURE_RESULTS, indent=2).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=LECTURE_RESULTS_GROUP_ID,
+            document=InputFile(BytesIO(data), filename="lecture_results.json"),
+            caption=LECTURE_RESULTS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("LECTURE RESULTS BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=LECTURE_RESULTS_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("LECTURE RESULTS PIN ERROR:", e)
+    if _lecture_results_backup_msg_id and _lecture_results_backup_msg_id != sent.message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=LECTURE_RESULTS_GROUP_ID,
+                message_id=_lecture_results_backup_msg_id,
+            )
+        except Exception:
+            pass
+    _lecture_results_backup_msg_id = sent.message_id
+
+async def restore_lecture_results_from_channel(app):
+    global _lecture_results_backup_msg_id
+    if not LECTURE_RESULTS_GROUP_ID:
+        return
+
+    async def _do():
+        global _lecture_results_backup_msg_id
+        chat   = await app.bot.get_chat(LECTURE_RESULTS_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document:
+            return
+        if (pinned.caption or "") != LECTURE_RESULTS_BACKUP_MARKER:
+            return
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        LECTURE_RESULTS.update(json.loads(bytes(raw).decode("utf-8")))
+        save_lecture_results()
+        _lecture_results_backup_msg_id = pinned.message_id
+        print(f"Restored lecture results: {len(LECTURE_RESULTS)} lecture(s).")
+
+    await _run_restore_with_retries(app, "lecture_results", "Lecture results", _do)
 
 # ═══════════════════════════════════════════════════════════════
 # PASSWORD-GATED STORAGE (private group)
@@ -2324,6 +2453,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     answer  = update.poll_answer
     poll_id = answer.poll_id
     user_id = answer.user.id
+    _update_telegram_name(user_id, answer.user)
 
     session = LECTURE_SESSIONS.get(user_id)
     if not session:
@@ -2415,6 +2545,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
         lecture_name = QUIZ_INDEX.get(session["lecture_key"], {}).get("name", session["lecture_key"])
         _record_lecture_result(user_id, session["lecture_key"], correct, session["answered"])
+        await backup_lecture_results_to_channel(context)
         summary = (
             f"🎓 <b>خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!</b>\n\n"
             f"✅ صح: {correct}\n"
@@ -2683,6 +2814,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 explanation=explanation, image_path=img_path,
             )
             events = _record_activity(real_uid, questions_delta=1)
+            _update_telegram_name(real_uid, update.effective_user)
             await react_random(update, context)
             await _announce_events(context, user_id, events)
             await backup_analytics_to_channel(context)
@@ -2778,6 +2910,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await deliver_quiz(context, user_id, question, raw_options, correct_index, explanation=explanation)
             events = _record_activity(real_uid, questions_delta=1)
+            _update_telegram_name(real_uid, update.effective_user)
             await react_random(update, context)
             await _announce_events(context, user_id, events)
             await backup_analytics_to_channel(context)
@@ -3302,6 +3435,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 explanation=explanation, image_path=pending_img,
             )
             events = _record_activity(real_uid, questions_delta=1)
+            _update_telegram_name(real_uid, update.effective_user)
             await react_random(update, context)
             await _announce_events(context, user_id, events)
             await backup_analytics_to_channel(context)
@@ -3903,6 +4037,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
 
     q_count = sum(1 for it in items if it.get("type") in ("mcq", "written"))
     events  = _record_activity(analytics_uid, questions_delta=q_count, pdfs_delta=1, session_questions=q_count)
+    _update_telegram_name(analytics_uid, getattr(message, "from_user", None))
     await _announce_events(context, session_id, events)
     await backup_analytics_to_channel(context)
     _reset_pdf_session(session_id)
@@ -3961,6 +4096,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_storage_to_channel(context)
 
     real_uid = update.effective_user.id if update.effective_user else chat_id
+    _update_telegram_name(real_uid, update.effective_user)
     nickname = get_nickname(real_uid)
 
     if nickname is None:
@@ -3997,7 +4133,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("/pdf_clear — clears the current PDF session")
     lines.append("/cancel — cancels whatever's currently in progress (PDF, pending image, etc.)")
     lines.append("/quiz — browse lectures (module → subject → lecture) and pull their questions")
-    lines.append("/storage_id — gets this chat's ID (for setting STORAGE_GROUP_ID)")
+    lines.append("/storage_id — gets this chat's ID (for setting STORAGE_GROUP_ID or LECTURE_RESULTS_GROUP_ID)")
     lines.append("/quiz_channel_id — gets the quiz channel's chat ID (forward a message from it first)")
     lines.append("/c — this list")
 
@@ -4315,6 +4451,65 @@ async def _post_init(app):
     await restore_quiz_from_channel(app)
     await restore_analytics_from_channel(app)
     await restore_settings_from_channel(app)
+    await restore_lecture_results_from_channel(app)
+
+    if app.job_queue is None:
+        print(
+            "⚠️ No JobQueue available — periodic backup reconciliation is "
+            "disabled. Install with: pip install \"python-telegram-bot[job-queue]\""
+        )
+    else:
+        app.job_queue.run_repeating(
+            _reconcile_backups_job, interval=BACKUP_RECONCILE_INTERVAL, first=BACKUP_RECONCILE_INTERVAL,
+        )
+
+# ── Backup reconciliation ────────────────────────────────────────
+# Every backup_*_to_channel() call above is reactive and fire-and-forget:
+# it fires once, right after a data change, and any failure in the
+# upload/pin/delete-old-pin sequence is only logged, never retried.
+# Almost always fine — but a dropped pin call or a delete that silently
+# fails (message already gone, a transient timeout, etc.) can leave the
+# channel's pinned message out of sync with what's actually on disk,
+# and nothing would notice until the NEXT change came along to trigger
+# another reactive backup.
+#
+# This job runs on a short timer instead of waiting for the next change:
+# every BACKUP_RECONCILE_INTERVAL seconds, for each of the five backup
+# systems (analytics, settings, lecture results, storage, quiz index), it checks whether the channel's current pin still matches the
+# caption marker we expect. If the pin is missing, or belongs to a
+# different marker (e.g. our own backup got unpinned by someone, or a
+# delete-old-pin call left a stale one pinned instead), it just re-runs
+# that system's normal backup_*_to_channel() — which re-uploads,
+# re-pins, and cleans up the old message the same way it always does.
+# Cheap: one get_chat per system per tick, and the throttle inside each
+# backup_*_to_channel() call means this never spams uploads if
+# everything's already fine.
+BACKUP_RECONCILE_INTERVAL = 5  # seconds
+
+async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
+    checks = [
+        ("analytics",       ANALYTICS_GROUP_ID,       ANALYTICS_BACKUP_MARKER,       backup_analytics_to_channel),
+        ("settings",        SETTINGS_GROUP_ID,        SETTINGS_BACKUP_MARKER,        backup_settings_to_channel),
+        ("lecture_results", LECTURE_RESULTS_GROUP_ID, LECTURE_RESULTS_BACKUP_MARKER, backup_lecture_results_to_channel),
+        ("storage",         STORAGE_GROUP_ID,         STORAGE_BACKUP_MARKER,         backup_storage_to_channel),
+        ("quiz",            QUIZ_CHANNEL_ID,          QUIZ_BACKUP_MARKER,            backup_quiz_to_channel),
+    ]
+    for key, group_id, marker, backup_fn in checks:
+        if not group_id or not RESTORE_OK.get(key, True):
+            continue   # not configured, or restore already failed this session — leave it alone
+        try:
+            chat   = await context.bot.get_chat(group_id)
+            pinned = chat.pinned_message
+            in_sync = bool(pinned and pinned.document and (pinned.caption or "") == marker)
+        except Exception as e:
+            print(f"BACKUP RECONCILE — couldn't check {key}: {e}")
+            continue
+        if not in_sync:
+            print(f"BACKUP RECONCILE — {key} pin out of sync, re-backing up.")
+            try:
+                await backup_fn(context)
+            except Exception as e:
+                print(f"BACKUP RECONCILE — re-backup of {key} failed: {e}")
 
 app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
