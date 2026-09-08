@@ -215,34 +215,32 @@ STORAGE_GROUP_ID = -1004447646576
 # below, repurposed and started fresh — its lecture index/state/poll-status
 # are stored under new "_y3" files, so nothing from the old combined
 # quiz_index.json/quiz_state.json/quiz_poll_status.json carries over.
+#
+# Subject names here are plain text, no emoji — this is the exact string
+# admins type in a lecture title ("<Module> - <Subject> Lecture <n>: ...")
+# and the exact string stored in QUIZ_INDEX, so it needs to stay simple and
+# typeable. Emoji are purely cosmetic and live in SUBJECT_EMOJI below,
+# looked up only when rendering a subject as a button label.
 YEARS = {
     "y1": {
         "label": "Year 1",
         "channel_id": -1004491934509,
         "modules": {
-            "Foundation (1)": [
-                "Anatomy 🩻", "Embryology 👶🏼", "Biochemistry 🧬",
-                "Histology 🔬", "Physiology 🧠",
-            ],
-            "Foundation (2)": [
-                "Pathology 🩸", "Pharmacology 💊", "Microbiology 🦠",
-                "Parasitology 🪱", "Communication skills 💬",
-            ],
-            "MSK": [
-                "Anatomy 🩻", "Biochemistry 🧬", "Histology 🔬",
-                "Physiology 🧠", "Pathology 🩸",
-            ],
-            "CVS": [
-                "Physiology 🧠", "Anatomy 🩻", "Pharmacology 💊",
-                "Pathology 🩸", "Histology 🔬", "MP 👨‍⚕️",
-            ],
+            "Foundation (1)": ["Anatomy", "Embryology", "Biochemistry", "Histology", "Physiology"],
+            "Foundation (2)": ["Pathology", "Pharmacology", "Microbiology", "Parasitology", "Communication skills"],
+            "MSK":            ["Anatomy", "Biochemistry", "Histology", "Physiology", "Pathology"],
+            "CVS":            ["Physiology", "Anatomy", "Pharmacology", "Pathology", "Histology", "MP"],
         },
     },
     "y2": {
         "label": "Year 2",
         "channel_id": -1004370807195,
         "modules": {
-            # TODO: fill in Year 2's modules/subjects, same shape as Year 1/3.
+            "Respiratory":  ["Biochemistry", "Anatomy", "Physiology", "Histology", "Pharmacology", "Microbiology", "Pathology"],
+            "Blood":        ["Microbiology", "Physiology", "Biochemistry", "Pharmacology", "Parasitology", "Histology", "Pathology", "Psychiatry"],
+            "GIT":          ["Anatomy", "Pharmacology", "Parasitology", "Histology", "Pathology", "Physiology", "Microbiology"],
+            "CNS 1":        ["Physiology", "Anatomy"],
+            "CNS 2":        ["Pharmacology", "Physiology", "Parasitology", "Histology", "Pathology"],
         },
     },
     "y3": {
@@ -257,6 +255,49 @@ YEARS = {
 }
 # Display order for the /quiz year picker.
 YEAR_ORDER = ["y1", "y2", "y3"]
+
+# Cosmetic-only: emoji shown next to a subject's name on module/subject
+# selection buttons. Looked up by the plain subject string above — never
+# stored, matched against lecture titles, or used as a dict key anywhere.
+# A subject with no entry here just renders without an emoji.
+SUBJECT_EMOJI = {
+    "Anatomy":              "🩻",
+    "Embryology":           "👶🏼",
+    "Biochemistry":         "🧬",
+    "Histology":            "🔬",
+    "Physiology":           "🧠",
+    "Pathology":            "🩸",
+    "Pharmacology":         "💊",
+    "Microbiology":         "🦠",
+    "Parasitology":         "🪱",
+    "Communication skills": "💬",
+    "MP":                   "👨‍⚕️",
+    "Psychiatry":           "🏥",
+}
+
+def subject_label(subject: str) -> str:
+    """Subject string for display: name + its emoji, if it has one in
+    SUBJECT_EMOJI. Never use this for storage/matching — always plain
+    `subject` for that (parse_lecture_title, QUIZ_INDEX, callback_data)."""
+    emoji = SUBJECT_EMOJI.get(subject)
+    return f"{subject} {emoji}" if emoji else subject
+
+# Cosmetic-only, same idea as SUBJECT_EMOJI but for module names.
+MODULE_EMOJI = {
+    "Respiratory": "🫁",
+    "Blood":       "🩸",
+    "GIT":         "😋",
+    "CNS 1":       "⚡️",
+    "CNS 2":       "⚡️⚡️",
+}
+
+def module_label(module: str) -> str:
+    """Module string for display: name + its emoji, if it has one in
+    MODULE_EMOJI. Never use this for storage/matching — always plain
+    `module` for that (parse_lecture_title, QUIZ_INDEX, callback_data)."""
+    emoji = MODULE_EMOJI.get(module)
+    return f"{module} {emoji}" if emoji else module
+
 
 def year_channel_id(year: str):
     return YEARS.get(year, {}).get("channel_id")
@@ -3745,7 +3786,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not modules:
             await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
             return
-        buttons = [[InlineKeyboardButton(m, callback_data=f"module:{year}:{i}")] for i, m in enumerate(modules)]
+        buttons = [[InlineKeyboardButton(module_label(m), callback_data=f"module:{year}:{i}")] for i, m in enumerate(modules)]
         buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="quiz_years")])
         await query.edit_message_text(
             f"📚 <b>{year_label(year)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
@@ -3767,7 +3808,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         module = modules[mod_idx]
         subjects = ready_subjects(year, module)
         buttons = [
-            [InlineKeyboardButton(s, callback_data=f"subject:{year}:{mod_idx}:{i}")]
+            [InlineKeyboardButton(subject_label(s), callback_data=f"subject:{year}:{mod_idx}:{i}")]
             for i, s in enumerate(subjects)
         ]
         buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"yr:{year}")])
