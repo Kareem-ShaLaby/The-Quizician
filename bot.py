@@ -9,7 +9,7 @@ import html
 import tempfile
 import traceback
 from io import BytesIO
-from datetime import time as dt_time
+from datetime import time as dt_time, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ═══════════════════════════════════════════════════════════════
@@ -1348,12 +1348,16 @@ async def restore_mistakes_bank_from_channel(app):
     await _run_restore_with_retries(app, "mistakes_bank", "Mistakes bank", _do)
 
 # ═══════════════════════════════════════════════════════════════
-# DAILY QUIZ — 💥Daily Quiz💥: 7 random questions from 7 different
-# subjects (across every configured year), plus 3 random questions from
-# the shared MISTAKES_BANK. Pushed to everyone at 2pm Cairo time once a
-# day (see the job_queue.run_daily call in MAIN); the push itself is just
-# a button — tapping it is what actually starts the quiz and is gated to
-# once per person per day via each user's settings "daily_quiz_last_date".
+# DAILY QUIZ — 💥Daily Quiz💥: 7 random questions pulled from random
+# subjects (any subject can contribute more than one — this is not a
+# one-per-subject pick), plus 3 random questions from the shared
+# MISTAKES_BANK. Both slices are restricted to the admin-set /daily_module
+# scope when one is set (see get_daily_quiz_scope), or span every
+# configured year/module otherwise. Pushed to everyone at 2pm Cairo time
+# once a day (see the job_queue.run_daily call in MAIN); the push itself
+# is just a button — tapping it is what actually starts the quiz and is
+# gated to once per person per day via each user's settings
+# "daily_quiz_last_date".
 #
 # Deliberately its own session type (DAILY_QUIZ_SESSIONS), separate from
 # LECTURE_SESSIONS, rather than shoehorned into the lecture-session shape:
@@ -1368,19 +1372,31 @@ DAILY_QUIZ_SESSIONS = {}   # user_id -> {"queue": [question dict, ...], "current
                            #             "current_correct_id", "current_message_id",
                            #             "total", "answered", "correct", "xp_earned"}
 
-DAILY_QUIZ_SUBJECT_COUNT  = 7   # distinct-subject questions
-DAILY_QUIZ_MISTAKES_COUNT = 3   # questions pulled from MISTAKES_BANK
+DAILY_QUIZ_SUBJECT_COUNT  = 7   # random questions from the ready-question pool
+DAILY_QUIZ_MISTAKES_COUNT = 3   # random questions pulled from the mistakes bank
+
+# Push time for the daily 💥Daily Quiz💥 button (see job_queue.run_daily in
+# MAIN, and next_daily_quiz_time() / /time below — all three read from
+# these two so the schedule only ever needs to change in one place).
+DAILY_QUIZ_TZ   = ZoneInfo("Africa/Cairo")
+DAILY_QUIZ_HOUR = 14
+DAILY_QUIZ_MIN  = 0
+
+def next_daily_quiz_time() -> datetime:
+    """The next upcoming 2pm-Cairo push moment — today's if it hasn't
+    happened yet, otherwise tomorrow's."""
+    now = datetime.now(DAILY_QUIZ_TZ)
+    today_push = now.replace(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, second=0, microsecond=0)
+    return today_push if now < today_push else today_push + timedelta(days=1)
 
 def _daily_quiz_subject_pool() -> dict:
-    """One ready (closed-poll) question per distinct (year, module,
-    subject) group — the pool build_daily_quiz_questions draws its 7
-    "different subjects" slice from. Normally spans every configured
+    """Every ready (closed-poll) question mid, across all subjects,
+    grouped by (year, module, subject) — the pool build_daily_quiz_questions
+    draws its 7 random questions from (any subject can contribute more
+    than one; this is just how the mids are organized so a scope filter
+    can narrow it before picking). Normally spans every configured
     year/module; if an admin has set a scope via /daily_module, narrowed
-    to just that one module (still one entry per subject within it, so
-    "7 different subjects" still means what it says). Picks one random
-    mid per subject group from whichever ready lectures have it, so
-    re-running this later in the same process naturally reshuffles which
-    lecture represents a subject if new ones have closed since."""
+    to just that one module."""
     scope = get_daily_quiz_scope()
     years = [scope["year"]] if scope else configured_years()
 
@@ -1417,24 +1433,46 @@ async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid:
         "explanation": explanation, "year": year, "module": module, "subject": subject,
     }
 
+def _scoped_mistakes_bank() -> list:
+    """MISTAKES_BANK filtered to the admin-set /daily_module scope, if
+    any. Unlike the subject pool (which is scoped by construction), this
+    filters the flat list directly since MISTAKES_BANK isn't grouped by
+    (year, module) already."""
+    scope = get_daily_quiz_scope()
+    if not scope:
+        return MISTAKES_BANK
+    return [m for m in MISTAKES_BANK if m["year"] == scope["year"] and m["module"] == scope["module"]]
+
 async def build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE) -> list:
-    """The full 10-question set for one Daily Quiz run: up to 7 from
-    distinct subjects (one per subject, so no subject repeats) plus up to
-    3 from MISTAKES_BANK. Falls short of 10 gracefully if there isn't
-    enough ready content yet — callers just get a shorter (or empty) list."""
+    """The full 10-question set for one Daily Quiz run: 7 random questions
+    pulled from random subjects (a subject can contribute more than one —
+    this is NOT one-per-subject) plus up to 3 from the mistakes bank.
+    Both slices respect the admin-set /daily_module scope, if any. Falls
+    short of 10 gracefully if there isn't enough ready content yet —
+    callers just get a shorter (or empty) list."""
     subject_pool = _daily_quiz_subject_pool()
-    subject_keys = list(subject_pool.keys())
-    random.shuffle(subject_keys)
+    # Flatten to one (year, module, subject, mid) tuple per ready question,
+    # so picking 7 is a plain random sample over individual questions —
+    # not a pick-a-subject-then-one-question-from-it scheme, which is what
+    # was capping this to one question per subject before.
+    all_mids = [
+        (year, module, subject, mid)
+        for (year, module, subject), mids in subject_pool.items()
+        for mid in mids
+    ]
+    random.shuffle(all_mids)
 
     questions = []
-    for (year, module, subject) in subject_keys[:DAILY_QUIZ_SUBJECT_COUNT]:
-        mid = random.choice(subject_pool[(year, module, subject)])
+    for year, module, subject, mid in all_mids:
+        if len(questions) >= DAILY_QUIZ_SUBJECT_COUNT:
+            break
         snap = await _snapshot_from_mid(context, year, mid, module, subject)
         if snap:
             questions.append(snap)
 
-    if MISTAKES_BANK:
-        questions.extend(random.sample(MISTAKES_BANK, k=min(DAILY_QUIZ_MISTAKES_COUNT, len(MISTAKES_BANK))))
+    mistakes = _scoped_mistakes_bank()
+    if mistakes:
+        questions.extend(random.sample(mistakes, k=min(DAILY_QUIZ_MISTAKES_COUNT, len(mistakes))))
 
     random.shuffle(questions)
     return questions
@@ -1527,7 +1565,8 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
             f"❌ غلط: {incorrect}\n"
             f"📊 نسبة: {pct}%\n"
             f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
-            f"✨ XP: <b>+{session['xp_earned']}</b>"
+            f"✨ XP: <b>+{session['xp_earned']}</b>\n\n"
+            f"{_next_daily_quiz_line()}"
         )
         try:
             await context.bot.send_message(
@@ -1544,11 +1583,10 @@ def get_daily_quiz_last_date(user_id: int) -> str | None:
     return SETTINGS.get(str(user_id), {}).get("daily_quiz_last_date")
 
 # ── Admin-set Daily Quiz scope ──────────────────────────────────
-# By default the "7 different subjects" slice draws from every configured
-# year/module (see _daily_quiz_subject_pool). An admin can narrow that to
-# one specific module (e.g. whatever's currently being taught) via
-# /daily_module — the 3-mistakes-bank slice is untouched either way, since
-# that's meant to resurface old material regardless of what's current.
+# By default both the 7-random-questions slice and the 3-mistakes-bank
+# slice draw from every configured year/module. An admin can narrow both
+# to one specific module (e.g. whatever's currently being taught) via
+# /daily_module — see _daily_quiz_subject_pool and _scoped_mistakes_bank.
 #
 # Stored under a reserved key in SETTINGS (not a per-user key — this is a
 # single global switch) so it rides on the exact same backup/restore path
@@ -1575,7 +1613,7 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
     only gets today's quiz once."""
     today = _today()
     if get_daily_quiz_last_date(user_id) == today:
-        text = "⏳ خلصت الـ Daily Quiz بتاعت النهاردة خلاص — تعالى تاني بكرة!"
+        text = f"⏳ خلصت الـ Daily Quiz بتاعت النهاردة خلاص!\n\n{_next_daily_quiz_line()}"
         if message:
             await message.edit_text(text)
         else:
@@ -1629,6 +1667,119 @@ async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass   # blocked the bot, deactivated account, etc. — skip silently, same as broadcast_cmd
+
+# ═══════════════════════════════════════════════════════════════
+# MISTAKES BANK RETAKE — 🧠 Mistakes Bank menu button lets a user fire off
+# every question in the (module-scoped) MISTAKES_BANK as a one-shot
+# practice quiz. Same self-contained-question shape and delivery mechanics
+# as the Daily Quiz (_deliver_next_daily_question works unchanged here —
+# it only ever touches the passed-in session dict), just its own session
+# map and completion message so it doesn't collide with an in-flight Daily
+# Quiz for the same user.
+# ═══════════════════════════════════════════════════════════════
+MISTAKES_RETAKE_SESSIONS = {}   # user_id -> same session shape as DAILY_QUIZ_SESSIONS
+
+async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """Every question currently in the mistakes bank for the admin-set
+    /daily_module scope (or the whole bank if no scope is set), sent one
+    at a time. No once-per-day gate — unlike the Daily Quiz, this is an
+    on-demand review the user can retake as often as they like."""
+    questions = list(_scoped_mistakes_bank())
+    if not questions:
+        text = "🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!"
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+        if message:
+            await message.edit_text(text, reply_markup=keyboard)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        return
+
+    random.shuffle(questions)
+    session = {
+        "queue": questions, "current_poll_id": None, "current_correct_id": None,
+        "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
+    }
+    MISTAKES_RETAKE_SESSIONS[user_id] = session
+
+    text = f"🧠 <b>مراجعة بنك الأخطاء</b> — {len(questions)} سؤال، هيتبعتولك واحد واحد 👇"
+    if message:
+        await message.edit_text(text, parse_mode=ParseMode.HTML)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
+
+    sent = await _deliver_next_daily_question(context, user_id, session)
+    if not sent:
+        MISTAKES_RETAKE_SESSIONS.pop(user_id, None)
+        await context.bot.send_message(chat_id=user_id, text="⚠️ حصلت مشكلة في تجهيز الأسئلة — جرب تاني.")
+
+async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None):
+    """Mistakes-retake counterpart to _advance_daily_quiz_session — same
+    XP/streak/achievement bookkeeping, its own completion summary text."""
+    session["answered"] += 1
+    session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+
+    sent_next = await _deliver_next_daily_question(context, user_id, session)
+    is_last   = not sent_next
+
+    per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
+    xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
+
+    events     = _record_activity(user_id)
+    user_entry = _get_entry(user_id)
+    prev_streak = user_entry.get("lecture_correct_streak_current", 0)
+    user_entry["lecture_questions_answered"]  += 1
+    user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
+    user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    if is_correct:
+        user_entry["lecture_correct_streak_current"] += 1
+        if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
+            user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
+    else:
+        user_entry["lecture_correct_streak_current"] = 0
+
+    await _react_to_lecture_answer(
+        context, user_id, message_id,
+        is_correct=is_correct,
+        new_streak=user_entry["lecture_correct_streak_current"],
+        streak_broken=(not is_correct and prev_streak > 0),
+    )
+
+    events["achievements"] += _check_achievements(user_entry, "lecture_questions")
+    events["achievements"] += _check_achievements(user_entry, "lecture_streak")
+
+    _award_xp(user_entry, xp_delta)
+    final_level = _xp_to_level(user_entry["xp"])
+    if final_level > user_entry["level"]:
+        user_entry["level"] = final_level
+        events["level_up"] = final_level
+    save_analytics()
+    await _announce_events(context, user_id, events)
+    await backup_analytics_to_channel(context)
+
+    if is_last:
+        total     = session["total"]
+        correct   = session["correct"]
+        incorrect = session["answered"] - correct
+        pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+        summary = (
+            f"🧠 <b>خلصت مراجعة بنك الأخطاء!</b>\n\n"
+            f"✅ صح: {correct}\n"
+            f"❌ غلط: {incorrect}\n"
+            f"📊 نسبة: {pct}%\n"
+            f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
+            f"✨ XP: <b>+{session['xp_earned']}</b>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, text=summary, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+                ]]),
+            )
+        except Exception:
+            pass
+        MISTAKES_RETAKE_SESSIONS.pop(user_id, None)
 
 # ═══════════════════════════════════════════════════════════════
 # PASSWORD-GATED STORAGE (private group)
@@ -2411,6 +2562,9 @@ def start_menu_keyboard():
         [
             InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
         ],
+        [
+            InlineKeyboardButton("🧠 Mistakes Bank", callback_data="mistakes_bank_menu"),
+        ],
     ])
 
 def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -3136,6 +3290,15 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         is_correct = chosen is not None and chosen == daily_session.get("current_correct_id")
         await _advance_daily_quiz_session(
             context, user_id, daily_session, is_correct, daily_session.get("current_message_id"),
+        )
+        return
+
+    retake_session = MISTAKES_RETAKE_SESSIONS.get(user_id)
+    if retake_session and retake_session.get("current_poll_id") == poll_id:
+        chosen     = answer.option_ids[0] if answer.option_ids else None
+        is_correct = chosen is not None and chosen == retake_session.get("current_correct_id")
+        await _advance_mistakes_retake_session(
+            context, user_id, retake_session, is_correct, retake_session.get("current_message_id"),
         )
         return
 
@@ -3905,13 +4068,34 @@ async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
+def _next_daily_quiz_line() -> str:
+    """One line: how long until the next 💥Daily Quiz💥 push, plus its
+    Cairo clock time. Shared by /time and the post-quiz results summary."""
+    next_push = next_daily_quiz_time()
+    now       = datetime.now(DAILY_QUIZ_TZ)
+    delta     = next_push - now
+    hours, remainder = divmod(int(delta.total_seconds()), 3600)
+    minutes = remainder // 60
+    when = "النهاردة" if next_push.date() == now.date() else "بكرة"
+    return f"⏰ الـ Daily Quiz الجاية: {when} الساعة {next_push.strftime('%I:%M %p')} (بعد {hours} ساعة و{minutes} دقيقة)"
+
+async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/time — current Cairo time, and when the next 💥Daily Quiz💥 push is."""
+    now = datetime.now(DAILY_QUIZ_TZ)
+    await update.message.reply_text(
+        f"🕒 دلوقتي: <b>{now.strftime('%I:%M %p')}</b> (توقيت القاهرة)\n\n"
+        f"{_next_daily_quiz_line()}",
+        parse_mode=ParseMode.HTML,
+    )
+
 async def daily_module_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: pick a year, then a module, to restrict the Daily Quiz's
-    "7 different subjects" slice to just that module (e.g. whatever's
-    currently being taught) instead of the whole curriculum. Own
-    callback_data namespace (dqy:/dqm:/dq_scope_off) — deliberately
-    separate from the yr:/module: user-facing browsing flow, since this
-    is a one-time admin scope pick, not lecture navigation."""
+    """Admin: pick a year, then a module, to restrict BOTH the Daily
+    Quiz's 7-random-questions slice and its 3-mistakes-bank slice to just
+    that module (e.g. whatever's currently being taught) instead of the
+    whole curriculum. Own callback_data namespace (dqy:/dqm:/dq_scope_off)
+    — deliberately separate from the yr:/module: user-facing browsing
+    flow, since this is a one-time admin scope pick, not lecture
+    navigation."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
@@ -4871,6 +5055,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_daily_quiz(context, user_id, message=query.message)
         return
 
+    # ── 🧠 Mistakes Bank menu button ──────────────────────────────
+    if query.data == "mistakes_bank_menu":
+        scope = get_daily_quiz_scope()
+        count = len(_scoped_mistakes_bank())
+        scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
+        text = f"🧠 <b>بنك الأخطاء</b>\n\n{scope_line}عدد الأسئلة المسجلة: <b>{count}</b>"
+        buttons = []
+        if count:
+            buttons.append([InlineKeyboardButton("🔁 Retake Questions", callback_data="mistakes_retake")])
+        buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if query.data == "mistakes_retake":
+        await start_mistakes_retake(context, user_id, message=query.message)
+        return
+
     # ── Admin: /daily_module picker (dqy:/dqm:/dq_scope_off) ─────────
     if query.data.startswith("dqy:"):
         if not is_admin(update):
@@ -4922,7 +5123,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_settings_to_channel(context)
         await query.edit_message_text(
             f"✅ Daily Quiz دلوقتي محدد على: {year_label(year)} — {module_label(module)}\n\n"
-            f"(الـ 3 أسئلة من الأخطاء القديمة لسه بتيجي من كل حاجة زي ما هي)",
+            f"(الأسئلة العشوائية وأسئلة الأخطاء القديمة هيتسحبوا من الموديول ده بس)",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -5166,6 +5367,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("/pdf_clear — clears the current PDF session")
     lines.append("/cancel — cancels whatever's currently in progress (PDF, pending image, etc.)")
     lines.append("/quiz — browse lectures (year → module → subject → lecture) and pull their questions")
+    lines.append("/time — current time, and when the next 💥Daily Quiz💥 push is")
     lines.append("/storage_id — gets this chat's ID (for setting STORAGE_GROUP_ID or LECTURE_RESULTS_GROUP_ID)")
     lines.append("/quiz_channel_id — gets a quiz channel's chat ID (forward a message from it first)")
     lines.append("/c — this list")
@@ -5502,7 +5704,7 @@ async def _post_init(app):
             _reconcile_backups_job, interval=BACKUP_RECONCILE_INTERVAL, first=BACKUP_RECONCILE_INTERVAL,
         )
         app.job_queue.run_daily(
-            _daily_quiz_push_job, time=dt_time(hour=14, minute=0, tzinfo=ZoneInfo("Africa/Cairo")),
+            _daily_quiz_push_job, time=dt_time(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, tzinfo=DAILY_QUIZ_TZ),
         )
 
 # ── Backup reconciliation ────────────────────────────────────────
@@ -5648,6 +5850,7 @@ app.add_handler(CommandHandler("backup_now",     backup_now_cmd))
 app.add_handler(CommandHandler("quiz_channel_id", quiz_channel_id_cmd))
 app.add_handler(CommandHandler("quiz",            quiz_lectures_cmd))
 app.add_handler(CommandHandler("daily_module",     daily_module_cmd))
+app.add_handler(CommandHandler("time",             time_cmd))
 app.add_handler(CommandHandler("quiz_list",       quiz_list_cmd))
 app.add_handler(CommandHandler("quiz_delete",     quiz_delete_cmd))
 
