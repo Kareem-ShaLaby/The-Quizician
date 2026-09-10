@@ -5,6 +5,7 @@ import json
 import os
 import time
 import asyncio
+import functools
 import html
 import tempfile
 import traceback
@@ -16,55 +17,97 @@ from zoneinfo import ZoneInfo
 # FILE INDEX — where to find things (line numbers approximate;
 # section banners below are exact and searchable).
 # ═══════════════════════════════════════════════════════════════
-#   94   FONT SETUP
-#  219   QUIZZY — The Quizician's cat friend (persona/flavor text)
-#  263   BOT MESSAGES — every user-facing string, in one place
-#  294   USERS STORAGE
-#  311   ANALYTICS — XP · LEVELS · ACHIEVEMENTS (also: telegram_name /
+#  130   FONT SETUP
+#  388   QUIZZY — The Quizician's cat friend (persona/flavor text)
+#  432   BOT MESSAGES — every user-facing string, in one place
+#  489   USERS STORAGE
+#  505   ANALYTICS — XP · LEVELS · ACHIEVEMENTS (also: telegram_name /
 #          telegram_username via _update_telegram_name)
-#  720   SETTINGS — per-user personalization (nickname, reactions,
+#  927   SETTINGS — per-user personalization (nickname, reactions,
 #          auto_next, randomize)
-#  855   LECTURE RESULTS — per-lecture leaderboard (own file + own
+# 1114   LECTURE RESULTS — per-lecture leaderboard (own file + own
 #          backup channel: LECTURE_RESULTS_GROUP_ID)
-# 1003   PASSWORD-GATED STORAGE (private group)
-# 1128   QUIZ CHANNELS (per-year: YEARS registry near the top of the file
+# 1267   MISTAKES BANK — wrong-answer pool that seeds the Daily Quiz's
+#          "questions you got wrong before" slice. Entries are lightweight
+#          {mid, year, module, subject} REFERENCES, not full question
+#          snapshots — record_mistake() stores just the id; _resolve_mistake(s)
+#          turns a reference back into a full question dict on demand via
+#          _snapshot_from_mid + QUIZ_POLL_STATUS[year].
+#          Grep "_resolve_mistake" for every call site that needs resolved
+#          content (build_daily_quiz_questions, start_mistakes_retake).
+# 1749   MISTAKES BANK RETAKE — 🧠 Mistakes Bank menu button, one-shot
+#          practice quiz over _scoped_mistakes_bank() (resolved first)
+# 1863   PASSWORD-GATED STORAGE (private group) — unrelated to quiz
+#          content; this is the password-triggered media vault. Its backup
+#          file is quizician_storage_backup.json (singular, no year
+#          suffix) — do NOT confuse with each year's Quizician_Quiz_Backup
+#          file below, despite the similar "storage/backup" wording.
+# 1986   QUIZ CHANNELS (per-year: YEARS registry near the top of the file
 #          controls channel_id + curriculum per year; index/state/poll-status/
-#          backup are all keyed by year, e.g. QUIZ_INDEX[year])
-# 1330   STATE (in-memory dicts: LECTURE_SESSIONS, QUIZ_POLL_STATUS, etc.)
-# 1353   CONSTANTS
-# 1362   HELPERS
-# 1524   QUIZ DELIVERY (single source of truth for sending a live quiz poll)
-# 1626   PROGRESS MESSAGE BUILDER
-# 1690   KEYBOARD HELPERS (main menu, settings menu, etc.)
-# 1764   MENU TEXT CONTENT
-# 1789   PDF BUILDER
-# 1926   DOCX BUILDER
-# 2185   REACTIONS (react_random, lecture-answer streak reactions)
-# 2241   SLEEP / WAKE COMMANDS
-# 2253   PASSIVE ANSWER BACKFILL / LECTURE DELIVERY + SESSION LOGIC
+#          backup are all keyed by year, e.g. QUIZ_INDEX[year]). Each
+#          year's pinned backup document is named
+#          Quizician_Quiz_Backup_Y1.json / _Y2.json / _Y3.json
+#          (backup_quiz_to_channel) and contains quiz_index + quiz_state +
+#          quiz_poll_status for that year — this is what MISTAKES BANK
+#          entries resolve against.
+# 2212   STATE (in-memory dicts: LECTURE_SESSIONS, QUIZ_POLL_STATUS, etc. —
+#          all purely in-memory, NOT persisted/restored across a restart;
+#          a crash mid-finals-night silently drops everyone's active
+#          quiz/lecture session)
+# 2238   CONSTANTS
+# 2247   PER-USER SERIALIZATION — @_serialize_per_user decorator, applied
+#          to handle_poll_answer and button_handler. Needed because
+#          concurrent_updates() (see MAIN, near the bottom) lets different
+#          users' updates run truly concurrently now; this keeps each
+#          individual user's own updates ordered against each other via a
+#          private asyncio.Lock per user_id, without touching either
+#          handler's body.
+# 2287   HELPERS
+# 2446   QUIZ DELIVERY (single source of truth for sending a live quiz poll)
+# 2555   PROGRESS MESSAGE BUILDER
+# 2619   KEYBOARD HELPERS (main menu, settings menu, etc.)
+# 2706   MENU TEXT CONTENT
+# 2731   PDF BUILDER
+# 2868   DOCX BUILDER
+# 3127   REACTIONS (react_random, lecture-answer streak reactions)
+# 3183   SLEEP / WAKE COMMANDS
+# 3195   PASSIVE ANSWER BACKFILL / LECTURE DELIVERY + SESSION LOGIC
 #          — _deliver_next_lecture_question, _deliver_all_lecture_questions,
-#            handle_poll_answer, _advance_lecture_session
-# 2561   FORWARDED POLL HANDLER
-# 2600   QUESTION REVIEW / EDIT (after a question lands in the PDF buffer)
-# 2746   IMAGE HANDLER (PDF mode only)
-# 2911   STORAGE GROUP — AUTO-INDEXING
-# 2992   QUIZ CHANNELS — AUTO-INDEXING (year resolved per-message via year_for_chat)
-# 3183   TEXT MESSAGE HANDLER (includes /start's onboarding nickname prompt)
-# 3439   INLINE BUTTON HANDLER (button_handler — all callback_data routing,
-#          including lecture preview/leaderboard, lecture start, and
-#          settings toggles)
-# 3934   PDF/DOCX EXPORT (single source of truth, called from both PDF
+#            handle_poll_answer (@_serialize_per_user), _advance_lecture_session
+#            (records mistakes into MISTAKES_BANK via record_mistake(mid, ...))
+# 3567   FORWARDED POLL HANDLER
+# 3606   QUESTION REVIEW / EDIT (after a question lands in the PDF buffer)
+# 3752   IMAGE HANDLER (PDF mode only)
+# 3917   STORAGE GROUP — AUTO-INDEXING
+# 4307   TEXT MESSAGE HANDLER (includes /start's onboarding nickname prompt)
+# 4564   INLINE BUTTON HANDLER (button_handler, @_serialize_per_user — all
+#          callback_data routing, including lecture preview/leaderboard,
+#          lecture start, and settings toggles)
+# 5280   PDF/DOCX EXPORT (single source of truth, called from both PDF
 #          commands and quiz-channel exports)
-# 4037   PDF COMMANDS
-# 4077   START (also wakes bot from sleep; asks for a nickname on first use)
-# 4141   ADMIN HELPERS
-# 4162   BROADCAST COMMAND (admin only)
-# 4239   MAIN — also where _reconcile_backups_job lives: a
-#          job_queue.run_repeating() job (every BACKUP_RECONCILE_INTERVAL
-#          seconds) that re-checks each backup channel's pin and
-#          re-uploads if it's out of sync, so a missed pin/delete on the
-#          reactive path gets caught within a few seconds instead of
-#          waiting for the next real data change.
+# 5397   PDF COMMANDS
+# 5437   START (also wakes bot from sleep; asks for a nickname on first use)
+# 5505   ADMIN HELPERS
+# 5526   BROADCAST COMMAND (admin only)
+# 5603   MAIN — ApplicationBuilder here sets .concurrent_updates(256), so
+#          updates from different users are handled in parallel instead of
+#          one-at-a-time globally (see PER-USER SERIALIZATION above for
+#          how same-user ordering is still preserved). Also where
+#          _reconcile_backups_job lives: a job_queue.run_repeating() job
+#          (every BACKUP_RECONCILE_INTERVAL seconds) that re-checks each
+#          backup channel's pin and re-uploads if it's out of sync, so a
+#          missed pin/delete on the reactive path gets caught within a few
+#          seconds instead of waiting for the next real data change.
+#
+# NOTE ON save_*() FUNCTIONS: all 11 are async, writing via
+# asyncio.to_thread(_atomic_write_json, ...) — atomic (temp file + fsync +
+# os.replace, so a crash can't leave a half-written JSON file) AND
+# non-blocking (the disk I/O runs in a worker thread instead of stalling
+# the event loop for every other user while one save is in flight). Every
+# call site must `await` them; a few originally-sync helper functions
+# (_record_activity, set_daily_quiz_scope, _record_lecture_result,
+# record_mistake, _index_item) became async too since they call save_*()
+# internally — grep any of these names before adding a new call site.
 #
 # NOTE: line numbers drift as the file grows — treat them as "roughly
 # here", and confirm with a grep for the section banner text if unsure.
@@ -188,6 +231,17 @@ BUNDLED_FONTS = {
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
 ADMIN_ID = 940770584
+
+# ── PDF/DOCX export whitelist ────────────────────────────────────
+# /pdf_start (and therefore the whole PDF-collection flow — font/bg setup,
+# gen_pdf/gen_docx export buttons) is only usable by the IDs listed here.
+# Empty set = nobody but you has added their ID yet; add numeric Telegram
+# user IDs (same way as ADMIN_ID above) as you approve people.
+PDF_ALLOWED_USER_IDS: set[int] = set()
+
+def _pdf_access_allowed(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else None
+    return uid is not None and (uid == ADMIN_ID or uid in PDF_ALLOWED_USER_IDS)
 
 # ── Replace with your private GROUP's chat ID ────────────────────
 # 1. Create the group, add this bot to it as a member (admin not required
@@ -354,7 +408,14 @@ MISTAKES_BANK_GROUP_ID = -1004394139690
 # Not a backup destination like the ones above — just a plain group the
 # bot sends a message to whenever an update handler raises an
 # unhandled exception. See the global error handler near app setup.
-ERROR_LOG_GROUP_ID = -1003732733553
+ERROR_LOG_GROUP_ID = -1004333428419
+
+# ── User-submitted issue reports land here (see /report_issue) ──────
+# Each report is its own message with a "↩️ Reply" button; the admin's
+# next text message in this group becomes the reply, then the message is
+# edited to show both sides with fresh Reply/Close buttons. A plain group
+# the bot posts to — not a backup destination.
+REPORT_ISSUE_GROUP_ID = -1004495732411
 
 # ── Curriculum structure for the quiz channels ─────────────────────
 # Each year in YEARS (above) has its own "modules" dict in this same shape.
@@ -420,6 +481,7 @@ def quizzy_block(art: str, line: str) -> str:
 MSG_ADMIN_ONLY = "🚫 للأدمن فقط"
 
 # ── PDF collection flow ───────────────────────────────────────
+MSG_PDF_ACCESS_DENIED = "🚫 مميزة PDF/DOCX مش متاحة لحسابك دلوقتي."
 MSG_PDF_ASK_NAME = (
     "✏️ <b>اكتب اسم التوحفة الفنية (الملف) اللي عايزه:</b>\n"
     "<i>Lecture 1 Anatomy Questions</i>"
@@ -440,6 +502,32 @@ MSG_CANCEL_DONE = "❌ تم نطر أبلكاش"
 MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
 
 # ═══════════════════════════════════════════════════════════════
+# JSON HELPERS
+# ═══════════════════════════════════════════════════════════════
+def _atomic_write_json(path: str, data, **dump_kwargs):
+    """Writes JSON to `path` atomically: dump to a temp file in the same
+    directory, flush + fsync it to disk, then os.replace() it over the
+    real path. os.replace is atomic on both POSIX and Windows (same
+    filesystem), so a crash/power loss can only ever leave either the old
+    file or the fully-written new one — never a half-written/truncated
+    one. Every save_*() function in this file should go through this
+    instead of `open(path, "w")` + json.dump directly."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, **dump_kwargs)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)   # atomic rename, same filesystem
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+# ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
 # ═══════════════════════════════════════════════════════════════
 USERS_FILE = "users.json"
@@ -450,9 +538,8 @@ def load_users():
             return set(json.load(f))
     return set()
 
-def save_users():
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(USERS), f, ensure_ascii=False)
+async def save_users():
+    await asyncio.to_thread(_atomic_write_json, USERS_FILE, list(USERS), ensure_ascii=False)
 
 USERS = load_users()
 
@@ -602,9 +689,8 @@ def load_analytics() -> dict:
             return json.load(f)
     return {}
 
-def save_analytics():
-    with open(ANALYTICS_FILE, "w", encoding="utf-8") as f:
-        json.dump(ANALYTICS, f, indent=2, ensure_ascii=False)
+async def save_analytics():
+    await asyncio.to_thread(_atomic_write_json, ANALYTICS_FILE, ANALYTICS, indent=2, ensure_ascii=False)
 
 ANALYTICS: dict = load_analytics()
 
@@ -619,7 +705,7 @@ _analytics_backup_msg_id: int | None = None
 # debounced, since callers like lecture-answer XP can fire dozens of times
 # a minute and would otherwise risk hitting Telegram's rate limits.
 _last_analytics_backup_at: float = 0.0
-ANALYTICS_BACKUP_MIN_INTERVAL = 5  # seconds
+ANALYTICS_BACKUP_MIN_INTERVAL = 300  # seconds
 
 def _today() -> str:
     from datetime import datetime, timezone
@@ -636,6 +722,32 @@ def _get_entry(user_id: int) -> dict:
     for k in ACHIEVEMENTS:
         entry["achievements"].setdefault(k, 0)
     return entry
+
+def _year_leaderboard(year_class: str, limit: int = 15) -> list[dict]:
+    """Top users in one Year/Class cohort (SETTINGS' year_class — see the
+    onboarding question, NOT the quiz-browsing YEARS), ranked by all-time
+    lecture_questions_correct, highest first (ties broken by fewer
+    incorrect, so someone who got there more efficiently ranks above
+    someone who needed more attempts to reach the same correct count).
+    Only counts users who've actually set a Year/Class — that's the whole
+    filter, since ANALYTICS itself isn't year-scoped, SETTINGS is."""
+    rows = []
+    for uid_str, entry in ANALYTICS.items():
+        uid = int(uid_str)
+        if get_year_class(uid) != year_class:
+            continue
+        correct = entry.get("lecture_questions_correct", 0)
+        if correct <= 0:
+            continue   # no lecture activity yet — nothing to rank
+        rows.append({
+            "user_id":  uid,
+            "name":     get_nickname(uid) or entry.get("telegram_name") or f"مستخدم #{uid % 10000}",
+            "correct":  correct,
+            "incorrect": entry.get("lecture_questions_incorrect", 0),
+            "level":    entry.get("level", 0),
+        })
+    rows.sort(key=lambda r: (-r["correct"], r["incorrect"]))
+    return rows[:limit]
 
 def _update_telegram_name(user_id: int, tg_user) -> None:
     """Keeps the Telegram display name/username (and bot nickname) on the
@@ -679,7 +791,7 @@ def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
             break   # tiers are ordered — no point checking higher ones
     return unlocked
 
-def _record_activity(user_id: int, questions_delta: int = 0,
+async def _record_activity(user_id: int, questions_delta: int = 0,
                      pdfs_delta: int = 0, session_questions: int = 0) -> dict:
     """Update all stats. Returns dict of events for the caller to announce:
     { "achievements": [...], "level_up": int | 0 }"""
@@ -723,7 +835,7 @@ def _record_activity(user_id: int, questions_delta: int = 0,
         entry["level"] = final_level
         new_level = final_level
 
-    save_analytics()
+    await save_analytics()
     return {"achievements": newly_unlocked, "level_up": new_level}
 
 async def _announce_events(context, chat_id: int, events: dict, settings_uid: int | None = None):
@@ -768,7 +880,7 @@ RESTORE_RETRY_DELAY_BASE  = 4   # seconds; multiplied by attempt number (4s, the
 # fresh/empty local file over the good backup still sitting in the
 # channel. Fixed by a restart once the underlying Telegram/network issue
 # clears (or manually via /restore_analytics etc. for analytics).
-RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "lecture_results": True, "mistakes_bank": True}
+RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "lecture_results": True, "mistakes_bank": True, "report_threads": True}
 RESTORE_OK.update({f"quiz_{y}": True for y in YEARS})  # one flag per year's quiz index
 
 async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_found_hint: str | None = None):
@@ -871,7 +983,7 @@ async def restore_analytics_from_channel(app):
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
         ANALYTICS.update(json.loads(bytes(raw).decode("utf-8")))
-        save_analytics()
+        await save_analytics()
         _analytics_backup_msg_id = pinned.message_id
         print(f"Restored analytics: {len(ANALYTICS)} user(s).")
 
@@ -925,6 +1037,7 @@ def _blank_settings_entry() -> dict:
         "auto_next": True,
         "randomize": True,
         "achievement_notifs": True,
+        "spaced_repetition": True,   # see get_spaced_repetition_enabled below
         "question_timer": 0,   # seconds a live quiz poll stays open before
                                 # auto-closing; 0 = off. Cycles 0 -> 60 -> 30 -> 0.
         "year_class": None,    # "y1"/"y2"/"y3" — see YEAR_CLASS_NUMBER above
@@ -937,9 +1050,8 @@ def load_settings() -> dict:
             return json.load(f)
     return {}
 
-def save_settings():
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(SETTINGS, f, indent=2, ensure_ascii=False)
+async def save_settings():
+    await asyncio.to_thread(_atomic_write_json, SETTINGS_FILE, SETTINGS, indent=2, ensure_ascii=False)
 
 SETTINGS: dict = load_settings()
 
@@ -951,7 +1063,7 @@ _settings_backup_msg_id: int | None = None
 # Same debounce pattern as analytics — local save_settings() always
 # happens immediately; only the channel mirror is throttled.
 _last_settings_backup_at: float = 0.0
-SETTINGS_BACKUP_MIN_INTERVAL = 5  # seconds
+SETTINGS_BACKUP_MIN_INTERVAL = 300  # seconds
 
 def _get_settings_entry(user_id: int) -> dict:
     key   = str(user_id)
@@ -980,6 +1092,9 @@ def get_randomize_enabled(user_id: int) -> bool:
 
 def get_achievement_notifs_enabled(user_id: int) -> bool:
     return _get_bool_setting(user_id, "achievement_notifs")
+
+def get_spaced_repetition_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "spaced_repetition")
 
 def get_question_timer_seconds(user_id: int) -> int:
     # Defaults to 0 (off) for anyone not yet in SETTINGS — matches
@@ -1061,7 +1176,7 @@ async def restore_settings_from_channel(app):
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
         SETTINGS.update(json.loads(bytes(raw).decode("utf-8")))
-        save_settings()
+        await save_settings()
         _settings_backup_msg_id = pinned.message_id
         print(f"Restored settings: {len(SETTINGS)} user(s).")
 
@@ -1097,9 +1212,8 @@ def load_lecture_results() -> dict:
             return json.load(f)
     return {}
 
-def save_lecture_results():
-    with open(LECTURE_RESULTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(LECTURE_RESULTS, f, indent=2, ensure_ascii=False)
+async def save_lecture_results():
+    await asyncio.to_thread(_atomic_write_json, LECTURE_RESULTS_FILE, LECTURE_RESULTS, indent=2, ensure_ascii=False)
 
 LECTURE_RESULTS: dict = load_lecture_results()
 
@@ -1111,7 +1225,7 @@ _lecture_results_backup_msg_id: int | None = None
 # Same debounce pattern as analytics/settings — local save always
 # happens immediately; only the channel mirror is throttled.
 _last_lecture_results_backup_at: float = 0.0
-LECTURE_RESULTS_BACKUP_MIN_INTERVAL = 5  # seconds
+LECTURE_RESULTS_BACKUP_MIN_INTERVAL = 300  # seconds
 
 def _lr_key(year: str, lecture_key: str) -> str:
     """LECTURE_RESULTS is one shared file across all years — prefix with
@@ -1122,7 +1236,7 @@ def _lr_key(year: str, lecture_key: str) -> str:
 def _get_lecture_results(lecture_key: str) -> dict:
     return LECTURE_RESULTS.setdefault(lecture_key, {})
 
-def _record_lecture_result(user_id: int, lecture_key: str, correct: int, total: int) -> None:
+async def _record_lecture_result(user_id: int, lecture_key: str, correct: int, total: int) -> None:
     if total <= 0:
         return
     results = _get_lecture_results(lecture_key)
@@ -1142,7 +1256,7 @@ def _record_lecture_result(user_id: int, lecture_key: str, correct: int, total: 
         "attempts":     (prev.get("attempts", 0) if prev else 0) + 1,
         "last_at":      _today(),
     }
-    save_lecture_results()
+    await save_lecture_results()
 
 def _lecture_leaderboard(lecture_key: str, limit: int = 10) -> list[dict]:
     """Top attempts for this lecture, best % first (ties broken by more
@@ -1215,7 +1329,7 @@ async def restore_lecture_results_from_channel(app):
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
         LECTURE_RESULTS.update(json.loads(bytes(raw).decode("utf-8")))
-        save_lecture_results()
+        await save_lecture_results()
         _lecture_results_backup_msg_id = pinned.message_id
         print(f"Restored lecture results: {len(LECTURE_RESULTS)} lecture(s).")
 
@@ -1228,18 +1342,26 @@ async def restore_lecture_results_from_channel(app):
 #
 # mistakes_bank.json schema:
 # [
-#   {
-#     "question": str, "options": [str, ...], "correct_option_id": int,
-#     "explanation": str | None, "year": str, "module": str, "subject": str,
-#   },
+#   {"mid": int, "year": str, "module": str, "subject": str},
 #   ...
 # ]
 #
-# Snapshots are self-contained (full question/options/answer baked in) —
-# deliberately NOT a list of mid/lecture_key references, since a mistake
-# needs to keep working even if the original lecture is later edited or
-# deleted, and it needs to be deliverable without depending on any one
-# year's channel/state at all.
+# Entries are lightweight REFERENCES, not self-contained snapshots — just
+# the question's message id (mid) plus enough scoping info to filter by
+# /daily_module and to look the question back up. Full content (question/
+# options/correct_option_id/explanation) is resolved on demand via
+# _snapshot_from_mid, which reads QUIZ_POLL_STATUS[year] — the same data
+# that's durably backed up per year in that year's quiz backup document
+# (see QUIZ_BACKUP_MARKER / backup_quiz_to_channel). This is what keeps
+# this file from ballooning: it used to bake in the full question text/
+# options on every miss, which made mistakes_bank.json grow unbounded.
+#
+# Trade-off vs. the old self-contained design: a mistake now stops
+# resolving if its specific question message is later deleted (not just
+# edited — QUIZ_POLL_STATUS keeps content fine for edited/closed
+# questions). _resolve_mistake prunes any entry that no longer resolves
+# the moment it's looked up, so the bank self-cleans instead of
+# accumulating dead references.
 #
 # Mirrors LECTURE_RESULTS exactly: local JSON file, plus a pinned backup
 # in MISTAKES_BANK_GROUP_ID that gets replaced (upload + pin + delete old
@@ -1254,9 +1376,8 @@ def load_mistakes_bank() -> list:
             return json.load(f)
     return []
 
-def save_mistakes_bank():
-    with open(MISTAKES_BANK_FILE, "w", encoding="utf-8") as f:
-        json.dump(MISTAKES_BANK, f, indent=2, ensure_ascii=False)
+async def save_mistakes_bank():
+    await asyncio.to_thread(_atomic_write_json, MISTAKES_BANK_FILE, MISTAKES_BANK, indent=2, ensure_ascii=False)
 
 MISTAKES_BANK: list = load_mistakes_bank()
 
@@ -1268,22 +1389,20 @@ _mistakes_bank_backup_msg_id: int | None = None
 # Same debounce pattern as lecture results — local save always happens
 # immediately; only the channel mirror is throttled.
 _last_mistakes_bank_backup_at: float = 0.0
-MISTAKES_BANK_BACKUP_MIN_INTERVAL = 5  # seconds
+MISTAKES_BANK_BACKUP_MIN_INTERVAL = 300  # seconds
 
-def record_mistake(question: str, options: list, correct_option_id: int,
-                    explanation: str | None, year: str, module: str, subject: str) -> bool:
-    """Adds a wrong-answer snapshot to the bank, deduped by question text +
-    options (so the same question missed by 50 different people over time
-    only ever occupies one slot). Returns whether a new entry was added
-    (False if it was already there — nothing to save/back up in that case)."""
+async def record_mistake(mid: int, year: str, module: str, subject: str) -> bool:
+    """Adds a wrong-answer REFERENCE to the bank — just the question id
+    (mid) + scoping info, not the full question text (see schema note
+    above). Deduped by (year, mid), so the same question missed by 50
+    different people over time only ever occupies one slot. Returns
+    whether a new entry was added (False if it was already there —
+    nothing to save/back up in that case)."""
     for m in MISTAKES_BANK:
-        if m["question"] == question and m["options"] == options:
+        if m["mid"] == mid and m["year"] == year:
             return False
-    MISTAKES_BANK.append({
-        "question": question, "options": options, "correct_option_id": correct_option_id,
-        "explanation": explanation, "year": year, "module": module, "subject": subject,
-    })
-    save_mistakes_bank()
+    MISTAKES_BANK.append({"mid": mid, "year": year, "module": module, "subject": subject})
+    await save_mistakes_bank()
     return True
 
 async def backup_mistakes_bank_to_channel(context):
@@ -1341,7 +1460,7 @@ async def restore_mistakes_bank_from_channel(app):
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
         MISTAKES_BANK[:] = json.loads(bytes(raw).decode("utf-8"))
-        save_mistakes_bank()
+        await save_mistakes_bank()
         _mistakes_bank_backup_msg_id = pinned.message_id
         print(f"Restored mistakes bank: {len(MISTAKES_BANK)} question(s).")
 
@@ -1389,6 +1508,18 @@ def next_daily_quiz_time() -> datetime:
     today_push = now.replace(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, second=0, microsecond=0)
     return today_push if now < today_push else today_push + timedelta(days=1)
 
+_DAILY_QUIZ_POOL_CACHE: dict = {"pool": None, "built_at": 0.0, "scope_key": None}
+_DAILY_QUIZ_POOL_CACHE_TTL_SECONDS = 120
+# Rebuilding this pool means: for every (module, subject) pair, scanning
+# the ENTIRE year's QUIZ_INDEX to find lectures matching that pair (see
+# ready_lecture_keys), on top of a QUIZ_POLL_STATUS scan. That's fine once
+# — it's expensive when 700 students all tap "Daily Quiz" inside the same
+# push window and each one triggers a fresh rebuild. The pool doesn't
+# depend on which student is asking, so it's cached for a couple of
+# minutes; a lecture that gets closed mid-window just joins the pool the
+# next time the cache refreshes rather than instantly, which is fine for
+# a once-a-day quiz. Invalidated early if the admin changes /daily_module
+# scope, so a scope change is never stuck behind a stale cache.
 def _daily_quiz_subject_pool() -> dict:
     """Every ready (closed-poll) question mid, across all subjects,
     grouped by (year, module, subject) — the pool build_daily_quiz_questions
@@ -1396,8 +1527,17 @@ def _daily_quiz_subject_pool() -> dict:
     than one; this is just how the mids are organized so a scope filter
     can narrow it before picking). Normally spans every configured
     year/module; if an admin has set a scope via /daily_module, narrowed
-    to just that one module."""
+    to just that one module. Cached briefly — see _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS."""
     scope = get_daily_quiz_scope()
+    scope_key = (scope["year"], scope["module"]) if scope else None
+
+    now = time.monotonic()
+    cache = _DAILY_QUIZ_POOL_CACHE
+    if (cache["pool"] is not None
+            and cache["scope_key"] == scope_key
+            and now - cache["built_at"] < _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS):
+        return cache["pool"]
+
     years = [scope["year"]] if scope else configured_years()
 
     pool = {}   # (year, module, subject) -> [mid, ...]
@@ -1414,14 +1554,28 @@ def _daily_quiz_subject_pool() -> dict:
                     mids.extend(mid for mid in ids if mid in closed_message_ids)
                 if mids:
                     pool[(year, module, subject)] = mids
+
+    cache["pool"] = pool
+    cache["built_at"] = now
+    cache["scope_key"] = scope_key
     return pool
 
-async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid: int, module: str, subject: str) -> dict | None:
+async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid: int, module: str, subject: str,
+                              status_by_mid: dict | None = None) -> dict | None:
     """Builds a self-contained question dict (same shape as a
     MISTAKES_BANK entry) from a channel poll's captured content. Returns
     None if the content was never captured and couldn't be recovered
-    (very old lecture, or the message is gone) — callers skip it."""
-    status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
+    (very old lecture, or the message is gone) — callers skip it.
+
+    status_by_mid, if given, is a {message_id: status} map for this year
+    (built once by the caller) used instead of scanning
+    QUIZ_POLL_STATUS[year] here — callers that resolve many mids in a row
+    (e.g. build_daily_quiz_questions) should pass one in so N lookups cost
+    O(N) total instead of O(N * len(QUIZ_POLL_STATUS[year]))."""
+    if status_by_mid is not None:
+        status = status_by_mid.get(mid)
+    else:
+        status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
     question    = status.get("question")           if status else None
     options     = status.get("options")             if status else None
     correct_id  = status.get("correct_option_id")   if status else None
@@ -1437,11 +1591,58 @@ def _scoped_mistakes_bank() -> list:
     """MISTAKES_BANK filtered to the admin-set /daily_module scope, if
     any. Unlike the subject pool (which is scoped by construction), this
     filters the flat list directly since MISTAKES_BANK isn't grouped by
-    (year, module) already."""
+    (year, module) already. Returns lightweight {mid, year, module,
+    subject} references — see _resolve_mistake(s) to turn these into full
+    question dicts."""
     scope = get_daily_quiz_scope()
     if not scope:
         return MISTAKES_BANK
     return [m for m in MISTAKES_BANK if m["year"] == scope["year"] and m["module"] == scope["module"]]
+
+def _poll_status_index(year: str) -> dict:
+    """{message_id: status} for every poll tracked in QUIZ_POLL_STATUS[year].
+    Built fresh each call (QUIZ_POLL_STATUS is mutated in many places, so
+    this isn't cached) — the point is letting a caller that's about to
+    resolve several mids in the same year pay this scan once instead of
+    once per mid, not eliminating the scan altogether."""
+    return {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values()}
+
+async def _resolve_mistake(context: ContextTypes.DEFAULT_TYPE, entry: dict, status_by_mid: dict | None = None) -> dict | None:
+    """Turns one lightweight MISTAKES_BANK entry ({mid, year, module,
+    subject}) into a full self-contained question dict via
+    _snapshot_from_mid. If the question no longer resolves (its message
+    was deleted since the mistake was recorded), the entry is pruned from
+    MISTAKES_BANK right here — a failed lookup means it'll never resolve
+    again, so there's no point keeping it around. Returns None in that
+    case; callers just skip it.
+
+    status_by_mid, if given, is passed straight through to
+    _snapshot_from_mid (see there) — pass one in when resolving several
+    entries from the same year in a row, e.g. via _resolve_mistakes."""
+    snap = await _snapshot_from_mid(context, entry["year"], entry["mid"], entry["module"], entry["subject"], status_by_mid)
+    if snap is None:
+        try:
+            MISTAKES_BANK.remove(entry)
+            await save_mistakes_bank()
+        except ValueError:
+            pass   # already removed by a concurrent lookup — harmless
+    return snap
+
+async def _resolve_mistakes(context: ContextTypes.DEFAULT_TYPE, entries: list) -> list:
+    """Resolves a list of MISTAKES_BANK entries to full question dicts,
+    silently dropping (and pruning) any that no longer resolve. Builds one
+    poll-status index per distinct year among the entries, rather than
+    scanning QUIZ_POLL_STATUS[year] again for every single entry."""
+    status_by_mid_by_year: dict = {}
+    resolved = []
+    for entry in entries:
+        year = entry["year"]
+        if year not in status_by_mid_by_year:
+            status_by_mid_by_year[year] = _poll_status_index(year)
+        snap = await _resolve_mistake(context, entry, status_by_mid_by_year[year])
+        if snap:
+            resolved.append(snap)
+    return resolved
 
 async def build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE) -> list:
     """The full 10-question set for one Daily Quiz run: 7 random questions
@@ -1462,17 +1663,25 @@ async def build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE) -> list
     ]
     random.shuffle(all_mids)
 
+    # One poll-status index per distinct year touched, built once here
+    # rather than _snapshot_from_mid scanning QUIZ_POLL_STATUS[year] fresh
+    # for every one of up to DAILY_QUIZ_SUBJECT_COUNT questions.
+    status_by_mid_by_year: dict = {}
+
     questions = []
     for year, module, subject, mid in all_mids:
         if len(questions) >= DAILY_QUIZ_SUBJECT_COUNT:
             break
-        snap = await _snapshot_from_mid(context, year, mid, module, subject)
+        if year not in status_by_mid_by_year:
+            status_by_mid_by_year[year] = _poll_status_index(year)
+        snap = await _snapshot_from_mid(context, year, mid, module, subject, status_by_mid_by_year[year])
         if snap:
             questions.append(snap)
 
     mistakes = _scoped_mistakes_bank()
     if mistakes:
-        questions.extend(random.sample(mistakes, k=min(DAILY_QUIZ_MISTAKES_COUNT, len(mistakes))))
+        sample = random.sample(mistakes, k=min(DAILY_QUIZ_MISTAKES_COUNT, len(mistakes)))
+        questions.extend(await _resolve_mistakes(context, sample))
 
     random.shuffle(questions)
     return questions
@@ -1522,7 +1731,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
-    events     = _record_activity(user_id)
+    events     = await _record_activity(user_id)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -1550,7 +1759,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     if final_level > user_entry["level"]:
         user_entry["level"] = final_level
         events["level_up"] = final_level
-    save_analytics()
+    await save_analytics()
     await _announce_events(context, user_id, events)
     await backup_analytics_to_channel(context)
 
@@ -1596,12 +1805,12 @@ def get_daily_quiz_scope() -> dict | None:
     module, or None for the default (every configured year/module)."""
     return SETTINGS.get("_daily_quiz_scope")
 
-def set_daily_quiz_scope(year: str | None, module: str | None) -> None:
+async def set_daily_quiz_scope(year: str | None, module: str | None) -> None:
     if year and module:
         SETTINGS["_daily_quiz_scope"] = {"year": year, "module": module}
     else:
         SETTINGS.pop("_daily_quiz_scope", None)
-    save_settings()
+    await save_settings()
 
 async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
     """Shared by the 💥Daily Quiz💥 button and (if ever wanted) any other
@@ -1631,7 +1840,7 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
 
     entry = _get_settings_entry(user_id)
     entry["daily_quiz_last_date"] = today
-    save_settings()
+    await save_settings()
     await backup_settings_to_channel(context)
 
     session = {
@@ -1684,7 +1893,8 @@ async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int
     /daily_module scope (or the whole bank if no scope is set), sent one
     at a time. No once-per-day gate — unlike the Daily Quiz, this is an
     on-demand review the user can retake as often as they like."""
-    questions = list(_scoped_mistakes_bank())
+    entries   = list(_scoped_mistakes_bank())
+    questions = await _resolve_mistakes(context, entries) if entries else []
     if not questions:
         text = "🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
@@ -1725,7 +1935,7 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
     xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
-    events     = _record_activity(user_id)
+    events     = await _record_activity(user_id)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -1753,7 +1963,7 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
     if final_level > user_entry["level"]:
         user_entry["level"] = final_level
         events["level_up"] = final_level
-    save_analytics()
+    await save_analytics()
     await _announce_events(context, user_id, events)
     await backup_analytics_to_channel(context)
 
@@ -1795,9 +2005,8 @@ def load_storage_index():
             return json.load(f)
     return {}
 
-def save_storage_index():
-    with open(STORAGE_INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(STORAGE_INDEX, f, ensure_ascii=False)
+async def save_storage_index():
+    await asyncio.to_thread(_atomic_write_json, STORAGE_INDEX_FILE, STORAGE_INDEX, ensure_ascii=False)
 
 # password (lowercased) -> list of items; each item is a list of message_ids
 # (a single-message item is [id], an album is [id1, id2, ...]). Reusing the
@@ -1824,9 +2033,8 @@ def load_storage_backup_state():
             return json.load(f)
     return {}
 
-def save_storage_backup_state():
-    with open(STORAGE_BACKUP_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(STORAGE_BACKUP_STATE, f, ensure_ascii=False)
+async def save_storage_backup_state():
+    await asyncio.to_thread(_atomic_write_json, STORAGE_BACKUP_STATE_FILE, STORAGE_BACKUP_STATE, ensure_ascii=False)
 
 STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
 
@@ -1864,7 +2072,7 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
     # haves on top, and their failure (e.g. bot isn't admin / lacks rights)
     # must NOT stop us from remembering this new message id.
     STORAGE_BACKUP_STATE["backup_msg_id"] = sent.message_id
-    save_storage_backup_state()
+    await save_storage_backup_state()
 
     try:
         await context.bot.pin_chat_message(chat_id=STORAGE_GROUP_ID, message_id=sent.message_id, disable_notification=True)
@@ -1892,10 +2100,10 @@ async def restore_storage_from_channel(app):
             payload = json.loads(bytes(raw).decode("utf-8"))
             USERS.update(payload.get("users", []))
             STORAGE_INDEX.update(payload.get("storage_index", {}))
-            save_users()
-            save_storage_index()
+            await save_users()
+            await save_storage_index()
             STORAGE_BACKUP_STATE["backup_msg_id"] = pinned.message_id
-            save_storage_backup_state()
+            await save_storage_backup_state()
             print(f"Restored storage backup: {len(USERS)} user(s), {len(STORAGE_INDEX)} password(s).")
 
     not_found_hint = (
@@ -1929,10 +2137,9 @@ def load_quiz_index(year: str) -> dict:
             return json.load(f)
     return {}
 
-def save_quiz_index(year: str):
+async def save_quiz_index(year: str):
     path = QUIZ_INDEX_FILE_TMPL.format(year=year)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(QUIZ_INDEX[year], f, ensure_ascii=False)
+    await asyncio.to_thread(_atomic_write_json, path, QUIZ_INDEX[year], ensure_ascii=False)
 
 # year -> {lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}}
 QUIZ_INDEX: dict = {y: load_quiz_index(y) for y in YEARS}
@@ -2003,10 +2210,9 @@ def load_quiz_state(year: str) -> dict:
             return json.load(f)
     return {"current_lecture": None}
 
-def save_quiz_state(year: str):
+async def save_quiz_state(year: str):
     path = QUIZ_STATE_FILE_TMPL.format(year=year)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(QUIZ_STATE[year], f, ensure_ascii=False)
+    await asyncio.to_thread(_atomic_write_json, path, QUIZ_STATE[year], ensure_ascii=False)
 
 QUIZ_STATE: dict = {y: load_quiz_state(y) for y in YEARS}  # survives restarts mid-lecture, per year
 
@@ -2019,10 +2225,9 @@ def load_quiz_poll_status(year: str) -> dict:
             return json.load(f)
     return {}
 
-def save_quiz_poll_status(year: str):
+async def save_quiz_poll_status(year: str):
     path = QUIZ_POLL_STATUS_FILE_TMPL.format(year=year)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(QUIZ_POLL_STATUS[year], f, ensure_ascii=False)
+    await asyncio.to_thread(_atomic_write_json, path, QUIZ_POLL_STATUS[year], ensure_ascii=False)
 
 # year -> {poll_id -> {"lecture": str, "message_id": int, "closed": bool, ...}}
 # Tracks whether each quiz-channel poll has been stopped yet — Telegram
@@ -2044,10 +2249,9 @@ def load_quiz_backup_state(year: str) -> dict:
             return json.load(f)
     return {}
 
-def save_quiz_backup_state(year: str):
+async def save_quiz_backup_state(year: str):
     path = QUIZ_BACKUP_STATE_FILE_TMPL.format(year=year)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(QUIZ_BACKUP_STATE[year], f, ensure_ascii=False)
+    await asyncio.to_thread(_atomic_write_json, path, QUIZ_BACKUP_STATE[year], ensure_ascii=False)
 
 QUIZ_BACKUP_STATE: dict = {y: load_quiz_backup_state(y) for y in YEARS}  # year -> {"backup_msg_id": int}
 
@@ -2064,7 +2268,12 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE, year: str):
         "quiz_poll_status": QUIZ_POLL_STATUS[year],
     }
     data     = json.dumps(payload).encode("utf-8")
-    filename = f"quizician_quiz_backup_{year}.json"
+    # NOTE: named Quizician_Quiz_Backup (not *_Storage_Backup) even though
+    # this is the file colloquially thought of as "the storage backup" for
+    # a year's questions — quizician_storage_backup.json (no year suffix)
+    # is a different, unrelated file: the password-gated media vault. Two
+    # files named near-identically would be a landmine for future greps.
+    filename = f"Quizician_Quiz_Backup_{year.upper()}.json"
 
     # Same approach as storage backup: editing the existing pinned document
     # in place reliably failed with "Can't parse inputmedia: media not
@@ -2086,7 +2295,7 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE, year: str):
     # whether pinning/deleting-old succeed, so we don't resend a fresh
     # document on every single addition.
     QUIZ_BACKUP_STATE[year]["backup_msg_id"] = sent.message_id
-    save_quiz_backup_state(year)
+    await save_quiz_backup_state(year)
 
     try:
         await context.bot.pin_chat_message(chat_id=channel_id, message_id=sent.message_id, disable_notification=True)
@@ -2117,11 +2326,11 @@ async def restore_quiz_from_channel(app, year: str):
             QUIZ_INDEX[year].update(payload.get("quiz_index", {}))
             QUIZ_STATE[year].update(payload.get("quiz_state", {}))
             QUIZ_POLL_STATUS[year].update(payload.get("quiz_poll_status", {}))
-            save_quiz_index(year)
-            save_quiz_state(year)
-            save_quiz_poll_status(year)
+            await save_quiz_index(year)
+            await save_quiz_state(year)
+            await save_quiz_poll_status(year)
             QUIZ_BACKUP_STATE[year]["backup_msg_id"] = pinned.message_id
-            save_quiz_backup_state(year)
+            await save_quiz_backup_state(year)
             print(f"Restored quiz backup ({year}): {len(QUIZ_INDEX[year])} lecture(s).")
 
     not_found_hint = (
@@ -2144,6 +2353,22 @@ PDF_BG_IMAGE_PATH      = {}    # user_id -> path to an uploaded per-page backgro
 AWAITING_FONT          = {}    # user_id -> True, while the PDF-setup flow is waiting on a font file/skip
 AWAITING_BG            = {}    # user_id -> True, while the PDF-setup flow is waiting on a background image/skip
 SLEEPING               = set()
+
+# ── /health support ──────────────────────────────────────────────
+# In-memory only, so it resets on restart — noted explicitly in the
+# /health output rather than papered over, since a restart is exactly the
+# kind of event this dashboard exists to surface.
+_BOT_STARTED_AT   = time.monotonic()
+# Timestamps of errors actually posted to ERROR_LOG_GROUP_ID (appended
+# only on a successful send — see global_error_handler) — NOT every
+# exception the handler saw, since a send that itself failed never made
+# it into that channel. This deliberately mirrors "what's actually in the
+# errors channel" rather than tracking exceptions independently, since
+# the Bot API has no way to read a channel's message history back to
+# verify the two ever matched. Self-trimmed to the last ~26h.
+_ERROR_LOG_TIMES: list = []
+_ERROR_LOG_MAX_AGE_SECONDS = 26 * 3600   # a bit over a day of headroom; /health itself filters to exactly 24h
+
 PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
 PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
 CLARIFY_QUEUE          = {}    # user_id -> list of PDF_BUFFER indices awaiting a correct-answer tap
@@ -2151,11 +2376,118 @@ POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive au
 PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/"content"/"option", "opt_index": int?}
                                 # awaiting free-text replacement for one field of a just-added question
 LECTURE_SESSIONS       = {}    # user_id -> {"year","module","subject","lecture_key","queue":[mid,...],
-                                #             "current_poll_id","total","answered"} — active one-at-a-time delivery
+                                #             "current_poll_id","total","answered",
+                                #             "poll_status_by_mid": {mid: QUIZ_POLL_STATUS[year][pid], ...}
+                                #             — scoped to this lecture's polls, built once at session
+                                #             start so _advance_lecture_session can look up a wrong
+                                #             answer's content in O(1) instead of scanning the whole
+                                #             year} — active one-at-a-time delivery
 RETAKE_STAGING         = {}    # user_id -> {"year","module","subject","lecture_key","mids":[mid,...]}
                                 # — wrong-question mids from a just-finished lecture, offered via the
                                 # "🔁 Retake incorrect questions!" button; consumed (popped) once tapped
 AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is waiting on a nickname reply
+
+# ── /report_issue support ────────────────────────────────────────
+# REPORT_THREADS mirrors the MISTAKES_BANK persistence pattern exactly:
+# local JSON file, plus a pinned backup in REPORT_ISSUE_GROUP_ID that gets
+# replaced (upload + pin + delete old pin) on every change and restored
+# from on startup. See restore_report_threads_from_channel /
+# backup_report_threads_to_channel below, and their registration
+# alongside every other system's restore/backup calls near MAIN.
+AWAITING_REPORT_ISSUE  = {}    # user_id -> True, while waiting on the user's issue text after /report_issue
+AWAITING_REPORT_REPLY  = {}    # admin_id -> {"group_message_id": int}
+                                # — set when the admin taps "↩️ Reply" on a report in REPORT_ISSUE_GROUP_ID;
+                                # the admin's next text message there becomes the reply sent back to that user
+
+REPORT_THREADS_FILE          = "report_threads.json"
+REPORT_THREADS_BACKUP_MARKER = "📩 QUIZICIAN_REPORT_THREADS_BACKUP"
+
+def load_report_threads() -> dict:
+    if os.path.exists(REPORT_THREADS_FILE):
+        with open(REPORT_THREADS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        return {int(k): v for k, v in raw.items()}   # JSON keys are always strings — back to int here
+    return {}
+
+async def save_report_threads():
+    # JSON object keys must be strings, so REPORT_THREADS (keyed by an
+    # int message_id) needs the same str(k)/int(k) round-trip on the way
+    # out and back in — see load_report_threads above.
+    await asyncio.to_thread(
+        _atomic_write_json, REPORT_THREADS_FILE,
+        {str(k): v for k, v in REPORT_THREADS.items()}, indent=2, ensure_ascii=False,
+    )
+
+REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id","name","username","user_text","replies","closed"}
+                                                # — one entry per report ever filed, so the report message can be
+                                                # rebuilt (user text + every reply so far) each time it's edited
+
+_report_threads_backup_msg_id: int | None = None
+_last_report_threads_backup_at: float = 0.0
+REPORT_THREADS_BACKUP_MIN_INTERVAL = 300   # seconds — same debounce as mistakes bank; local save is never throttled
+
+async def backup_report_threads_to_channel(context):
+    global _report_threads_backup_msg_id, _last_report_threads_backup_at
+    if not REPORT_ISSUE_GROUP_ID:
+        return
+    if not RESTORE_OK.get("report_threads", True):
+        print("REPORT THREADS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if now - _last_report_threads_backup_at < REPORT_THREADS_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_report_threads() already has the latest data
+    _last_report_threads_backup_at = now
+    data = json.dumps({str(k): v for k, v in REPORT_THREADS.items()}, indent=2, ensure_ascii=False).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=REPORT_ISSUE_GROUP_ID,
+            document=InputFile(BytesIO(data), filename="report_threads.json"),
+            caption=REPORT_THREADS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("REPORT THREADS BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=REPORT_ISSUE_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("REPORT THREADS PIN ERROR:", e)
+    if _report_threads_backup_msg_id and _report_threads_backup_msg_id != sent.message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=REPORT_ISSUE_GROUP_ID,
+                message_id=_report_threads_backup_msg_id,
+            )
+        except Exception:
+            pass
+    _report_threads_backup_msg_id = sent.message_id
+
+async def restore_report_threads_from_channel(app):
+    global _report_threads_backup_msg_id
+    if not REPORT_ISSUE_GROUP_ID:
+        return
+
+    async def _do():
+        global _report_threads_backup_msg_id
+        chat   = await app.bot.get_chat(REPORT_ISSUE_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document:
+            return
+        if (pinned.caption or "") != REPORT_THREADS_BACKUP_MARKER:
+            return
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        REPORT_THREADS.clear()
+        REPORT_THREADS.update({int(k): v for k, v in restored.items()})
+        await save_report_threads()
+        _report_threads_backup_msg_id = pinned.message_id
+        print(f"Restored report threads: {len(REPORT_THREADS)} thread(s).")
+
+    await _run_restore_with_retries(app, "report_threads", "Report threads", _do)
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -2165,6 +2497,46 @@ TELEGRAM_Q_LIMIT      = 300   # max chars in poll question field
 TELEGRAM_DESC_LIMIT   = 200   # max chars in poll description (shown above question)
 TELEGRAM_EX_LIMIT     = 200   # max chars in poll explanation (shown after answering)
 PDF_MAX_IMG_WIDTH     = 13 * cm
+
+# ═══════════════════════════════════════════════════════════════
+# PER-USER SERIALIZATION
+#
+# Now that concurrent_updates() lets updates from different users run at
+# the same time (see the ApplicationBuilder call near the bottom of this
+# file), two updates from the SAME user in quick succession (a fast
+# double-tap, or a poll-answer racing a button tap) could otherwise
+# interleave mid-handler and corrupt shared per-user state — e.g. two
+# coroutines both reading LECTURE_SESSIONS[user_id], each unaware the
+# other is also about to mutate it, with real await points (Telegram API
+# calls, disk writes) in between the read and the write.
+#
+# @_serialize_per_user fixes this without touching either handler's body:
+# it runs everything from the same user_id through a private asyncio.Lock,
+# so a user's own updates are still handled one-at-a-time, in order — but
+# different users remain fully concurrent with each other, which is what
+# actually matters at 500+ simultaneous users.
+# ═══════════════════════════════════════════════════════════════
+_user_locks: dict[int, asyncio.Lock] = {}
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+    return lock
+
+def _serialize_per_user(handler):
+    """Decorator for update handlers: serializes concurrent updates from
+    the same user_id through a per-user lock. No-ops (calls straight
+    through) if the update has no identifiable user."""
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if user is None:
+            return await handler(update, context, *args, **kwargs)
+        async with _get_user_lock(user.id):
+            return await handler(update, context, *args, **kwargs)
+    return wrapper
 
 # ═══════════════════════════════════════════════════════════════
 # HELPERS
@@ -2565,6 +2937,9 @@ def start_menu_keyboard():
         [
             InlineKeyboardButton("🧠 Mistakes Bank", callback_data="mistakes_bank_menu"),
         ],
+        [
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="year_leaderboard"),
+        ],
     ])
 
 def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -2574,6 +2949,7 @@ def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     auto_next  = get_auto_next_enabled(user_id)
     randomize  = get_randomize_enabled(user_id)
     ach_notifs = get_achievement_notifs_enabled(user_id)
+    spaced_rep = get_spaced_repetition_enabled(user_id)
     timer      = get_question_timer_seconds(user_id)
     timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
     yc_label   = year_class_label(get_year_class(user_id))
@@ -2584,6 +2960,7 @@ def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
         [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
         [InlineKeyboardButton(f"🏆 Achievement Alerts: {_tag(ach_notifs)}", callback_data="toggle_achievement_notifs")],
+        [InlineKeyboardButton(f"🔁 Spaced Repetition: {_tag(spaced_rep)}", callback_data="toggle_spaced_repetition")],
         [InlineKeyboardButton(f"⏱️ Question Timer: {timer_tag}", callback_data="toggle_question_timer")],
         [InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home")],
     ])
@@ -3107,7 +3484,7 @@ async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             entry["question"]    = poll.question
             entry["options"]     = [o.text for o in poll.options]
             entry["explanation"] = poll.explanation
-            save_quiz_poll_status(poll_year)
+            await save_quiz_poll_status(poll_year)
             try:
                 await context.bot.set_message_reaction(
                     chat_id=year_channel_id(poll_year), message_id=entry["message_id"],
@@ -3174,20 +3551,42 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
     Sets session['current_poll_id']. Returns whether a question went out."""
     year  = session["year"]
     entry = QUIZ_INDEX[year].get(session["lecture_key"])
+    # Same index used by _advance_lecture_session for the mistakes-bank
+    # lookup — scoped to this lecture's polls, built once at session start.
+    # Falls back to a fresh year-wide scan only for sessions predating this
+    # field (shouldn't happen once a bot restart has run, but keeps old
+    # in-memory sessions from crashing rather than erroring).
+    poll_status_by_mid = session.get("poll_status_by_mid")
+    if poll_status_by_mid is None:
+        poll_status_by_mid = {
+            v["message_id"]: v
+            for v in QUIZ_POLL_STATUS[year].values()
+            if v["lecture"] == session["lecture_key"]
+        }
+        session["poll_status_by_mid"] = poll_status_by_mid
 
-    def _drop_dead(mid: int):
+    async def _drop_dead(mid: int):
         if entry and mid in entry.get("ids", []):
             entry["ids"].remove(mid)
             if not entry["ids"]:
                 QUIZ_INDEX[year].pop(session["lecture_key"], None)  # whole lecture was deleted
-        for pid in [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
-            QUIZ_POLL_STATUS[year].pop(pid, None)
-        save_quiz_index(year)
-        save_quiz_poll_status(year)
+        dead_status = poll_status_by_mid.pop(mid, None)
+        if dead_status is not None:
+            for pid, v in list(QUIZ_POLL_STATUS[year].items()):
+                if v is dead_status:
+                    QUIZ_POLL_STATUS[year].pop(pid, None)
+                    break
+        else:
+            # Not in our index (legacy session, or already gone) — fall back
+            # to the direct scan rather than silently leaving a stale entry.
+            for pid in [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
+                QUIZ_POLL_STATUS[year].pop(pid, None)
+        await save_quiz_index(year)
+        await save_quiz_poll_status(year)
 
     while session["queue"]:
         mid = session["queue"].pop(0)
-        status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
+        status = poll_status_by_mid.get(mid)
 
         question    = status.get("question")    if status else None
         options     = status.get("options")      if status else None
@@ -3205,7 +3604,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
                 probe = await context.bot.forward_message(chat_id=user_id, from_chat_id=year_channel_id(year), message_id=mid)
             except Exception as e:
                 print(f"Quiz question {mid} in lecture '{session['lecture_key']}' ({year}) unreachable (likely deleted): {e}")
-                _drop_dead(mid)
+                await _drop_dead(mid)
                 continue
             if probe.poll and probe.poll.correct_option_ids:
                 question    = probe.poll.question
@@ -3215,7 +3614,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
                 if status is not None:
                     status.update(question=question, options=options,
                                    correct_option_id=correct_id, explanation=explanation)
-                    save_quiz_poll_status(year)
+                    await save_quiz_poll_status(year)
             try:
                 await context.bot.delete_message(chat_id=user_id, message_id=probe.message_id)
             except Exception:
@@ -3272,6 +3671,7 @@ async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, use
     session["current_mid"]        = None
     return sent_count
 
+@_serialize_per_user
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fires when a user answers a poll the bot sent (our lecture-delivery
     polls are always is_anonymous=False specifically so this reliably
@@ -3304,6 +3704,24 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     session = LECTURE_SESSIONS.get(user_id)
     if not session:
+        # No session at all for this user — most likely the bot restarted
+        # (all of LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS
+        # are in-memory only, wiped on restart) while they were mid-quiz.
+        # We can't tell from here which kind of session this poll_id used
+        # to belong to, so this is deliberately generic rather than
+        # guessing "lecture" when it might have been a Daily Quiz or
+        # retake. Best-effort: if the send fails, still just return quietly.
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "⚠️ يبدو إن الجلسة دي اتقفلت (البوت أعاد التشغيل لسه) — "
+                    "مينفعش نكمل من نفس السؤال. ابدأ تاني: /quiz للمحاضرات، "
+                    "أو من زرار 💥Daily Quiz💥."
+                ),
+            )
+        except Exception:
+            pass
         return
 
     if session.get("mode") == "batch":
@@ -3314,6 +3732,41 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         chosen     = answer.option_ids[0] if answer.option_ids else None
         is_correct = chosen is not None and chosen == correct_id
         await _advance_lecture_session(context, user_id, session, is_correct, message_id, mid)
+        return
+
+    # ── Spaced Repetition re-ask answer ──────────────────────────
+    # Checked before the normal current_poll_id match below, since a
+    # re-ask's poll_id was never written into current_poll_id/
+    # current_correct_id — see _maybe_deliver_spaced_repetition. No-stakes:
+    # doesn't touch session["answered"]/["correct"], XP, or the mistakes
+    # bank — just the 🤩/😢 reaction — then falls through to delivering
+    # the actual next lecture question, same as a normal answer would.
+    if session.get("sr_pending_poll_id") == poll_id:
+        chosen     = answer.option_ids[0] if answer.option_ids else None
+        is_correct = chosen is not None and chosen == session.get("sr_pending_correct_id")
+        sr_message_id = session.get("sr_pending_message_id")
+        session.pop("sr_pending", None)
+        session.pop("sr_pending_poll_id", None)
+        session.pop("sr_pending_correct_id", None)
+        session.pop("sr_pending_message_id", None)
+        if sr_message_id is not None:
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=user_id, message_id=sr_message_id,
+                    reaction=[ReactionTypeEmoji("🤩" if is_correct else "😢")], is_big=False,
+                )
+            except Exception:
+                pass
+        sent_sr = await _maybe_deliver_spaced_repetition(context, user_id, session)
+        if not sent_sr:
+            sent_next = await _deliver_next_lecture_question(context, user_id, session)
+            if not sent_next:
+                # Queue was already empty (or every remaining id was dead)
+                # by the time this re-ask came back — the lecture actually
+                # finished on the answer that triggered the re-ask, but
+                # the summary was deferred until the re-ask itself
+                # resolved so the two questions don't overlap in the chat.
+                await _finish_lecture_session(context, user_id, session)
         return
 
     if session.get("current_poll_id") != poll_id:
@@ -3327,6 +3780,136 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def _maybe_deliver_spaced_repetition(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
+    """Spaced Repetition (Settings toggle, on by default): every 5-8
+    questions (re-rolled each time so the interval isn't predictable), if
+    the user has a wrong answer from earlier in this lecture that hasn't
+    been re-asked yet, re-send it as an extra question before the next
+    fresh one. Auto-next mode only — batch mode sends every question
+    up front, so there's no "next question" moment to insert into.
+
+    The re-ask is no-stakes: it doesn't touch session['answered']/
+    ['correct'], XP, the mistakes bank, or the normal correctness
+    reactions — it's purely a memory check with its own reaction set
+    (👀 on send, 🤩 if they get it right this time, 😢 if not). Getting
+    it wrong again does NOT re-queue it; it stays in the mistakes bank
+    from its original miss (see _advance_lecture_session) and the user
+    can drill it properly later via the Mistakes Bank / retake flow —
+    this feature is a lightweight in-lecture nudge, not a full leitner
+    system.
+
+    Sets session['sr_pending'] = mid when a re-ask goes out, which
+    handle_poll_answer checks before treating an answer as a normal
+    lecture question. Returns whether a re-ask was actually sent."""
+    if session.get("mode") == "batch":
+        return False
+    if session.get("is_retake"):
+        return False   # the whole session IS already a re-ask of prior wrong answers — nothing to layer on top
+    if not get_spaced_repetition_enabled(user_id):
+        return False
+
+    pool = session.setdefault("sr_pool", [])          # wrong mids not yet re-asked, this lecture
+    asked = session.setdefault("sr_asked", set())      # wrong mids already re-asked once, this lecture
+    for wrong_mid in session.get("wrong_mids", []):
+        if wrong_mid not in pool and wrong_mid not in asked:
+            pool.append(wrong_mid)
+    if not pool:
+        return False
+
+    session["sr_counter"] = session.get("sr_counter", 0) + 1
+    threshold = session.get("sr_next_threshold")
+    if threshold is None:
+        threshold = random.randint(5, 8)
+        session["sr_next_threshold"] = threshold
+    if session["sr_counter"] < threshold:
+        return False
+
+    # Time to re-ask. Reset the counter/threshold for the next interval
+    # regardless of whether the send below actually succeeds — a poll
+    # send failure here shouldn't jam the trigger into firing again next
+    # question too.
+    session["sr_counter"] = 0
+    session["sr_next_threshold"] = random.randint(5, 8)
+
+    wrong_mid = pool.pop(0)
+    asked.add(wrong_mid)
+    status = session.get("poll_status_by_mid", {}).get(wrong_mid)
+    if not (status and status.get("question") and status.get("options") and status.get("correct_option_id") is not None):
+        return False   # content not resolvable (shouldn't normally happen — it was just answered) — skip quietly
+
+    try:
+        msg = await context.bot.send_poll(
+            chat_id=user_id, question=status["question"], options=status["options"],
+            type="quiz", correct_option_id=status["correct_option_id"], is_anonymous=False,
+            explanation=(status.get("explanation") or None),
+        )
+    except Exception as e:
+        print(f"Couldn't send spaced-repetition re-ask for mid {wrong_mid}: {e}")
+        return False
+
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=user_id, message_id=msg.message_id,
+            reaction=[ReactionTypeEmoji("👀")], is_big=False,
+        )
+    except Exception:
+        pass
+
+    session["sr_pending"]            = wrong_mid
+    session["sr_pending_poll_id"]    = msg.poll.id
+    session["sr_pending_correct_id"] = status["correct_option_id"]
+    session["sr_pending_message_id"] = msg.message_id
+    return True
+
+async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> None:
+    """The lecture-complete summary message + retake-staging + leaderboard
+    write. Split out of _advance_lecture_session so the spaced-repetition
+    re-ask path (see handle_poll_answer) can reach the same completion
+    logic when a re-ask empties the queue, without re-running the
+    XP/streak/achievement bookkeeping that only applies to a real answer."""
+    total     = session["total"]
+    correct   = session["correct"]
+    incorrect = session["answered"] - correct
+    pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+    year = session["year"]
+    lecture_name = QUIZ_INDEX[year].get(session["lecture_key"], {}).get("name", session["lecture_key"])
+    is_retake = session.get("is_retake", False)
+    if not is_retake:
+        # Retakes are practice, not a new attempt at the lecture proper —
+        # they never touch the leaderboard or best-score file.
+        await _record_lecture_result(user_id, _lr_key(year, session["lecture_key"]), correct, session["answered"])
+        await backup_lecture_results_to_channel(context)
+    title = "خلصت مراجعة الأسئلة الغلط!" if is_retake else f"خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!"
+    summary = (
+        f"🎓 <b>{title}</b>\n\n"
+        f"✅ صح: {correct}\n"
+        f"❌ غلط: {incorrect}\n"
+        f"📊 نسبة: {pct}%\n"
+        f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
+        f"✨ XP: <b>+{session['xp_earned']}</b>"
+    )
+    result_buttons = [[
+        InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+        InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_years"),
+    ]]
+    wrong_mids = session.get("wrong_mids", [])
+    if wrong_mids:
+        RETAKE_STAGING[user_id] = {
+            "year": year, "module": session["module"], "subject": session["subject"],
+            "lecture_key": session["lecture_key"], "mids": wrong_mids,
+        }
+        result_buttons.insert(0, [
+            InlineKeyboardButton(f"🔁 Retake incorrect questions! ({len(wrong_mids)})", callback_data="retake_wrong"),
+        ])
+    result_keyboard = InlineKeyboardMarkup(result_buttons)
+    try:
+        await context.bot.send_message(
+            chat_id=user_id, text=summary, parse_mode=ParseMode.HTML, reply_markup=result_keyboard,
+        )
+    except Exception:
+        pass
+    LECTURE_SESSIONS.pop(user_id, None)
+
 async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None = None, mid: int | None = None):
     """Called once handle_poll_answer confirms the user answered their
     current lecture question, and whether it was right. Awards XP —
@@ -3339,17 +3922,20 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     if not is_correct and mid is not None:
         session.setdefault("wrong_mids", []).append(mid)
         # Also pool this question into the cross-user mistakes bank, for
-        # the Daily Quiz's "questions you got wrong before" slice. Uses
-        # whatever QUIZ_POLL_STATUS already captured for this poll — the
-        # same content _deliver_next_lecture_question just used to build
-        # the poll the user answered, so it's always present here.
+        # the Daily Quiz's "questions you got wrong before" slice. Only
+        # store the question id (mid) here, not the full text — full
+        # content is resolved on demand later via _resolve_mistake, which
+        # reads QUIZ_POLL_STATUS[year] (see MISTAKES BANK schema note).
+        # Still check QUIZ_POLL_STATUS captured this poll's content before
+        # recording, same as before, so we never bank a reference that's
+        # already known to be unresolvable. Looked up via the session's own
+        # poll_status_by_mid index (built once at lecture-start, scoped to
+        # this lecture) instead of scanning every poll ever tracked for the
+        # year on every wrong answer.
         year   = session["year"]
-        status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
+        status = session.get("poll_status_by_mid", {}).get(mid)
         if status and status.get("question") and status.get("options") and status.get("correct_option_id") is not None:
-            if record_mistake(
-                status["question"], status["options"], status["correct_option_id"], status.get("explanation"),
-                year, session["module"], session["subject"],
-            ):
+            if await record_mistake(mid, year, session["module"], session["subject"]):
                 await backup_mistakes_bank_to_channel(context)
 
     if session.get("mode") == "batch":
@@ -3358,8 +3944,12 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         # dry (the queue was already drained back at dispatch time).
         is_last = session["answered"] >= session["total"]
     else:
-        sent_next = await _deliver_next_lecture_question(context, user_id, session)
-        is_last   = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
+        sent_sr = await _maybe_deliver_spaced_repetition(context, user_id, session)
+        if sent_sr:
+            is_last = False   # a re-ask went out — lecture isn't over, and no fresh question was pulled this round
+        else:
+            sent_next = await _deliver_next_lecture_question(context, user_id, session)
+            is_last   = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
 
     per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
     xp_delta         = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
@@ -3367,7 +3957,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         xp_delta = 0   # repeat attempt at a lecture already completed once — no XP farming
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
-    events     = _record_activity(user_id)
+    events     = await _record_activity(user_id)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -3398,54 +3988,13 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     if final_level > user_entry["level"]:
         user_entry["level"] = final_level
         events["level_up"] = final_level
-    save_analytics()
+    await save_analytics()
     await _announce_events(context, user_id, events)   # still immediate: level-ups/achievements are rare enough to be worth a heads-up mid-lecture
 
     await backup_analytics_to_channel(context)
 
     if is_last:
-        total     = session["total"]
-        correct   = session["correct"]
-        incorrect = session["answered"] - correct
-        pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
-        year = session["year"]
-        lecture_name = QUIZ_INDEX[year].get(session["lecture_key"], {}).get("name", session["lecture_key"])
-        is_retake = session.get("is_retake", False)
-        if not is_retake:
-            # Retakes are practice, not a new attempt at the lecture proper —
-            # they never touch the leaderboard or best-score file.
-            _record_lecture_result(user_id, _lr_key(year, session["lecture_key"]), correct, session["answered"])
-            await backup_lecture_results_to_channel(context)
-        title = "خلصت مراجعة الأسئلة الغلط!" if is_retake else f"خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!"
-        summary = (
-            f"🎓 <b>{title}</b>\n\n"
-            f"✅ صح: {correct}\n"
-            f"❌ غلط: {incorrect}\n"
-            f"📊 نسبة: {pct}%\n"
-            f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
-            f"✨ XP: <b>+{session['xp_earned']}</b>"
-        )
-        result_buttons = [[
-            InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
-            InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_years"),
-        ]]
-        wrong_mids = session.get("wrong_mids", [])
-        if wrong_mids:
-            RETAKE_STAGING[user_id] = {
-                "year": year, "module": session["module"], "subject": session["subject"],
-                "lecture_key": session["lecture_key"], "mids": wrong_mids,
-            }
-            result_buttons.insert(0, [
-                InlineKeyboardButton(f"🔁 Retake incorrect questions! ({len(wrong_mids)})", callback_data="retake_wrong"),
-            ])
-        result_keyboard = InlineKeyboardMarkup(result_buttons)
-        try:
-            await context.bot.send_message(
-                chat_id=user_id, text=summary, parse_mode=ParseMode.HTML, reply_markup=result_keyboard,
-            )
-        except Exception:
-            pass
-        LECTURE_SESSIONS.pop(user_id, None)
+        await _finish_lecture_session(context, user_id, session)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3694,7 +4243,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context, user_id, question, raw_options, correct_index,
                 explanation=explanation, image_path=img_path,
             )
-            events = _record_activity(real_uid, questions_delta=1)
+            events = await _record_activity(real_uid, questions_delta=1)
             _update_telegram_name(real_uid, update.effective_user)
             await react_random(update, context)
             await _announce_events(context, user_id, events)
@@ -3790,7 +4339,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await deliver_quiz(context, user_id, question, raw_options, correct_index, explanation=explanation)
-            events = _record_activity(real_uid, questions_delta=1)
+            events = await _record_activity(real_uid, questions_delta=1)
             _update_telegram_name(real_uid, update.effective_user)
             await react_random(update, context)
             await _announce_events(context, user_id, events)
@@ -3801,10 +4350,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # STORAGE GROUP — AUTO-INDEXING
 # ═══════════════════════════════════════════════════════════════
-def _index_item(caption: str, message_ids: list):
+async def _index_item(caption: str, message_ids: list):
     password = caption.strip().split(maxsplit=1)[0].lower()
     STORAGE_INDEX.setdefault(password, []).append(sorted(message_ids))
-    save_storage_index()
+    await save_storage_index()
     return password
 
 async def _finalize_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
@@ -3820,7 +4369,7 @@ async def _finalize_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: st
             "⚠️ ألبوم اتبعت من غير كابشن (كلمة سر) — اتجاهله ومحدش هيقدر يفتحه.",
         )
         return
-    password = _index_item(caption, buf["ids"])
+    password = await _index_item(caption, buf["ids"])
     await backup_storage_to_channel(context)
     await context.bot.send_message(
         STORAGE_GROUP_ID,
@@ -3851,7 +4400,7 @@ async def handle_storage_message(update: Update, context: ContextTypes.DEFAULT_T
         await msg.reply_text("⚠️ الملف ده اتبعت من غير كابشن — محتاج كلمة سر في الكابشن عشان يتخزن.")
         return
 
-    password = _index_item(caption, [msg.message_id])
+    password = await _index_item(caption, [msg.message_id])
     await backup_storage_to_channel(context)
     await msg.reply_text(
         f"✅ اتخزن تحت الكلمة: <code>{password}</code>\n"
@@ -3910,7 +4459,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             )
             return
         QUIZ_INDEX[year][current]["ids"].append(msg.message_id)
-        save_quiz_index(year)
+        await save_quiz_index(year)
         # Track this poll so we know once it's stopped (only then is the
         # correct answer known — needed before it can be delivered as a
         # lecture question). question/options are captured right away since
@@ -3927,7 +4476,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             "options":           [o.text for o in msg.poll.options],
             "explanation":       msg.poll.explanation,
         }
-        save_quiz_poll_status(year)
+        await save_quiz_poll_status(year)
         # NOTE: the channel backup document + the "still open" reaction are
         # both deliberately deferred to -END (below) instead of happening
         # here per-question — doing them per-question was sending/pinning
@@ -3975,12 +4524,12 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
                 open_message_ids.remove(mid)
                 auto_stopped += 1
             if auto_stopped:
-                save_quiz_poll_status(year)
+                await save_quiz_poll_status(year)
 
         QUIZ_INDEX[year][current]["closed"] = True
-        save_quiz_index(year)
+        await save_quiz_index(year)
         QUIZ_STATE[year]["current_lecture"] = None
-        save_quiz_state(year)
+        await save_quiz_state(year)
 
         # Batched now, once, instead of one reaction call per question:
         # mark every still-open (forgot to Stop Poll) question in this
@@ -4031,9 +4580,9 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
     entry["subject"]        = subject
     entry["lecture_number"] = lecture_number
     entry["name"]           = name
-    save_quiz_index(year)
+    await save_quiz_index(year)
     QUIZ_STATE[year]["current_lecture"] = text
-    save_quiz_state(year)
+    await save_quiz_state(year)
     await backup_quiz_to_channel(context, year)
     await context.bot.send_message(
         channel_id,
@@ -4174,14 +4723,14 @@ async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     key = keys[n - 1]
     removed = index.pop(key)
-    save_quiz_index(year)
+    await save_quiz_index(year)
     if QUIZ_STATE[year].get("current_lecture") == key:
         QUIZ_STATE[year]["current_lecture"] = None
-        save_quiz_state(year)
+        await save_quiz_state(year)
     stale_polls = [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["lecture"] == key]
     for pid in stale_polls:
         QUIZ_POLL_STATUS[year].pop(pid, None)
-    save_quiz_poll_status(year)
+    await save_quiz_poll_status(year)
     await backup_quiz_to_channel(context, year)
     await update.message.reply_text(
         f"🗑 اتشالت محاضرة من {year_label(year)}: {removed['module']} - {removed['subject']}: {removed['name']}\n"
@@ -4227,10 +4776,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         entry = _get_settings_entry(real_uid)
         entry["nickname"] = nickname
-        save_settings()
+        await save_settings()
         await backup_settings_to_channel(context)
         _get_entry(real_uid)["nickname"] = nickname
-        save_analytics()
+        await save_analytics()
         await backup_analytics_to_channel(context)
         if onboarding:
             await update.message.reply_text(
@@ -4247,6 +4796,84 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=settings_menu_keyboard(real_uid),
             )
+        return
+
+    # ── AWAITING REPORT ISSUE TEXT (/report_issue) ───────────────
+    # Keyed by real_uid, same as nickname above.
+    if AWAITING_REPORT_ISSUE.pop(real_uid, None):
+        if not REPORT_ISSUE_GROUP_ID:
+            await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
+            return
+        tg_user  = update.effective_user
+        name     = " ".join(p for p in (tg_user.first_name, tg_user.last_name) if p).strip() if tg_user else "?"
+        username = tg_user.username if tg_user else None
+        thread = {
+            "user_id":  real_uid,
+            "name":     name or "?",
+            "username": username,
+            "user_text": text,
+            "replies":  [],
+            "closed":   False,
+        }
+        try:
+            sent = await context.bot.send_message(
+                chat_id=REPORT_ISSUE_GROUP_ID,
+                text=_report_thread_text(thread),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_report_reply_keyboard(0, closed=False),   # placeholder id, fixed up right below
+            )
+        except Exception as e:
+            print("REPORT ISSUE SEND FAILED:", e)
+            await update.message.reply_text("⚠️ مشكلة في إرسال الرسالة — جرب تاني لو سمحت.")
+            return
+        # The keyboard's callback_data needs this message's own id, which
+        # we only get back after sending — one quick edit to fix it up.
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=REPORT_ISSUE_GROUP_ID, message_id=sent.message_id,
+                reply_markup=_report_reply_keyboard(sent.message_id, closed=False),
+            )
+        except Exception as e:
+            print("REPORT ISSUE KEYBOARD FIXUP FAILED:", e)
+        REPORT_THREADS[sent.message_id] = thread
+        await save_report_threads()
+        await backup_report_threads_to_channel(context)
+        await update.message.reply_text("✅ اتبعتت. هيتم الرد عليك من هنا لما الأدمن يشوفها.")
+        return
+
+    # ── AWAITING ADMIN REPLY TEXT (report_reply button) ──────────
+    # Keyed by real_uid — only ever set for ADMIN_ID (see button_handler),
+    # but keying by user id here rather than a bare flag keeps this
+    # consistent with every other AWAITING_* dict and costs nothing.
+    pending_reply = AWAITING_REPORT_REPLY.pop(real_uid, None)
+    if pending_reply:
+        group_message_id = pending_reply["group_message_id"]
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread:
+            await update.message.reply_text("⚠️ الـ report ده مش لاقيه دلوقتي (يمكن البوت اتعمله restart).")
+            return
+        thread["replies"].append(text)
+        await save_report_threads()
+        try:
+            await context.bot.send_message(
+                chat_id=thread["user_id"],
+                text=f"📩 <b>رد من الأدمن على مشكلتك:</b>\n\n{html.escape(text)}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            print("REPORT REPLY DELIVERY FAILED:", e)
+            await update.message.reply_text(
+                "⚠️ الرد اتسجل بس معرفتش أبعته للمستخدم (يمكن قافل البوت). هرجع أعدل الرسالة برضو."
+            )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=REPORT_ISSUE_GROUP_ID, message_id=group_message_id,
+                text=_report_thread_text(thread), parse_mode=ParseMode.HTML,
+                reply_markup=_report_reply_keyboard(group_message_id, closed=thread["closed"]),
+            )
+        except Exception as e:
+            print("REPORT THREAD EDIT FAILED:", e)
+        await backup_report_threads_to_channel(context)
         return
 
     # ── AWAITING A QUESTION EDIT (from the review/edit prompt) ───
@@ -4434,7 +5061,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context, user_id, question, raw_options, correct_index,
                 explanation=explanation, image_path=pending_img,
             )
-            events = _record_activity(real_uid, questions_delta=1)
+            events = await _record_activity(real_uid, questions_delta=1)
             _update_telegram_name(real_uid, update.effective_user)
             await react_random(update, context)
             await _announce_events(context, user_id, events)
@@ -4448,10 +5075,56 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # INLINE BUTTON HANDLER
 # ═══════════════════════════════════════════════════════════════
+@_serialize_per_user
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
     await query.answer()
+
+    # ── REPORT ISSUE: reply / close (admin-only, from REPORT_ISSUE_GROUP_ID) ──
+    if query.data == "report_noop":
+        return   # "🔒 Closed" button on an already-closed report — nothing to do
+
+    if query.data.startswith("report_reply:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        group_message_id = int(query.data.split(":", 1)[1])
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread or thread.get("closed"):
+            await query.answer("⚠️ الـ report ده مقفول أو مش لاقيه.", show_alert=True)
+            return
+        AWAITING_REPORT_REPLY[user_id] = {"group_message_id": group_message_id}
+        try:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="✏️ اكتب ردك على المستخدم ده في رسالة، وهيتبعتله على طول.",
+                reply_to_message_id=query.message.message_id,
+            )
+        except Exception as e:
+            print("REPORT REPLY PROMPT FAILED:", e)
+            AWAITING_REPORT_REPLY.pop(user_id, None)   # prompt never went out — don't leave a dangling awaiting-state
+            await query.answer("⚠️ مشكلة في إرسال طلب الرد — جرب تاني.", show_alert=True)
+        return
+
+    if query.data.startswith("report_close:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        group_message_id = int(query.data.split(":", 1)[1])
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread:
+            await query.answer("⚠️ الـ report ده مش لاقيه دلوقتي.", show_alert=True)
+            return
+        thread["closed"] = True
+        AWAITING_REPORT_REPLY.pop(user_id, None)   # cancel any reply this admin was mid-typing for it
+        await save_report_threads()
+        await query.edit_message_text(
+            _report_thread_text(thread), parse_mode=ParseMode.HTML,
+            reply_markup=_report_reply_keyboard(group_message_id, closed=True),
+        )
+        await backup_report_threads_to_channel(context)
+        return
 
     # ── QUIZ YEARS: top-level list ──────────────────────────────────
     if query.data == "quiz_years":
@@ -4649,6 +5322,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lr_key = _lr_key(year, lecture_key)
         already_attempted = str(user_id) in _get_lecture_results(lr_key)
 
+        # Built once here, scoped to just this lecture's polls, so
+        # _advance_lecture_session can do an O(1) lookup by message_id per
+        # wrong answer instead of an O(n) scan over every poll ever tracked
+        # for the year.
+        poll_status_by_mid = {
+            v["message_id"]: v
+            for v in QUIZ_POLL_STATUS[year].values()
+            if v["lecture"] == lecture_key
+        }
+
         session = {
             "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
             "queue": list(ready_ids), "current_poll_id": None, "current_correct_id": None,
@@ -4656,6 +5339,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "mode": "auto" if auto_next else "batch",
             "pending_polls": {},
             "award_xp": not already_attempted,   # no XP farming on repeat attempts
+            "poll_status_by_mid": poll_status_by_mid,
         }
         LECTURE_SESSIONS[user_id] = session
 
@@ -4710,6 +5394,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         auto_next = get_auto_next_enabled(user_id)
 
+        poll_status_by_mid = {
+            v["message_id"]: v
+            for v in QUIZ_POLL_STATUS[year].values()
+            if v["lecture"] == lecture_key
+        }
+
         session = {
             "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
             "queue": list(mids), "current_poll_id": None, "current_correct_id": None,
@@ -4718,6 +5408,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "pending_polls": {},
             "award_xp": True,      # retakes always earn XP
             "is_retake": True,     # ...but never touch the leaderboard/results file
+            "poll_status_by_mid": poll_status_by_mid,
         }
         LECTURE_SESSIONS[user_id] = session
 
@@ -4960,6 +5651,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_mystats(context, user_id, query.message, edit=True)
         return
 
+    if query.data == "year_leaderboard":
+        year_class = get_year_class(user_id)
+        if not year_class:
+            await query.edit_message_text(
+                "📚 محتاج تحدد سنتك/فرقتك الأول عشان تشوف الـ Leaderboard بتاعها.\n"
+                "اختار من هنا:",
+                reply_markup=year_class_keyboard("set_yc"),
+            )
+            return
+        rows = _year_leaderboard(year_class)
+        title = f"🏆 <b>Leaderboard — {year_class_label(year_class)}</b>"
+        if not rows:
+            text = f"{title}\n\nمفيش حد جاوب أسئلة محاضرات في السنة دي لسه."
+        else:
+            medal = {0: "🥇", 1: "🥈", 2: "🥉"}
+            lines = [title, ""]
+            for i, r in enumerate(rows):
+                rank = medal.get(i, f"{i + 1}.")
+                lines.append(f"{rank} {html.escape(r['name'])} (Lv.{r['level']}) — {r['correct']} ✅")
+            text = "\n".join(lines)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+            ]]),
+        )
+        return
+
     if query.data == "menu_settings":
         AWAITING_NICKNAME.pop(user_id, None)
         await _send_settings(context, user_id, query.message, edit=True)
@@ -4992,7 +5711,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         entry = _get_settings_entry(user_id)
         entry["year_class"] = year_class
-        save_settings()
+        await save_settings()
         await backup_settings_to_channel(context)
         if is_onboarding:
             nickname = get_nickname(user_id)
@@ -5013,16 +5732,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_settings(context, user_id, query.message, edit=True)
         return
 
-    if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize", "toggle_achievement_notifs"):
+    if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize", "toggle_achievement_notifs", "toggle_spaced_repetition"):
         key = {
             "toggle_reactions": "reactions",
             "toggle_auto_next": "auto_next",
             "toggle_randomize": "randomize",
             "toggle_achievement_notifs": "achievement_notifs",
+            "toggle_spaced_repetition": "spaced_repetition",
         }[query.data]
         entry = _get_settings_entry(user_id)
         entry[key] = not entry.get(key, True)
-        save_settings()
+        await save_settings()
         await backup_settings_to_channel(context)
         await _send_settings(context, user_id, query.message, edit=True)
         return
@@ -5032,7 +5752,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = _get_settings_entry(user_id)
         current = entry.get("question_timer", 0)
         entry["question_timer"] = {0: 60, 60: 30, 30: 0}.get(current, 0)
-        save_settings()
+        await save_settings()
         await backup_settings_to_channel(context)
         await _send_settings(context, user_id, query.message, edit=True)
         return
@@ -5119,7 +5839,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
             return
         module = modules[mod_idx]
-        set_daily_quiz_scope(year, module)
+        await set_daily_quiz_scope(year, module)
         await backup_settings_to_channel(context)
         await query.edit_message_text(
             f"✅ Daily Quiz دلوقتي محدد على: {year_label(year)} — {module_label(module)}\n\n"
@@ -5132,12 +5852,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await query.edit_message_text(MSG_ADMIN_ONLY)
             return
-        set_daily_quiz_scope(None, None)
+        await set_daily_quiz_scope(None, None)
         await backup_settings_to_channel(context)
         await query.edit_message_text("✅ اتشال التحديد — Daily Quiz دلوقتي بيسحب من المنهج كله تاني.")
         return
 
     # ── EXPORT BUTTONS ──────────────────────────────────────────
+    if query.data in ("gen_pdf", "gen_docx", "clear_pdf") and not _pdf_access_allowed(update):
+        await query.message.reply_text(MSG_PDF_ACCESS_DENIED)
+        return
+
     items = PDF_BUFFER.get(user_id, [])
     name  = PDF_NAMES.get(user_id, "questions")
     safe  = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
@@ -5270,7 +5994,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
         )
 
     q_count = sum(1 for it in items if it.get("type") in ("mcq", "written"))
-    events  = _record_activity(analytics_uid, questions_delta=q_count, pdfs_delta=1, session_questions=q_count)
+    events  = await _record_activity(analytics_uid, questions_delta=q_count, pdfs_delta=1, session_questions=q_count)
     _update_telegram_name(analytics_uid, getattr(message, "from_user", None))
     await _announce_events(context, session_id, events, settings_uid=analytics_uid)
     await backup_analytics_to_channel(context)
@@ -5278,15 +6002,82 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
     return True
 
 # ═══════════════════════════════════════════════════════════════
+# /report_issue — user sends a message, admin replies from
+# REPORT_ISSUE_GROUP_ID, both sides visible on the same message.
+#
+# Flow:
+#   1. /report_issue -> AWAITING_REPORT_ISSUE[user_id] = True, bot asks for the text.
+#   2. Next text message from that user (caught in handle()) is the report.
+#      Posted to REPORT_ISSUE_GROUP_ID with a "↩️ Reply" button, and
+#      recorded in REPORT_THREADS keyed by that group message's id.
+#   3. Admin taps Reply -> AWAITING_REPORT_REPLY[admin_id] = {...}, bot
+#      asks (in the group) for the reply text.
+#   4. Admin's next text message in that group (also caught in handle(),
+#      since the group isn't excluded from the generic text handler) is
+#      sent back to the user, appended to REPORT_THREADS, and the group
+#      message is edited to show the full thread so far plus fresh
+#      Reply/Close buttons.
+#   5. Close just strips the buttons and marks the thread closed — no
+#      further replies possible from that message (a re-tapped Reply is
+#      rejected with a toast; see button_handler).
+#
+# REPORT_THREADS is persisted the same way as MISTAKES_BANK: a local JSON
+# file plus a pinned backup in REPORT_ISSUE_GROUP_ID, restored on startup
+# (see restore_report_threads_from_channel). A restart mid-thread no
+# longer loses the ability to keep replying to an old report — the thread
+# reloads from the channel backup before polling starts.
+# ═══════════════════════════════════════════════════════════════
+def _report_reply_keyboard(group_message_id: int, closed: bool) -> InlineKeyboardMarkup:
+    if closed:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔒 Closed", callback_data="report_noop")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ Reply", callback_data=f"report_reply:{group_message_id}")],
+        [InlineKeyboardButton("✅ Close", callback_data=f"report_close:{group_message_id}")],
+    ])
+
+def _report_thread_text(thread: dict) -> str:
+    """Renders the full report message: the user's identity + original
+    text, then every admin reply appended in order."""
+    lines = [
+        "📩 <b>New issue report</b>",
+        f"👤 {html.escape(thread['name'])}",
+        f"🔗 @{html.escape(thread['username'])}" if thread.get("username") else "🔗 (no username)",
+        f"🆔 <code>{thread['user_id']}</code>",
+        "",
+        html.escape(thread["user_text"]),
+    ]
+    for reply in thread.get("replies", []):
+        lines.append("")
+        lines.append("➖➖➖➖➖➖➖➖")
+        lines.append(f"👨‍💼 <b>Admin:</b>\n{html.escape(reply)}")
+    return "\n".join(lines)
+
+async def report_issue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not REPORT_ISSUE_GROUP_ID:
+        await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
+        return
+    real_uid = update.effective_user.id if update.effective_user else update.effective_chat.id
+    AWAITING_REPORT_ISSUE[real_uid] = True
+    await update.message.reply_text(
+        "✏️ اكتب مشكلتك أو ملاحظتك في رسالة واحدة، وهتوصل للأدمن على طول.",
+    )
+
+# ═══════════════════════════════════════════════════════════════
 # PDF COMMANDS
 # ═══════════════════════════════════════════════════════════════
 async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _pdf_access_allowed(update):
+        await update.message.reply_text(MSG_PDF_ACCESS_DENIED)
+        return
     user_id = update.effective_chat.id
     _reset_pdf_session(user_id)
     AWAITING_NAME[user_id] = True
     await update.message.reply_text(MSG_PDF_ASK_NAME, parse_mode=ParseMode.HTML)
 
 async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _pdf_access_allowed(update):
+        await update.message.reply_text(MSG_PDF_ACCESS_DENIED)
+        return
     user_id  = update.effective_chat.id
     real_uid = update.effective_user.id if update.effective_user else user_id
     items    = PDF_BUFFER.get(user_id, [])
@@ -5298,6 +6089,9 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _export_pdf_session(context, update.message, user_id, real_uid, items, name, fmt="pdf")
 
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _pdf_access_allowed(update):
+        await update.message.reply_text(MSG_PDF_ACCESS_DENIED)
+        return
     user_id = update.effective_chat.id
     _reset_pdf_session(user_id)
     await update.message.reply_text(MSG_PDF_CLEARED)
@@ -5326,7 +6120,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat_id not in USERS:
         USERS.add(chat_id)
-        save_users()
+        await save_users()
         await backup_storage_to_channel(context)
 
     real_uid = update.effective_user.id if update.effective_user else chat_id
@@ -5366,6 +6160,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("/pdf_generate — builds a PDF from the images you've collected")
     lines.append("/pdf_clear — clears the current PDF session")
     lines.append("/cancel — cancels whatever's currently in progress (PDF, pending image, etc.)")
+    lines.append("/report_issue — send a message straight to the admin")
     lines.append("/quiz — browse lectures (year → module → subject → lecture) and pull their questions")
     lines.append("/time — current time, and when the next 💥Daily Quiz💥 push is")
     lines.append("/storage_id — gets this chat's ID (for setting STORAGE_GROUP_ID or LECTURE_RESULTS_GROUP_ID)")
@@ -5375,6 +6170,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update):
         lines.append("\n🔐 <b>Admin only</b>")
         lines.append("/admincheck — confirms you're an admin")
+        lines.append("/health — bot status dashboard (users, lectures, backups, sessions, errors, uptime)")
         lines.append("/broadcast &lt;message&gt; — sends a message to every user")
         lines.append("/backup_now — instantly refreshes every pinned backup (storage + each year's quiz index)")
         lines.append("/quiz_list &lt;year&gt; — numbered list of every lecture (open and closed) in that year")
@@ -5405,6 +6201,76 @@ async def admincheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🚫 مش أدمن\n🆔 Your ID: <code>{uid}</code>",
             parse_mode=ParseMode.HTML,
         )
+
+def _format_uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    days, rem   = divmod(seconds, 86400)
+    hours, rem  = divmod(rem, 3600)
+    minutes, _  = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only at-a-glance dashboard: is the bot up, how many users/
+    lectures exist, whether each channel backup is currently trustworthy
+    (RESTORE_OK — see the comment where it's defined: False there means
+    that system's backups are actively being *refused* right now, not
+    just "unchecked"), how many sessions are live in memory, how many
+    unhandled errors hit the global error handler in the last 24h, and
+    how long this process has been running.
+
+    Two numbers here are explicitly since-last-restart, not lifetime,
+    because their backing state is in-memory only (see _ERROR_LOG_TIMES
+    and the LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS
+    dicts) — called out in the footer so a low error count right after a
+    restart doesn't get misread as "no errors in the last day"."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+
+    lecture_counts = {y: len(QUIZ_INDEX.get(y, {})) for y in YEAR_ORDER}
+
+    backup_rows = [
+        ("Analytics", RESTORE_OK.get("analytics", True)),
+        ("Settings",  RESTORE_OK.get("settings", True)),
+        ("Storage",   RESTORE_OK.get("storage", True)),
+    ] + [
+        (year_label(y), RESTORE_OK.get(f"quiz_{y}", True)) for y in YEAR_ORDER
+    ] + [
+        ("Mistakes",  RESTORE_OK.get("mistakes_bank", True)),
+        ("Reports",   RESTORE_OK.get("report_threads", True)),
+    ]
+    label_width = max(len(label) for label, _ in backup_rows)
+    backup_lines = "\n".join(
+        f"{label.ljust(label_width)}  {'✅' if ok else '❌'}" for label, ok in backup_rows
+    )
+
+    active_sessions = len(LECTURE_SESSIONS) + len(DAILY_QUIZ_SESSIONS) + len(MISTAKES_RETAKE_SESSIONS)
+
+    now = time.time()
+    errors_24h = sum(1 for t in _ERROR_LOG_TIMES if now - t < 24 * 3600)
+
+    uptime = _format_uptime(time.monotonic() - _BOT_STARTED_AT)
+
+    lecture_lines = "\n".join(
+        f"📚 {year_label(y)} lectures: {lecture_counts[y]}" for y in YEAR_ORDER
+    )
+
+    text = (
+        f"🟢 Bot: ONLINE\n"
+        f"👥 Users: {len(USERS)}\n"
+        f"{lecture_lines}\n\n"
+        f"💾 Backups:\n"
+        f"<code>{backup_lines}</code>\n\n"
+        f"⚠️ Active sessions: {active_sessions}\n"
+        f"❌ Errors last 24h: {errors_24h}\n"
+        f"⏱ Uptime: {uptime}\n\n"
+        f"<i>Sessions and error count are since the last restart — both reset when the process does.</i>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 # ═══════════════════════════════════════════════════════════════
 # BROADCAST COMMAND  (admin only)
@@ -5469,7 +6335,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if blocked:
         for uid in blocked:
             USERS.discard(uid)
-        save_users()
+        await save_users()
         await backup_storage_to_channel(context)
 
     summary = (
@@ -5619,7 +6485,7 @@ async def reset_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_chat.id != ADMIN_ID:
         return
     ANALYTICS.clear()
-    save_analytics()
+    await save_analytics()
     if _analytics_backup_msg_id and ANALYTICS_GROUP_ID:
         try:
             await context.bot.delete_message(
@@ -5671,7 +6537,7 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Import failed: {e}")
         return
     ANALYTICS.update(imported)
-    save_analytics()
+    await save_analytics()
     await backup_analytics_to_channel(context)
     await update.message.reply_text(
         f"✅ Imported <b>{len(imported)}</b> user(s) — merged into current data, "
@@ -5692,6 +6558,7 @@ async def _post_init(app):
     await restore_settings_from_channel(app)
     await restore_lecture_results_from_channel(app)
     await restore_mistakes_bank_from_channel(app)
+    await restore_report_threads_from_channel(app)
 
     if app.job_queue is None:
         print(
@@ -5788,7 +6655,23 @@ async def delete_pin_service_message(update: Update, context: ContextTypes.DEFAU
     except Exception as e:
         print(f"PIN SERVICE MESSAGE DELETE ERROR: {e}")
 
-app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).post_init(_post_init).build()
+# concurrent_updates(256): by default PTB processes updates one at a time,
+# globally — every poll answer/button tap/message from every user queues
+# behind whichever one is currently being handled. Fine at low volume, but
+# on a night with 500+ people answering quizzes at once it means everyone
+# queues behind everyone else, even though their updates touch completely
+# unrelated per-user state. 256 lets that many updates run concurrently
+# (each user's own updates are still serialized against each other — see
+# @_serialize_per_user below); Telegram's own rate limits are still
+# enforced by AIORateLimiter regardless of how many run at once locally.
+app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .rate_limiter(AIORateLimiter())
+    .concurrent_updates(256)
+    .post_init(_post_init)
+    .build()
+)
 
 # ═══════════════════════════════════════════════════════════════
 # GLOBAL ERROR HANDLER
@@ -5822,6 +6705,16 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         )
     except Exception as e:
         print(f"ERROR LOG GROUP SEND FAILED: {e}")
+        return   # not counted below — it never actually reached the errors channel
+
+    # Only reaches here once the report has actually landed in the errors
+    # channel, so /health's "errors last 24h" always matches what's really
+    # sitting there — not what the handler merely attempted to send.
+    now = time.time()
+    _ERROR_LOG_TIMES.append(now)
+    cutoff = now - _ERROR_LOG_MAX_AGE_SECONDS
+    while _ERROR_LOG_TIMES and _ERROR_LOG_TIMES[0] < cutoff:
+        _ERROR_LOG_TIMES.pop(0)
 
 app.add_error_handler(global_error_handler)
 
@@ -5833,8 +6726,10 @@ app.add_handler(MessageHandler(
 app.add_handler(CommandHandler("start",          start))
 app.add_handler(CommandHandler("c",              commands_cmd))
 app.add_handler(CommandHandler("cancel",         cancel_cmd))
+app.add_handler(CommandHandler("report_issue",   report_issue_cmd))
 app.add_handler(CommandHandler("sleep",          sleep_cmd))
 app.add_handler(CommandHandler("admincheck",     admincheck_cmd))
+app.add_handler(CommandHandler("health",         health_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
 app.add_handler(CommandHandler("pdf_start",      pdf_start))
 app.add_handler(CommandHandler("pdf_generate",   pdf_generate))
