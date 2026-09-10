@@ -1371,10 +1371,30 @@ MISTAKES_BANK_FILE          = "mistakes_bank.json"
 MISTAKES_BANK_BACKUP_MARKER = "🗑 QUIZICIAN_MISTAKES_BANK_BACKUP"
 
 def load_mistakes_bank() -> list:
-    if os.path.exists(MISTAKES_BANK_FILE):
-        with open(MISTAKES_BANK_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return []
+    """Loads the local mistakes-bank file, dropping (and logging) any
+    entry missing a required key. Malformed entries have shown up here at
+    least once in practice (a KeyError on "mid" reaching all the way into
+    the Daily Quiz build) — root cause unconfirmed (a hand-edited file, an
+    old bot version's different shape, or a channel-backup restore
+    predating some schema change are all possible), but every entry this
+    system ever writes itself (see record_mistake) always has all four
+    keys, so anything missing one didn't come from normal operation and
+    isn't safe to trust downstream. Filtering here means every reader
+    (record_mistake's dedup check, _scoped_mistakes_bank, _resolve_mistake)
+    can keep assuming a well-formed entry without each needing its own
+    defensive check."""
+    if not os.path.exists(MISTAKES_BANK_FILE):
+        return []
+    with open(MISTAKES_BANK_FILE, encoding="utf-8") as f:
+        raw = json.load(f)
+    required = ("mid", "year", "module", "subject")
+    clean  = [m for m in raw if isinstance(m, dict) and all(k in m for k in required)]
+    if len(clean) != len(raw):
+        print(f"MISTAKES BANK: dropped {len(raw) - len(clean)} malformed entr(y/ies) missing a required key on load.")
+    return clean
+
+def _is_valid_mistake_entry(m) -> bool:
+    return isinstance(m, dict) and all(k in m for k in ("mid", "year", "module", "subject"))
 
 async def save_mistakes_bank():
     await asyncio.to_thread(_atomic_write_json, MISTAKES_BANK_FILE, MISTAKES_BANK, indent=2, ensure_ascii=False)
@@ -1399,7 +1419,7 @@ async def record_mistake(mid: int, year: str, module: str, subject: str) -> bool
     whether a new entry was added (False if it was already there —
     nothing to save/back up in that case)."""
     for m in MISTAKES_BANK:
-        if m["mid"] == mid and m["year"] == year:
+        if _is_valid_mistake_entry(m) and m["mid"] == mid and m["year"] == year:
             return False
     MISTAKES_BANK.append({"mid": mid, "year": year, "module": module, "subject": subject})
     await save_mistakes_bank()
@@ -1459,7 +1479,11 @@ async def restore_mistakes_bank_from_channel(app):
             return
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
-        MISTAKES_BANK[:] = json.loads(bytes(raw).decode("utf-8"))
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        clean    = [m for m in restored if _is_valid_mistake_entry(m)]
+        if len(clean) != len(restored):
+            print(f"MISTAKES BANK: dropped {len(restored) - len(clean)} malformed entr(y/ies) from the channel backup on restore.")
+        MISTAKES_BANK[:] = clean
         await save_mistakes_bank()
         _mistakes_bank_backup_msg_id = pinned.message_id
         print(f"Restored mistakes bank: {len(MISTAKES_BANK)} question(s).")
@@ -1597,7 +1621,7 @@ def _scoped_mistakes_bank() -> list:
     scope = get_daily_quiz_scope()
     if not scope:
         return MISTAKES_BANK
-    return [m for m in MISTAKES_BANK if m["year"] == scope["year"] and m["module"] == scope["module"]]
+    return [m for m in MISTAKES_BANK if _is_valid_mistake_entry(m) and m["year"] == scope["year"] and m["module"] == scope["module"]]
 
 def _poll_status_index(year: str) -> dict:
     """{message_id: status} for every poll tracked in QUIZ_POLL_STATUS[year].
@@ -1619,6 +1643,19 @@ async def _resolve_mistake(context: ContextTypes.DEFAULT_TYPE, entry: dict, stat
     status_by_mid, if given, is passed straight through to
     _snapshot_from_mid (see there) — pass one in when resolving several
     entries from the same year in a row, e.g. via _resolve_mistakes."""
+    if not _is_valid_mistake_entry(entry):
+        # Malformed entry (missing a required key) — shouldn't happen
+        # given the load/restore-time filtering (see load_mistakes_bank /
+        # restore_mistakes_bank_from_channel), but this crashed the whole
+        # Daily Quiz build once already, so degrade to "prune and skip"
+        # rather than trust that filtering is airtight everywhere.
+        print(f"MISTAKES BANK: skipping and removing malformed entry: {entry!r}")
+        try:
+            MISTAKES_BANK.remove(entry)
+            await save_mistakes_bank()
+        except ValueError:
+            pass
+        return None
     snap = await _snapshot_from_mid(context, entry["year"], entry["mid"], entry["module"], entry["subject"], status_by_mid)
     if snap is None:
         try:
@@ -1636,6 +1673,9 @@ async def _resolve_mistakes(context: ContextTypes.DEFAULT_TYPE, entries: list) -
     status_by_mid_by_year: dict = {}
     resolved = []
     for entry in entries:
+        if not _is_valid_mistake_entry(entry):
+            await _resolve_mistake(context, entry)   # logs + prunes it, returns None
+            continue
         year = entry["year"]
         if year not in status_by_mid_by_year:
             status_by_mid_by_year[year] = _poll_status_index(year)
@@ -2398,6 +2438,10 @@ AWAITING_REPORT_ISSUE  = {}    # user_id -> True, while waiting on the user's is
 AWAITING_REPORT_REPLY  = {}    # admin_id -> {"group_message_id": int}
                                 # — set when the admin taps "↩️ Reply" on a report in REPORT_ISSUE_GROUP_ID;
                                 # the admin's next text message there becomes the reply sent back to that user
+AWAITING_USER_FOLLOWUP = {}    # reporter_user_id -> {"group_message_id": int}
+                                # — set when the reporter taps "↩️ Reply" on the admin's reply DM'd to
+                                # them; their next text message becomes a follow-up appended to the
+                                # same thread (see _append_report_message) and shown to the admin
 
 REPORT_THREADS_FILE          = "report_threads.json"
 REPORT_THREADS_BACKUP_MARKER = "📩 QUIZICIAN_REPORT_THREADS_BACKUP"
@@ -2418,7 +2462,11 @@ async def save_report_threads():
         {str(k): v for k, v in REPORT_THREADS.items()}, indent=2, ensure_ascii=False,
     )
 
-REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id","name","username","user_text","replies","closed"}
+REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id","name","username","user_text","messages","closed"}
+                                                # — "messages": [{"from": "admin"|"user", "text": str}, ...] in
+                                                # chronological order (see _append_report_message /
+                                                # _report_thread_text); "replies" is the pre-follow-up shape,
+                                                # still read as a fallback for threads that predate this field
                                                 # — one entry per report ever filed, so the report message can be
                                                 # rebuilt (user text + every reply so far) each time it's edited
 
@@ -4751,6 +4799,90 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
+    # ── "-Reply <id> <message>" (report-issue reply, plain text) ─────
+    # Works from REPORT_ISSUE_GROUP_ID regardless of who Telegram reports
+    # as the sender — deliberately NOT identity-based (no AWAITING_* /
+    # real_uid matching) because the button-driven two-step flow below
+    # this one silently breaks when the group has "remain anonymous"
+    # enabled for admins: a typed message then arrives with
+    # effective_user = GroupAnonymousBot, not the admin's real id, so any
+    # check keyed on real_uid never matches. Parsing a self-contained
+    # command out of the message text sidesteps that identity question
+    # entirely — the id is right there in the text, no state to match up
+    # against who's supposedly typing. Not admin-gated beyond "must be
+    # sent in this group" for the same reason: if you're posting in a
+    # private group only admins are in, that's the access control.
+    if REPORT_ISSUE_GROUP_ID and user_id == REPORT_ISSUE_GROUP_ID and text.startswith("-Reply"):
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3 or not parts[1].isdigit():
+            await update.message.reply_text(
+                "⚠️ الصيغة: <code>-Reply &lt;id&gt; &lt;رسالتك&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        group_message_id = int(parts[1])
+        reply_text        = parts[2]
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread:
+            await update.message.reply_text(f"⚠️ مفيش report بالـ ID ده: {group_message_id}")
+            return
+        if thread.get("closed"):
+            await update.message.reply_text("⚠️ الـ report ده مقفول بالفعل.")
+            return
+        _append_report_message(thread, "admin", reply_text)
+        await save_report_threads()
+        try:
+            await context.bot.send_message(
+                chat_id=thread["user_id"],
+                text=f"📩 <b>رد من الأدمن على مشكلتك:</b>\n\n{html.escape(reply_text)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩️ Reply", callback_data=f"report_user_reply:{group_message_id}"),
+                ]]),
+            )
+        except Exception as e:
+            print("REPORT REPLY DELIVERY FAILED:", e)
+            await update.message.reply_text(
+                "⚠️ الرد اتسجل بس معرفتش أبعته للمستخدم (يمكن قافل البوت). هرجع أعدل الرسالة برضو."
+            )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=REPORT_ISSUE_GROUP_ID, message_id=group_message_id,
+                text=_report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
+                reply_markup=_report_reply_keyboard(group_message_id, closed=thread["closed"]),
+            )
+        except Exception as e:
+            print("REPORT THREAD EDIT FAILED:", e)
+        await backup_report_threads_to_channel(context)
+        return
+
+    # ── AWAITING USER FOLLOWUP (reporter's own "↩️ Reply") ───────
+    # Keyed by real_uid (the reporter, in their own DM — no anonymous-
+    # admin identity issue here, this only ever runs in a private chat).
+    pending_followup = AWAITING_USER_FOLLOWUP.pop(real_uid, None)
+    if pending_followup:
+        group_message_id = pending_followup["group_message_id"]
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread:
+            await update.message.reply_text("⚠️ الـ report ده مش لاقيه دلوقتي (يمكن البوت اتعمله restart).")
+            return
+        if thread.get("closed"):
+            await update.message.reply_text("⚠️ الـ report ده اتقفل، مينفعش ترد عليه تاني.")
+            return
+        _append_report_message(thread, "user", text)
+        await save_report_threads()
+        await update.message.reply_text("✅ اتبعت للأدمن.")
+        try:
+            await context.bot.edit_message_text(
+                chat_id=REPORT_ISSUE_GROUP_ID, message_id=group_message_id,
+                text=_report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
+                reply_markup=_report_reply_keyboard(group_message_id, closed=thread["closed"]),
+            )
+        except Exception as e:
+            print("REPORT THREAD EDIT FAILED (user followup):", e)
+        await backup_report_threads_to_channel(context)
+        return
+
     # ── AWAITING NICKNAME (Settings, or first-ever /start) ───────
     # Keyed by real_uid (the person's Telegram user id, same key SETTINGS
     # uses), not the chat id, so this works the same in DMs and groups.
@@ -4818,23 +4950,24 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             sent = await context.bot.send_message(
                 chat_id=REPORT_ISSUE_GROUP_ID,
-                text=_report_thread_text(thread),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_report_reply_keyboard(0, closed=False),   # placeholder id, fixed up right below
+                text="📩 New issue report — loading…",   # placeholder; fixed up right below once we have the real id
+                reply_markup=_report_reply_keyboard(0, closed=False),   # placeholder id, fixed up right below too
             )
         except Exception as e:
             print("REPORT ISSUE SEND FAILED:", e)
             await update.message.reply_text("⚠️ مشكلة في إرسال الرسالة — جرب تاني لو سمحت.")
             return
-        # The keyboard's callback_data needs this message's own id, which
-        # we only get back after sending — one quick edit to fix it up.
+        # Both the displayed Reply ID and the keyboard's callback_data need
+        # this message's own id, which we only get back after sending —
+        # one edit to fix up both text and keyboard together.
         try:
-            await context.bot.edit_message_reply_markup(
+            await context.bot.edit_message_text(
                 chat_id=REPORT_ISSUE_GROUP_ID, message_id=sent.message_id,
+                text=_report_thread_text(thread, sent.message_id), parse_mode=ParseMode.HTML,
                 reply_markup=_report_reply_keyboard(sent.message_id, closed=False),
             )
         except Exception as e:
-            print("REPORT ISSUE KEYBOARD FIXUP FAILED:", e)
+            print("REPORT ISSUE ID FIXUP FAILED:", e)
         REPORT_THREADS[sent.message_id] = thread
         await save_report_threads()
         await backup_report_threads_to_channel(context)
@@ -4867,13 +5000,16 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not thread:
             await update.message.reply_text("⚠️ الـ report ده مش لاقيه دلوقتي (يمكن البوت اتعمله restart).")
             return
-        thread["replies"].append(text)
+        _append_report_message(thread, "admin", text)
         await save_report_threads()
         try:
             await context.bot.send_message(
                 chat_id=thread["user_id"],
                 text=f"📩 <b>رد من الأدمن على مشكلتك:</b>\n\n{html.escape(text)}",
                 parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩️ Reply", callback_data=f"report_user_reply:{group_message_id}"),
+                ]]),
             )
         except Exception as e:
             print("REPORT REPLY DELIVERY FAILED:", e)
@@ -4883,7 +5019,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.edit_message_text(
                 chat_id=REPORT_ISSUE_GROUP_ID, message_id=group_message_id,
-                text=_report_thread_text(thread), parse_mode=ParseMode.HTML,
+                text=_report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
                 reply_markup=_report_reply_keyboard(group_message_id, closed=thread["closed"]),
             )
         except Exception as e:
@@ -5100,6 +5236,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "report_noop":
         return   # "🔒 Closed" button on an already-closed report — nothing to do
 
+    # ── REPORT ISSUE: reporter's own "↩️ Reply" on the admin's DM'd reply ──
+    # No admin gate here — this button is on the REPORTER's own DM, meant
+    # for them specifically. group_message_id ties it back to the right
+    # thread regardless of how many reports this person has ever filed.
+    if query.data.startswith("report_user_reply:"):
+        group_message_id = int(query.data.split(":", 1)[1])
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread or thread.get("closed"):
+            await query.answer("⚠️ الـ report ده اتقفل، مينفعش ترد عليه تاني.", show_alert=True)
+            return
+        if thread["user_id"] != user_id:
+            # Shouldn't happen (this button only ever goes out to the
+            # thread's own reporter), but don't let a forwarded/replayed
+            # callback_data let someone follow up on someone else's thread.
+            await query.answer("⚠️ مش قادر أعمل كده.", show_alert=True)
+            return
+        AWAITING_USER_FOLLOWUP[user_id] = {"group_message_id": group_message_id}
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="✏️ اكتب ردك، وهيتبعت للأدمن على طول.",
+        )
+        return
+
     if query.data.startswith("report_reply:"):
         if not is_admin(update):
             await query.answer("🚫 للأدمن فقط", show_alert=True)
@@ -5133,9 +5292,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         thread["closed"] = True
         AWAITING_REPORT_REPLY.pop(user_id, None)   # cancel any reply this admin was mid-typing for it
+        AWAITING_USER_FOLLOWUP.pop(thread["user_id"], None)   # ...and any follow-up the reporter was mid-typing
         await save_report_threads()
         await query.edit_message_text(
-            _report_thread_text(thread), parse_mode=ParseMode.HTML,
+            _report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
             reply_markup=_report_reply_keyboard(group_message_id, closed=True),
         )
         await backup_report_threads_to_channel(context)
@@ -6018,23 +6178,38 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
 
 # ═══════════════════════════════════════════════════════════════
 # /report_issue — user sends a message, admin replies from
-# REPORT_ISSUE_GROUP_ID, both sides visible on the same message.
+# REPORT_ISSUE_GROUP_ID, both sides visible on the same message, and the
+# reporter can send follow-ups back into the same thread.
 #
 # Flow:
 #   1. /report_issue -> AWAITING_REPORT_ISSUE[user_id] = True, bot asks for the text.
 #   2. Next text message from that user (caught in handle()) is the report.
 #      Posted to REPORT_ISSUE_GROUP_ID with a "↩️ Reply" button, and
-#      recorded in REPORT_THREADS keyed by that group message's id.
-#   3. Admin taps Reply -> AWAITING_REPORT_REPLY[admin_id] = {...}, bot
-#      asks (in the group) for the reply text.
-#   4. Admin's next text message in that group (also caught in handle(),
-#      since the group isn't excluded from the generic text handler) is
-#      sent back to the user, appended to REPORT_THREADS, and the group
-#      message is edited to show the full thread so far plus fresh
-#      Reply/Close buttons.
+#      recorded in REPORT_THREADS keyed by that group message's id — this
+#      id is also shown on the card itself as the "Reply ID".
+#   3. Admin replies one of two ways:
+#        a) Type "-Reply <id> <text>" directly in the group. Preferred —
+#           parsed straight out of the message text with no per-user
+#           state, so it works even if the group has "remain anonymous"
+#           enabled for admins (a typed message then arrives with
+#           effective_user = GroupAnonymousBot, not the admin's real id,
+#           which silently breaks any flow keyed on real_uid).
+#        b) Tap the "↩️ Reply" button -> AWAITING_REPORT_REPLY[admin_id]
+#           = {...}, bot asks for the text in the group, and the admin's
+#           next message there is picked up in handle(). Kept as a
+#           convenience alongside (a), with a same-chat fallback lookup
+#           for the anonymous-admin case — see the comment at that check.
+#      Either way: appended to the thread via _append_report_message, DM'd
+#      to the user with their own "↩️ Reply" button, and the group message
+#      is edited to show the full thread so far plus fresh Reply/Close
+#      buttons.
+#   4. Reporter taps their own "↩️ Reply" -> AWAITING_USER_FOLLOWUP[user_id]
+#      = {...}; their next DM text is appended to the same thread (shown
+#      to the admin under their name) and the group message is refreshed.
+#      Blocked once the thread is closed.
 #   5. Close just strips the buttons and marks the thread closed — no
-#      further replies possible from that message (a re-tapped Reply is
-#      rejected with a toast; see button_handler).
+#      further replies possible from that message (a re-tapped Reply, from
+#      either side, is rejected with a toast/message).
 #
 # REPORT_THREADS is persisted the same way as MISTAKES_BANK: a local JSON
 # file plus a pinned backup in REPORT_ISSUE_GROUP_ID, restored on startup
@@ -6050,22 +6225,51 @@ def _report_reply_keyboard(group_message_id: int, closed: bool) -> InlineKeyboar
         [InlineKeyboardButton("✅ Close", callback_data=f"report_close:{group_message_id}")],
     ])
 
-def _report_thread_text(thread: dict) -> str:
+def _report_thread_text(thread: dict, group_message_id: int) -> str:
     """Renders the full report message: the user's identity + original
-    text, then every admin reply appended in order."""
+    text, then every message after it (admin replies AND user follow-ups,
+    see AWAITING_USER_FOLLOWUP) in chronological order. group_message_id
+    is shown as the reply ID — the number to use with "-Reply <id> <text>"
+    (see the plain-text handler in handle()) — distinct from the
+    reporter's own Telegram ID shown just above it.
+
+    thread["messages"] is the single source of truth for everything after
+    the opening report: [{"from": "admin"|"user", "text": str}, ...] in
+    the order they happened. Threads created before follow-ups existed
+    only have the older "replies" list (admin-only, no "messages" key at
+    all) — that's read here as a fallback so old threads still render,
+    but nothing new is ever written to "replies" again; see
+    _append_report_message."""
     lines = [
         "📩 <b>New issue report</b>",
         f"👤 {html.escape(thread['name'])}",
         f"🔗 @{html.escape(thread['username'])}" if thread.get("username") else "🔗 (no username)",
-        f"🆔 <code>{thread['user_id']}</code>",
+        f"🆔 Reporter ID: <code>{thread['user_id']}</code>",
+        f"🔖 Reply ID: <code>{group_message_id}</code>  (use <code>-Reply {group_message_id} &lt;text&gt;</code>)",
         "",
         html.escape(thread["user_text"]),
     ]
-    for reply in thread.get("replies", []):
+    messages = thread.get("messages")
+    if messages is None:
+        # Pre-follow-up thread — every entry in "replies" was an admin
+        # message; render it exactly as before.
+        messages = [{"from": "admin", "text": r} for r in thread.get("replies", [])]
+    for msg in messages:
         lines.append("")
         lines.append("➖➖➖➖➖➖➖➖")
-        lines.append(f"👨‍💼 <b>Admin:</b>\n{html.escape(reply)}")
+        if msg["from"] == "admin":
+            lines.append(f"👨‍💼 <b>Admin:</b>\n{html.escape(msg['text'])}")
+        else:
+            lines.append(f"👤 <b>{html.escape(thread['name'])}:</b>\n{html.escape(msg['text'])}")
     return "\n".join(lines)
+
+def _append_report_message(thread: dict, sender: str, text: str) -> None:
+    """Adds one message (sender is 'admin' or 'user') to the thread's
+    unified timeline, migrating an old replies-only thread to the
+    "messages" schema on first touch. See _report_thread_text for why."""
+    if "messages" not in thread:
+        thread["messages"] = [{"from": "admin", "text": r} for r in thread.get("replies", [])]
+    thread["messages"].append({"from": sender, "text": text})
 
 async def report_issue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not REPORT_ISSUE_GROUP_ID:
