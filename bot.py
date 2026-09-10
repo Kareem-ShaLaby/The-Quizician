@@ -4842,10 +4842,25 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── AWAITING ADMIN REPLY TEXT (report_reply button) ──────────
-    # Keyed by real_uid — only ever set for ADMIN_ID (see button_handler),
-    # but keying by user id here rather than a bare flag keeps this
-    # consistent with every other AWAITING_* dict and costs nothing.
+    # Keyed by real_uid normally — but if this group has "remain
+    # anonymous" enabled for admins, a message the admin sends here
+    # arrives with effective_user = GroupAnonymousBot, not the admin's
+    # real Telegram id, even though the earlier button tap (a callback
+    # query, unaffected by anonymous-admin mode) correctly recorded
+    # AWAITING_REPORT_REPLY under the admin's real id. That mismatch was
+    # silently swallowing every reply: the pop-by-real_uid below found
+    # nothing and fell through with no message and no error.
+    #
+    # Fix: only the admin is ever expected to type in this specific
+    # group, so if the message is IN this group at all, resolve the
+    # pending reply by chat rather than strictly requiring real_uid to
+    # match — find whichever AWAITING_REPORT_REPLY entry (there should
+    # only ever be zero or one at a time in practice) exists, regardless
+    # of whose id it's filed under.
     pending_reply = AWAITING_REPORT_REPLY.pop(real_uid, None)
+    if pending_reply is None and REPORT_ISSUE_GROUP_ID and user_id == REPORT_ISSUE_GROUP_ID and AWAITING_REPORT_REPLY:
+        fallback_uid = next(iter(AWAITING_REPORT_REPLY))
+        pending_reply = AWAITING_REPORT_REPLY.pop(fallback_uid)
     if pending_reply:
         group_message_id = pending_reply["group_message_id"]
         thread = REPORT_THREADS.get(group_message_id)
