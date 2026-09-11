@@ -4,6 +4,7 @@ import random
 import json
 import os
 import time
+import copy
 import asyncio
 import functools
 import html
@@ -724,7 +725,10 @@ def _clean_analytics_dict(raw: dict) -> dict:
     if not isinstance(raw, dict):
         print(f"ANALYTICS: top-level data wasn't a dict ({type(raw).__name__}) — ignoring entirely.")
         return {}
-    clean = {k: v for k, v in raw.items() if _is_valid_analytics_entry(v)}
+    clean = {
+        k: v for k, v in raw.items()
+        if isinstance(k, str) and k.lstrip("-").isdigit() and _is_valid_analytics_entry(v)
+    }
     if len(clean) != len(raw):
         print(f"ANALYTICS: dropped {len(raw) - len(clean)} malformed entr(y/ies).")
     return clean
@@ -737,7 +741,16 @@ def load_analytics() -> dict:
     return {}
 
 async def save_analytics():
-    await asyncio.to_thread(_atomic_write_json, ANALYTICS_FILE, ANALYTICS, indent=2, ensure_ascii=False)
+    # deepcopy BEFORE handing off to the background thread: to_thread runs
+    # _atomic_write_json (and therefore json.dump, which iterates the
+    # whole structure) on a separate OS thread while the event loop keeps
+    # running — any coroutine that mutates ANALYTICS while that thread is
+    # mid-iteration (e.g. another user's answer landing at the same
+    # moment) races json.dump and can throw "dictionary changed size
+    # during iteration" or worse, write corrupt/partial JSON. A snapshot
+    # copy freezes what gets written; the live dict stays free to mutate.
+    snapshot = copy.deepcopy(ANALYTICS)
+    await asyncio.to_thread(_atomic_write_json, ANALYTICS_FILE, snapshot, indent=2, ensure_ascii=False)
 
 ANALYTICS: dict = load_analytics()
 
@@ -746,13 +759,51 @@ ANALYTICS: dict = load_analytics()
 # source of truth — no separate state file needed.
 _analytics_backup_msg_id: int | None = None
 
-# Throttle for backup_analytics_to_channel — local save_analytics() (a
-# plain JSON.dump) still happens every time and is never delayed; only the
-# channel mirror (upload + pin + delete-old-pin, three Telegram calls) gets
-# debounced, since callers like lecture-answer XP can fire dozens of times
-# a minute and would otherwise risk hitting Telegram's rate limits.
+# Throttle for backup_analytics_to_channel — the channel mirror (upload +
+# pin + delete-old-pin, three Telegram calls) gets debounced, since callers
+# like lecture-answer XP can fire dozens of times a minute and would
+# otherwise risk hitting Telegram's rate limits.
 _last_analytics_backup_at: float = 0.0
 ANALYTICS_BACKUP_MIN_INTERVAL = 300  # seconds
+
+# ── Local-disk debounce for the hot answer path ──────────────────
+# save_analytics() itself (deepcopy + atomic write of the WHOLE file, every
+# user's entry, not just the one who just answered) is still called
+# directly — and immediately — from low-frequency call sites (restore,
+# reset/import, nickname changes): those need the file on disk to be
+# correct right away and don't fire often enough for the cost to matter.
+#
+# The three poll-answer advance functions (_advance_lecture_session,
+# _advance_daily_quiz_session, _advance_mistakes_retake_session) are
+# different: they're the single hottest path in the bot, firing on every
+# answered question from every active user. Calling the real save_analytics()
+# there means every answer pays for a full-file deepcopy + fsync'd write,
+# scaling with total user count, not with "one answer." Those three now
+# call _mark_analytics_dirty() instead — an O(1) flag set, no I/O — and a
+# periodic job (_flush_analytics_job, registered in _post_init) does the
+# real save every ANALYTICS_FLUSH_INTERVAL seconds if anything changed.
+#
+# Data-loss window: a hard crash (not a clean restart/shutdown — see
+# _post_shutdown) between flushes can lose up to one interval's worth of
+# analytics deltas. 60s is deliberately much shorter than the 300s channel
+# backup already tolerates, so this isn't a new category of risk, just a
+# smaller version of one already accepted elsewhere in this file.
+_analytics_dirty: bool = False
+ANALYTICS_FLUSH_INTERVAL = 60  # seconds
+
+def _mark_analytics_dirty() -> None:
+    global _analytics_dirty
+    _analytics_dirty = True
+
+async def _flush_analytics_if_dirty() -> None:
+    """Writes ANALYTICS to disk only if something changed since the last
+    flush. Called by the periodic job and by _post_shutdown for a final
+    flush on clean exit."""
+    global _analytics_dirty
+    if not _analytics_dirty:
+        return
+    _analytics_dirty = False
+    await save_analytics()
 
 def _today() -> str:
     from datetime import datetime, timezone
@@ -780,6 +831,8 @@ def _year_leaderboard(year_class: str, limit: int = 15) -> list[dict]:
     filter, since ANALYTICS itself isn't year-scoped, SETTINGS is."""
     rows = []
     for uid_str, entry in ANALYTICS.items():
+        if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
+            continue   # not a real Telegram user id — corrupted/stray key, skip rather than crash
         uid = int(uid_str)
         if get_year_class(uid) != year_class:
             continue
@@ -839,9 +892,16 @@ def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
     return unlocked
 
 async def _record_activity(user_id: int, questions_delta: int = 0,
-                     pdfs_delta: int = 0, session_questions: int = 0) -> dict:
+                     pdfs_delta: int = 0, session_questions: int = 0,
+                     persist: bool = True) -> dict:
     """Update all stats. Returns dict of events for the caller to announce:
-    { "achievements": [...], "level_up": int | 0 }"""
+    { "achievements": [...], "level_up": int | 0 }
+
+    persist=False skips the save_analytics() call at the end — for callers
+    (the three poll-answer advance functions) that go on to mutate the
+    entry further and call save_analytics() themselves right after, so the
+    whole ANALYTICS dict doesn't get deep-copied and written to disk twice
+    for the same answer."""
     from datetime import datetime, timezone, timedelta
     today  = _today()
     entry  = _get_entry(user_id)
@@ -882,7 +942,8 @@ async def _record_activity(user_id: int, questions_delta: int = 0,
         entry["level"] = final_level
         new_level = final_level
 
-    await save_analytics()
+    if persist:
+        await save_analytics()
     return {"achievements": newly_unlocked, "level_up": new_level}
 
 async def _announce_events(context, chat_id: int, events: dict, settings_uid: int | None = None):
@@ -1095,7 +1156,10 @@ def load_settings() -> dict:
     return {}
 
 async def save_settings():
-    await asyncio.to_thread(_atomic_write_json, SETTINGS_FILE, SETTINGS, indent=2, ensure_ascii=False)
+    # See save_analytics for why this snapshot copy is required, not
+    # just defensive style — same to_thread-races-live-mutation risk.
+    snapshot = copy.deepcopy(SETTINGS)
+    await asyncio.to_thread(_atomic_write_json, SETTINGS_FILE, snapshot, indent=2, ensure_ascii=False)
 
 SETTINGS: dict = load_settings()
 
@@ -1251,7 +1315,9 @@ def load_lecture_results() -> dict:
     return {}
 
 async def save_lecture_results():
-    await asyncio.to_thread(_atomic_write_json, LECTURE_RESULTS_FILE, LECTURE_RESULTS, indent=2, ensure_ascii=False)
+    # See save_analytics for why this snapshot copy is required.
+    snapshot = copy.deepcopy(LECTURE_RESULTS)
+    await asyncio.to_thread(_atomic_write_json, LECTURE_RESULTS_FILE, snapshot, indent=2, ensure_ascii=False)
 
 LECTURE_RESULTS: dict = load_lecture_results()
 
@@ -1303,6 +1369,8 @@ def _lecture_leaderboard(lecture_key: str, limit: int = 10) -> list[dict]:
     results = _get_lecture_results(lecture_key)
     rows = []
     for uid_str, r in results.items():
+        if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
+            continue   # not a real Telegram user id — corrupted/stray key, skip rather than crash
         uid = int(uid_str)
         rows.append({
             "user_id":  uid,
@@ -1429,7 +1497,14 @@ def _is_valid_mistake_entry(m) -> bool:
     return isinstance(m, dict) and all(k in m for k in ("mid", "year", "module", "subject"))
 
 async def save_mistakes_bank():
-    await asyncio.to_thread(_atomic_write_json, MISTAKES_BANK_FILE, MISTAKES_BANK, indent=2, ensure_ascii=False)
+    # See save_analytics for why this snapshot copy is required — this is
+    # the exact function whose race the load test's "dictionary changed
+    # size during iteration" errors most likely came from: record_mistake
+    # appends to MISTAKES_BANK from many concurrent _advance_lecture_session
+    # calls while a background thread could simultaneously be mid-iteration
+    # serializing the same live list to JSON.
+    snapshot = copy.deepcopy(MISTAKES_BANK)
+    await asyncio.to_thread(_atomic_write_json, MISTAKES_BANK_FILE, snapshot, indent=2, ensure_ascii=False)
 
 MISTAKES_BANK: list = load_mistakes_bank()
 
@@ -1797,7 +1872,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
-    events     = await _record_activity(user_id)
+    events     = await _record_activity(user_id, persist=False)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -1825,7 +1900,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     if final_level > user_entry["level"]:
         user_entry["level"] = final_level
         events["level_up"] = final_level
-    await save_analytics()
+    _mark_analytics_dirty()
     await _announce_events(context, user_id, events)
     await backup_analytics_to_channel(context)
 
@@ -2001,7 +2076,7 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
     xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
-    events     = await _record_activity(user_id)
+    events     = await _record_activity(user_id, persist=False)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -2029,7 +2104,7 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
     if final_level > user_entry["level"]:
         user_entry["level"] = final_level
         events["level_up"] = final_level
-    await save_analytics()
+    _mark_analytics_dirty()
     await _announce_events(context, user_id, events)
     await backup_analytics_to_channel(context)
 
@@ -2072,7 +2147,9 @@ def load_storage_index():
     return {}
 
 async def save_storage_index():
-    await asyncio.to_thread(_atomic_write_json, STORAGE_INDEX_FILE, STORAGE_INDEX, ensure_ascii=False)
+    # See save_analytics for why this snapshot copy is required.
+    snapshot = copy.deepcopy(STORAGE_INDEX)
+    await asyncio.to_thread(_atomic_write_json, STORAGE_INDEX_FILE, snapshot, ensure_ascii=False)
 
 # password (lowercased) -> list of items; each item is a list of message_ids
 # (a single-message item is [id], an album is [id1, id2, ...]). Reusing the
@@ -2100,7 +2177,10 @@ def load_storage_backup_state():
     return {}
 
 async def save_storage_backup_state():
-    await asyncio.to_thread(_atomic_write_json, STORAGE_BACKUP_STATE_FILE, STORAGE_BACKUP_STATE, ensure_ascii=False)
+    # Tiny dict, but kept consistent with every other save_* here — see
+    # save_analytics for why the snapshot copy matters.
+    snapshot = copy.deepcopy(STORAGE_BACKUP_STATE)
+    await asyncio.to_thread(_atomic_write_json, STORAGE_BACKUP_STATE_FILE, snapshot, ensure_ascii=False)
 
 STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
 
@@ -2227,8 +2307,13 @@ def load_quiz_index(year: str) -> dict:
     return {}
 
 async def save_quiz_index(year: str):
+    # See save_analytics for why this snapshot copy is required — this is
+    # one of the highest-traffic save_* calls in the file (fires on every
+    # dead-poll cleanup during lecture delivery), so it's one of the most
+    # likely places the load test's races actually came from.
     path = QUIZ_INDEX_FILE_TMPL.format(year=year)
-    await asyncio.to_thread(_atomic_write_json, path, QUIZ_INDEX[year], ensure_ascii=False)
+    snapshot = copy.deepcopy(QUIZ_INDEX[year])
+    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
 
 # year -> {lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}}
 QUIZ_INDEX: dict = {y: load_quiz_index(y) for y in YEARS}
@@ -2300,8 +2385,10 @@ def load_quiz_state(year: str) -> dict:
     return {"current_lecture": None}
 
 async def save_quiz_state(year: str):
+    # See save_analytics for why this snapshot copy is required.
     path = QUIZ_STATE_FILE_TMPL.format(year=year)
-    await asyncio.to_thread(_atomic_write_json, path, QUIZ_STATE[year], ensure_ascii=False)
+    snapshot = copy.deepcopy(QUIZ_STATE[year])
+    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
 
 QUIZ_STATE: dict = {y: load_quiz_state(y) for y in YEARS}  # survives restarts mid-lecture, per year
 
@@ -2315,8 +2402,13 @@ def load_quiz_poll_status(year: str) -> dict:
     return {}
 
 async def save_quiz_poll_status(year: str):
+    # See save_analytics for why this snapshot copy is required — also
+    # high-traffic (fires on every question delivered), and this exact
+    # structure is what poll_status_by_mid is built from, read
+    # concurrently by every student's lecture session.
     path = QUIZ_POLL_STATUS_FILE_TMPL.format(year=year)
-    await asyncio.to_thread(_atomic_write_json, path, QUIZ_POLL_STATUS[year], ensure_ascii=False)
+    snapshot = copy.deepcopy(QUIZ_POLL_STATUS[year])
+    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
 
 # year -> {poll_id -> {"lecture": str, "message_id": int, "closed": bool, ...}}
 # Tracks whether each quiz-channel poll has been stopped yet — Telegram
@@ -2339,8 +2431,10 @@ def load_quiz_backup_state(year: str) -> dict:
     return {}
 
 async def save_quiz_backup_state(year: str):
+    # Tiny dict, but kept consistent — see save_analytics for why.
     path = QUIZ_BACKUP_STATE_FILE_TMPL.format(year=year)
-    await asyncio.to_thread(_atomic_write_json, path, QUIZ_BACKUP_STATE[year], ensure_ascii=False)
+    snapshot = copy.deepcopy(QUIZ_BACKUP_STATE[year])
+    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
 
 QUIZ_BACKUP_STATE: dict = {y: load_quiz_backup_state(y) for y in YEARS}  # year -> {"backup_msg_id": int}
 
@@ -2496,9 +2590,17 @@ async def save_report_threads():
     # JSON object keys must be strings, so REPORT_THREADS (keyed by an
     # int message_id) needs the same str(k)/int(k) round-trip on the way
     # out and back in — see load_report_threads above.
+    #
+    # deepcopy, not just the str-keyed dict comprehension below: the
+    # comprehension only copies the OUTER dict — each thread dict (and
+    # its "messages" list) would still be the same live object the event
+    # loop can keep mutating (e.g. a reply landing) while a background
+    # thread is mid-serializing it. See save_analytics for the general
+    # explanation of why to_thread needs a frozen snapshot.
+    snapshot = {str(k): v for k, v in copy.deepcopy(REPORT_THREADS).items()}
     await asyncio.to_thread(
         _atomic_write_json, REPORT_THREADS_FILE,
-        {str(k): v for k, v in REPORT_THREADS.items()}, indent=2, ensure_ascii=False,
+        snapshot, indent=2, ensure_ascii=False,
     )
 
 REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id","name","username","user_text","messages","closed"}
@@ -4038,7 +4140,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         xp_delta = 0   # repeat attempt at a lecture already completed once — no XP farming
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
-    events     = await _record_activity(user_id)
+    events     = await _record_activity(user_id, persist=False)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -4069,7 +4171,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     if final_level > user_entry["level"]:
         user_entry["level"] = final_level
         events["level_up"] = final_level
-    await save_analytics()
+    _mark_analytics_dirty()
     await _announce_events(context, user_id, events)   # still immediate: level-ups/achievements are rare enough to be worth a heads-up mid-lecture
 
     await backup_analytics_to_channel(context)
@@ -6800,11 +6902,12 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: wipe all analytics data locally and delete the pinned
     backup in the analytics group. Use when you need a clean slate."""
-    global _analytics_backup_msg_id
+    global _analytics_backup_msg_id, _analytics_dirty
     if update.effective_chat.id != ADMIN_ID:
         return
     ANALYTICS.clear()
     await save_analytics()
+    _analytics_dirty = False   # disk now matches memory — nothing left for the periodic flush to do
     if _analytics_backup_msg_id and ANALYTICS_GROUP_ID:
         try:
             await context.bot.delete_message(
@@ -6837,6 +6940,7 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     when the pinned backup itself is missing/corrupted — e.g. importing a
     copy you saved elsewhere. Merges into (does not wipe) existing data,
     then re-saves and re-pins so the channel backup reflects the import."""
+    global _analytics_dirty
     if not (update.effective_user and update.effective_user.id == ADMIN_ID):
         return
     reply = update.message.reply_to_message
@@ -6855,11 +6959,21 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await update.message.reply_text(f"❌ Import failed: {e}")
         return
-    ANALYTICS.update(imported)
+    cleaned = _clean_analytics_dict(imported)
+    if not cleaned:
+        await update.message.reply_text(
+            "❌ Import failed: nothing in that file looked like a valid analytics entry "
+            "(expected {\"<telegram_user_id>\": {...}, ...}). Wrong file?"
+        )
+        return
+    ANALYTICS.update(cleaned)
     await save_analytics()
+    _analytics_dirty = False   # disk now matches memory — nothing left for the periodic flush to do
     await backup_analytics_to_channel(context)
+    dropped = len(imported) - len(cleaned)
+    note = f" ({dropped} malformed entr{'y' if dropped == 1 else 'ies'} skipped)" if dropped else ""
     await update.message.reply_text(
-        f"✅ Imported <b>{len(imported)}</b> user(s) — merged into current data, "
+        f"✅ Imported <b>{len(cleaned)}</b> user(s){note} — merged into current data, "
         f"saved locally, and re-pinned to the backup channel.\n"
         f"Total users on file now: <b>{len(ANALYTICS)}</b>.",
         parse_mode=ParseMode.HTML,
@@ -6870,6 +6984,33 @@ async def _post_init(app):
     the storage-group and each year's quiz-channel indexes from their
     pinned backup messages, so a wiped/switched local disk doesn't orphan
     content that's still sitting safely in the channels themselves."""
+    # asyncio.to_thread() (used by every save_*() function's disk write)
+    # runs on Python's DEFAULT ThreadPoolExecutor, sized
+    # min(32, cpu_count()+4) — on a small Railway instance (1-2 vCPUs)
+    # that's as few as 5-6 threads, shared across the ENTIRE bot. Every
+    # save_*() call (which fires on essentially every answered question —
+    # XP, streak, mistakes-bank updates) queues behind that tiny pool
+    # once concurrent students exceed it. Under load-testing (see the
+    # load-test harness from this conversation), this was the leading
+    # suspect for latency going strongly super-linear with concurrency
+    # (p95 growing ~44x for a 7x increase in users) rather than roughly
+    # linearly, since it's a real queueing bottleneck, not a CPU-bound
+    # one — these are disk-I/O-bound calls (fsync), so a pool much larger
+    # than the CPU core count is appropriate and safe, not wasteful.
+    #
+    # Done here, not at module level: this is the first point in the
+    # file guaranteed to be running ON the actual event loop PTB will use
+    # for the rest of the bot's life (_post_init is an async callback PTB
+    # itself awaits during startup, per its own post_init contract) — so
+    # asyncio.get_running_loop() here is guaranteed correct, unlike
+    # calling asyncio.get_event_loop() at bare module-import time, which
+    # can silently attach to the wrong loop object depending on Python
+    # version and how run_polling() manages its own loop internally.
+    import concurrent.futures as _cf
+    asyncio.get_running_loop().set_default_executor(
+        _cf.ThreadPoolExecutor(max_workers=64, thread_name_prefix="quizician-io")
+    )
+
     await restore_storage_from_channel(app)
     for y in configured_years():
         await restore_quiz_from_channel(app, y)
@@ -6881,17 +7022,37 @@ async def _post_init(app):
 
     if app.job_queue is None:
         print(
-            "⚠️ No JobQueue available — periodic backup reconciliation and "
-            "the Daily Quiz push are disabled. Install with: "
+            "⚠️ No JobQueue available — periodic backup reconciliation, the "
+            "analytics flush, and the Daily Quiz push are disabled. Local "
+            "analytics from poll answers will only hit disk on the next "
+            "immediate-save call site (restore/reset/import) or on a clean "
+            "shutdown, not every 60s. Install with: "
             "pip install \"python-telegram-bot[job-queue]\""
         )
     else:
         app.job_queue.run_repeating(
             _reconcile_backups_job, interval=BACKUP_RECONCILE_INTERVAL, first=BACKUP_RECONCILE_INTERVAL,
         )
+        app.job_queue.run_repeating(
+            _flush_analytics_job, interval=ANALYTICS_FLUSH_INTERVAL, first=ANALYTICS_FLUSH_INTERVAL,
+        )
         app.job_queue.run_daily(
             _daily_quiz_push_job, time=dt_time(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, tzinfo=DAILY_QUIZ_TZ),
         )
+
+async def _flush_analytics_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick for the hot-path debounce described above
+    _analytics_dirty: writes analytics.json only if a poll answer marked it
+    dirty since the last tick. No-ops (no deepcopy, no I/O) on a quiet tick."""
+    await _flush_analytics_if_dirty()
+
+async def _post_shutdown(app):
+    """Runs once on a clean shutdown (PTB's own stop-signal handling calls
+    this before the process exits) — flushes any analytics still sitting in
+    memory from the last (< ANALYTICS_FLUSH_INTERVAL)-second window, so a
+    normal restart/redeploy never loses data. Only a hard crash (killed
+    process, power loss) can still lose that window; a clean stop cannot."""
+    await _flush_analytics_if_dirty()
 
 # ── Backup reconciliation ────────────────────────────────────────
 # Every backup_*_to_channel() call above is reactive and fire-and-forget:
@@ -6983,12 +7144,20 @@ async def delete_pin_service_message(update: Update, context: ContextTypes.DEFAU
 # (each user's own updates are still serialized against each other — see
 # @_serialize_per_user below); Telegram's own rate limits are still
 # enforced by AIORateLimiter regardless of how many run at once locally.
+#
+# The thread-pool-size fix for asyncio.to_thread() (every save_*()
+# function's disk write) lives in _post_init, not here — it needs a
+# guaranteed-running event loop to attach to (asyncio.get_running_loop()),
+# and at this point in the file the loop PTB will actually run polling on
+# doesn't necessarily exist yet / isn't necessarily the one
+# asyncio.get_event_loop() would return this early. See _post_init.
 app = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
     .rate_limiter(AIORateLimiter())
     .concurrent_updates(256)
     .post_init(_post_init)
+    .post_shutdown(_post_shutdown)
     .build()
 )
 
