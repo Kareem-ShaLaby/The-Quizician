@@ -527,6 +527,19 @@ def _atomic_write_json(path: str, data, **dump_kwargs):
             pass
         raise
 
+def _backup_filename(base: str) -> str:
+    """base.json -> base_20260910T143201Z.json. Every backup upload now
+    gets a distinct, sortable filename instead of reusing the same name —
+    paired with no longer deleting the previous backup message in every
+    backup_*_to_channel function, this means every backup ever taken
+    stays in its channel, each individually identifiable by caption +
+    timestamp. restore_cmd (/restore) reads this back off the filename to
+    show the admin what they're picking between."""
+    from datetime import timezone
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name, _, ext = base.rpartition(".")
+    return f"{name}_{stamp}.{ext}" if name else f"{base}_{stamp}"
+
 # ═══════════════════════════════════════════════════════════════
 # USERS STORAGE
 # ═══════════════════════════════════════════════════════════════
@@ -683,10 +696,44 @@ def _blank_entry() -> dict:
                                       # the settings backup.
     }
 
+def _is_valid_analytics_entry(e) -> bool:
+    """A minimal shape check for one ANALYTICS[user_id] entry — not
+    "has every key" (see _get_entry's own setdefault backfill for that,
+    which already handles a schema that's grown fields over time), just
+    "is this a dict at all, and are the fields most read directly by
+    key (without going through _get_entry first) actually the right
+    type." Guards against the kind of corruption that isn't a missing
+    key but a wrong-shaped value entirely — e.g. a restore that hands
+    back a string or a list where a dict belongs."""
+    if not isinstance(e, dict):
+        return False
+    if "achievements" in e and not isinstance(e["achievements"], dict):
+        return False
+    for k in ("questions_created", "streak", "pdfs_exported", "lecture_questions_answered",
+              "lecture_questions_correct", "lecture_questions_incorrect", "xp", "level"):
+        if k in e and not isinstance(e[k], (int, float)):
+            return False
+    return True
+
+def _clean_analytics_dict(raw: dict) -> dict:
+    """Filters a whole ANALYTICS-shaped dict ({user_id_str: entry}),
+    dropping any entry that fails _is_valid_analytics_entry. Used by both
+    load_analytics and restore_analytics_from_channel so a bad entry from
+    either source is caught the same way, before it can crash something
+    that reads a field directly off it."""
+    if not isinstance(raw, dict):
+        print(f"ANALYTICS: top-level data wasn't a dict ({type(raw).__name__}) — ignoring entirely.")
+        return {}
+    clean = {k: v for k, v in raw.items() if _is_valid_analytics_entry(v)}
+    if len(clean) != len(raw):
+        print(f"ANALYTICS: dropped {len(raw) - len(clean)} malformed entr(y/ies).")
+    return clean
+
 def load_analytics() -> dict:
     if os.path.exists(ANALYTICS_FILE):
         with open(ANALYTICS_FILE) as f:
-            return json.load(f)
+            raw = json.load(f)
+        return _clean_analytics_dict(raw)
     return {}
 
 async def save_analytics():
@@ -943,7 +990,7 @@ async def backup_analytics_to_channel(context):
     try:
         sent = await context.bot.send_document(
             chat_id=ANALYTICS_GROUP_ID,
-            document=InputFile(BytesIO(data), filename="analytics.json"),
+            document=InputFile(BytesIO(data), filename=_backup_filename("analytics.json")),
             caption=ANALYTICS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -957,14 +1004,10 @@ async def backup_analytics_to_channel(context):
         )
     except Exception as e:
         print("ANALYTICS PIN ERROR:", e)
-    if _analytics_backup_msg_id and _analytics_backup_msg_id != sent.message_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=ANALYTICS_GROUP_ID,
-                message_id=_analytics_backup_msg_id,
-            )
-        except Exception:
-            pass
+    # Previous backups are no longer deleted — every one ever taken stays
+    # in the channel, timestamped, so /restore can offer a choice and a
+    # bad backup never wipes out the only copy of a good one. The pin
+    # just moves to the newest; nothing else needs to change here.
     _analytics_backup_msg_id = sent.message_id
 
 async def restore_analytics_from_channel(app):
@@ -982,7 +1025,8 @@ async def restore_analytics_from_channel(app):
             return
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
-        ANALYTICS.update(json.loads(bytes(raw).decode("utf-8")))
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        ANALYTICS.update(_clean_analytics_dict(restored))
         await save_analytics()
         _analytics_backup_msg_id = pinned.message_id
         print(f"Restored analytics: {len(ANALYTICS)} user(s).")
@@ -1136,7 +1180,7 @@ async def backup_settings_to_channel(context):
     try:
         sent = await context.bot.send_document(
             chat_id=SETTINGS_GROUP_ID,
-            document=InputFile(BytesIO(data), filename="settings.json"),
+            document=InputFile(BytesIO(data), filename=_backup_filename("settings.json")),
             caption=SETTINGS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -1150,14 +1194,8 @@ async def backup_settings_to_channel(context):
         )
     except Exception as e:
         print("SETTINGS PIN ERROR:", e)
-    if _settings_backup_msg_id and _settings_backup_msg_id != sent.message_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=SETTINGS_GROUP_ID,
-                message_id=_settings_backup_msg_id,
-            )
-        except Exception:
-            pass
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
     _settings_backup_msg_id = sent.message_id
 
 async def restore_settings_from_channel(app):
@@ -1289,7 +1327,7 @@ async def backup_lecture_results_to_channel(context):
     try:
         sent = await context.bot.send_document(
             chat_id=LECTURE_RESULTS_GROUP_ID,
-            document=InputFile(BytesIO(data), filename="lecture_results.json"),
+            document=InputFile(BytesIO(data), filename=_backup_filename("lecture_results.json")),
             caption=LECTURE_RESULTS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -1303,14 +1341,8 @@ async def backup_lecture_results_to_channel(context):
         )
     except Exception as e:
         print("LECTURE RESULTS PIN ERROR:", e)
-    if _lecture_results_backup_msg_id and _lecture_results_backup_msg_id != sent.message_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=LECTURE_RESULTS_GROUP_ID,
-                message_id=_lecture_results_backup_msg_id,
-            )
-        except Exception:
-            pass
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
     _lecture_results_backup_msg_id = sent.message_id
 
 async def restore_lecture_results_from_channel(app):
@@ -1440,7 +1472,7 @@ async def backup_mistakes_bank_to_channel(context):
     try:
         sent = await context.bot.send_document(
             chat_id=MISTAKES_BANK_GROUP_ID,
-            document=InputFile(BytesIO(data), filename="mistakes_bank.json"),
+            document=InputFile(BytesIO(data), filename=_backup_filename("mistakes_bank.json")),
             caption=MISTAKES_BANK_BACKUP_MARKER,
         )
     except Exception as e:
@@ -1454,14 +1486,8 @@ async def backup_mistakes_bank_to_channel(context):
         )
     except Exception as e:
         print("MISTAKES BANK PIN ERROR:", e)
-    if _mistakes_bank_backup_msg_id and _mistakes_bank_backup_msg_id != sent.message_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=MISTAKES_BANK_GROUP_ID,
-                message_id=_mistakes_bank_backup_msg_id,
-            )
-        except Exception:
-            pass
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
     _mistakes_bank_backup_msg_id = sent.message_id
 
 async def restore_mistakes_bank_from_channel(app):
@@ -2089,14 +2115,7 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
     # A pinned document instead of a pinned text message: Bot API caps
     # documents at 50MB vs ~4KB for a text message — effectively removes
     # the size ceiling for any realistic amount of data this bot handles.
-    filename = "quizician_storage_backup.json"
-
-    # We tried editing the existing pinned document in place, but Telegram
-    # reliably rejected it with "Can't parse inputmedia: media not found".
-    # Simpler and just as effective: send a new document, pin it, then
-    # delete the previous one — net result is still exactly one backup
-    # document sitting in the chat at all times.
-    old_msg_id = STORAGE_BACKUP_STATE.get("backup_msg_id")
+    filename = _backup_filename("quizician_storage_backup.json")
 
     try:
         sent = await context.bot.send_document(
@@ -2108,9 +2127,9 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
         print("STORAGE BACKUP ERROR:", e)
         return
 
-    # Save the message id immediately — pinning/deleting-old are nice-to-
-    # haves on top, and their failure (e.g. bot isn't admin / lacks rights)
-    # must NOT stop us from remembering this new message id.
+    # Save the message id immediately — pinning is a nice-to-have on top,
+    # and its failure (e.g. bot isn't admin / lacks rights) must NOT stop
+    # us from remembering this new message id.
     STORAGE_BACKUP_STATE["backup_msg_id"] = sent.message_id
     await save_storage_backup_state()
 
@@ -2119,11 +2138,8 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("STORAGE BACKUP PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
 
-    if old_msg_id and old_msg_id != sent.message_id:
-        try:
-            await context.bot.delete_message(chat_id=STORAGE_GROUP_ID, message_id=old_msg_id)
-        except Exception as e:
-            print("STORAGE BACKUP OLD-MESSAGE DELETE ERROR (probably already gone, harmless):", e)
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
 
 async def restore_storage_from_channel(app):
     """Runs once on startup — rebuilds USERS + STORAGE_INDEX from the
@@ -2170,11 +2186,44 @@ async def restore_storage_from_channel(app):
 # Telegram's practical JSON document size as lectures pile up.
 QUIZ_INDEX_FILE_TMPL = "quiz_index_{year}.json"
 
+def _is_valid_quiz_index_entry(e) -> bool:
+    """One QUIZ_INDEX[year][lecture_name] entry — checked against the
+    schema in the QUIZ_INDEX comment just below: ids must be a list,
+    closed a bool, and module/subject/lecture_number/name strings where
+    present. Doesn't require every key (older entries or in-progress
+    lectures may be missing one), just that whatever IS there is the
+    right type — the same "shape, not completeness" check as
+    _is_valid_analytics_entry, for the same reason: this is a guard
+    against corruption, not a schema-completeness enforcer."""
+    if not isinstance(e, dict):
+        return False
+    if "ids" in e and not isinstance(e["ids"], list):
+        return False
+    if "closed" in e and not isinstance(e["closed"], bool):
+        return False
+    for k in ("module", "subject", "lecture_number", "name"):
+        if k in e and not isinstance(e[k], str):
+            return False
+    return True
+
+def _clean_quiz_index_dict(year: str, raw: dict) -> dict:
+    """Filters a whole QUIZ_INDEX[year]-shaped dict, dropping any lecture
+    entry that fails _is_valid_quiz_index_entry. Used by both
+    load_quiz_index and restore_quiz_from_channel."""
+    if not isinstance(raw, dict):
+        print(f"QUIZ INDEX ({year}): top-level data wasn't a dict ({type(raw).__name__}) — ignoring entirely.")
+        return {}
+    clean = {k: v for k, v in raw.items() if _is_valid_quiz_index_entry(v)}
+    if len(clean) != len(raw):
+        print(f"QUIZ INDEX ({year}): dropped {len(raw) - len(clean)} malformed lecture entr(y/ies).")
+    return clean
+
 def load_quiz_index(year: str) -> dict:
     path = QUIZ_INDEX_FILE_TMPL.format(year=year)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
+        return _clean_quiz_index_dict(year, raw)
     return {}
 
 async def save_quiz_index(year: str):
@@ -2313,13 +2362,7 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE, year: str):
     # a year's questions — quizician_storage_backup.json (no year suffix)
     # is a different, unrelated file: the password-gated media vault. Two
     # files named near-identically would be a landmine for future greps.
-    filename = f"Quizician_Quiz_Backup_{year.upper()}.json"
-
-    # Same approach as storage backup: editing the existing pinned document
-    # in place reliably failed with "Can't parse inputmedia: media not
-    # found", so instead we send a new one, pin it, then delete the old —
-    # still exactly one backup document in the channel at any time.
-    old_msg_id = QUIZ_BACKUP_STATE[year].get("backup_msg_id")
+    filename = _backup_filename(f"Quizician_Quiz_Backup_{year.upper()}.json")
 
     try:
         sent = await context.bot.send_document(
@@ -2331,9 +2374,8 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE, year: str):
         print(f"QUIZ BACKUP ({year}) ERROR:", e)
         return
 
-    # Same fix as storage backup: persist the message id regardless of
-    # whether pinning/deleting-old succeed, so we don't resend a fresh
-    # document on every single addition.
+    # Persist the message id regardless of whether pinning succeeds, so we
+    # don't resend a fresh document on every single addition.
     QUIZ_BACKUP_STATE[year]["backup_msg_id"] = sent.message_id
     await save_quiz_backup_state(year)
 
@@ -2342,11 +2384,8 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE, year: str):
     except Exception as e:
         print(f"QUIZ BACKUP ({year}) PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
 
-    if old_msg_id and old_msg_id != sent.message_id:
-        try:
-            await context.bot.delete_message(chat_id=channel_id, message_id=old_msg_id)
-        except Exception as e:
-            print(f"QUIZ BACKUP ({year}) OLD-MESSAGE DELETE ERROR (probably already gone, harmless):", e)
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
 
 async def restore_quiz_from_channel(app, year: str):
     """Runs once on startup per year — rebuilds that year's lecture/quiz
@@ -2363,7 +2402,7 @@ async def restore_quiz_from_channel(app, year: str):
             tg_file = await app.bot.get_file(pinned.document.file_id)
             raw     = await tg_file.download_as_bytearray()
             payload = json.loads(bytes(raw).decode("utf-8"))
-            QUIZ_INDEX[year].update(payload.get("quiz_index", {}))
+            QUIZ_INDEX[year].update(_clean_quiz_index_dict(year, payload.get("quiz_index", {})))
             QUIZ_STATE[year].update(payload.get("quiz_state", {}))
             QUIZ_POLL_STATUS[year].update(payload.get("quiz_poll_status", {}))
             await save_quiz_index(year)
@@ -2489,7 +2528,7 @@ async def backup_report_threads_to_channel(context):
     try:
         sent = await context.bot.send_document(
             chat_id=REPORT_ISSUE_GROUP_ID,
-            document=InputFile(BytesIO(data), filename="report_threads.json"),
+            document=InputFile(BytesIO(data), filename=_backup_filename("report_threads.json")),
             caption=REPORT_THREADS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -2503,14 +2542,8 @@ async def backup_report_threads_to_channel(context):
         )
     except Exception as e:
         print("REPORT THREADS PIN ERROR:", e)
-    if _report_threads_backup_msg_id and _report_threads_backup_msg_id != sent.message_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=REPORT_ISSUE_GROUP_ID,
-                message_id=_report_threads_backup_msg_id,
-            )
-        except Exception:
-            pass
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
     _report_threads_backup_msg_id = sent.message_id
 
 async def restore_report_threads_from_channel(app):
@@ -5232,6 +5265,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
+    # ── /restore: run one system's restore-from-pin on demand ────────
+    if query.data.startswith("restore_go:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        key = query.data.split(":", 1)[1]
+        target = _RESTORE_TARGETS.get(key)
+        if not target:
+            await query.edit_message_text("⚠️ مش لاقي الـ system ده.")
+            return
+        label, restore_fn = target
+        await query.edit_message_text(f"🔄 بيعمل restore لـ {label}…")
+        await restore_fn(context.application)
+        ok = RESTORE_OK.get(key, True)
+        if ok:
+            await context.bot.send_message(chat_id=user_id, text=f"✅ {label} — تم الـ restore من آخر نسخة مثبتة.")
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ {label} — الـ restore فشل. اتبعتلك رسالة تانية بالتفاصيل (نفس رسالة فشل الـ restore وقت التشغيل).",
+            )
+        return
+
     # ── REPORT ISSUE: reply / close (admin-only, from REPORT_ISSUE_GROUP_ID) ──
     if query.data == "report_noop":
         return   # "🔒 Closed" button on an already-closed report — nothing to do
@@ -6390,6 +6446,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("\n🔐 <b>Admin only</b>")
         lines.append("/admincheck — confirms you're an admin")
         lines.append("/health — bot status dashboard (users, lectures, backups, sessions, errors, uptime)")
+        lines.append("/restore — manually re-pull one system's data from its currently-pinned channel backup")
         lines.append("/broadcast &lt;message&gt; — sends a message to every user")
         lines.append("/backup_now — instantly refreshes every pinned backup (storage + each year's quiz index)")
         lines.append("/quiz_list &lt;year&gt; — numbered list of every lecture (open and closed) in that year")
@@ -6490,6 +6547,49 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<i>Sessions and error count are since the last restart — both reset when the process does.</i>"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+# ═══════════════════════════════════════════════════════════════
+# /restore — admin-only, on-demand re-run of the same pinned-backup
+# restore logic that normally only happens once at startup, per system.
+# Doesn't touch anything backup-related beyond what restore_*_from_channel
+# already does: reads whatever's CURRENTLY PINNED in that system's
+# channel (the Bot API has no way to list or browse older, unpinned
+# backup messages — see the backup_*_to_channel functions' comments on
+# why old backups are kept, just unpinned, instead of deleted) and
+# overwrites the local file with it, same as boot does.
+#
+# Practical use: if a bad backup got pinned (e.g. RESTORE_OK was False
+# for a while and then something manually re-pinned an old/wrong file),
+# re-pin the RIGHT backup message in the channel yourself first, THEN run
+# /restore for that system — it'll pick up whatever is pinned at the
+# moment you run it, not necessarily the newest one ever taken.
+# ═══════════════════════════════════════════════════════════════
+_RESTORE_TARGETS = {
+    "analytics":       ("Analytics",        lambda app: restore_analytics_from_channel(app)),
+    "settings":        ("Settings",         lambda app: restore_settings_from_channel(app)),
+    "storage":         ("Storage",          lambda app: restore_storage_from_channel(app)),
+    "quiz_y1":         ("Quiz Index — Y1",  lambda app: restore_quiz_from_channel(app, "y1")),
+    "quiz_y2":         ("Quiz Index — Y2",  lambda app: restore_quiz_from_channel(app, "y2")),
+    "quiz_y3":         ("Quiz Index — Y3",  lambda app: restore_quiz_from_channel(app, "y3")),
+    "mistakes_bank":   ("Mistakes Bank",    lambda app: restore_mistakes_bank_from_channel(app)),
+    "report_threads":  ("Report Threads",   lambda app: restore_report_threads_from_channel(app)),
+}
+
+def _restore_picker_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"restore_go:{key}")]
+        for key, (label, _) in _RESTORE_TARGETS.items()
+    ]
+    return InlineKeyboardMarkup(rows)
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    await update.message.reply_text(
+        "🔄 اختار الـ system اللي عايز تعمله restore من آخر نسخة مثبتة (pinned) في القناة بتاعته:",
+        reply_markup=_restore_picker_keyboard(),
+    )
 
 # ═══════════════════════════════════════════════════════════════
 # BROADCAST COMMAND  (admin only)
@@ -6949,6 +7049,7 @@ app.add_handler(CommandHandler("report_issue",   report_issue_cmd))
 app.add_handler(CommandHandler("sleep",          sleep_cmd))
 app.add_handler(CommandHandler("admincheck",     admincheck_cmd))
 app.add_handler(CommandHandler("health",         health_cmd))
+app.add_handler(CommandHandler("restore",        restore_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
 app.add_handler(CommandHandler("pdf_start",      pdf_start))
 app.add_handler(CommandHandler("pdf_generate",   pdf_generate))
