@@ -2091,7 +2091,7 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
     only gets today's quiz once."""
     today = _today()
     if get_daily_quiz_last_date(user_id) == today:
-        text = f"⏳ خلصت الـ Daily Quiz بتاعت النهاردة خلاص!\n\n{_next_daily_quiz_line()}"
+        text = f" !خلصت الكويز اليومي بتاع النهاردة خلاص\n\n{_next_daily_quiz_line()}"
         if message:
             await message.edit_text(text)
         else:
@@ -2100,7 +2100,7 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
 
     questions = await build_daily_quiz_questions(context, user_id)
     if not questions:
-        text = "📭 مفيش أسئلة كفاية جاهزة لعمل Daily Quiz دلوقتي — جرب تاني قريب."
+        text = "check again later :/"
         if message:
             await message.edit_text(text)
         else:
@@ -2118,7 +2118,7 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
     }
     DAILY_QUIZ_SESSIONS[user_id] = session
 
-    text = f"💥 <b>Daily Quiz</b> — {len(questions)} سؤال من مواد مختلفة، هيتبعتولك واحد واحد 👇"
+    text = f"💥 <b>Daily Quiz</b> — {len(questions)} أس~لة من مواد مختلفة 👇"
     if message:
         await message.edit_text(text, parse_mode=ParseMode.HTML)
     else:
@@ -2137,7 +2137,7 @@ async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=uid,
-                text="💥 <b>Daily Quiz</b> جاهزة! جرب 10 أسئلة سريعة.",
+                text="💥 <b>Daily Quiz</b> !الكويز اليومي أتجدد",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
@@ -2166,7 +2166,7 @@ async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int
     entries   = list(_scoped_mistakes_bank(user_id))
     questions = await _resolve_mistakes(context, entries) if entries else []
     if not questions:
-        text = "🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!"
+        text = "أما أنت كينج صحيح - 🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
         if message:
             await message.edit_text(text, reply_markup=keyboard)
@@ -2804,7 +2804,7 @@ async def restore_report_threads_from_channel(app):
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_QUESTIONS_PER_MSG = 40
+MAX_QUESTIONS_PER_MSG = 50
 TELEGRAM_Q_LIMIT      = 300   # max chars in poll question field
 TELEGRAM_DESC_LIMIT   = 200   # max chars in poll description (shown above question)
 TELEGRAM_EX_LIMIT     = 200   # max chars in poll explanation (shown after answering)
@@ -5856,8 +5856,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
-                    f"⚠️ {not_ready_cnt} سؤال لسه مش جاهز (التصويت عليه لسه مفتوح في القناة) "
-                    "— هيتبعت لما الأدمن يوقفه."
+                    f"⚠️ {not_ready_cnt} Quiz not ready yet"
+                    "use /report_issue للتواصل مع أدمن"
                 ),
             )
         return
@@ -5959,7 +5959,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "edit_pick":
         items = PDF_BUFFER.get(user_id, [])
         if not items:
-            await query.answer("مفيش أسئلة في البافر دلوقتي", show_alert=True)
+            await query.answer("مفيش أسئلة دلوقتي", show_alert=True)
             return
         lines = ["✏️ <b>اختار رقم السؤال اللي عايز تعدله:</b>\n"]
         for i, item in enumerate(items):
