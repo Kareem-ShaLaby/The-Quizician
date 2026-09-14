@@ -687,11 +687,20 @@ def _blank_entry() -> dict:
         "lecture_questions_answered":   0,
         "lecture_questions_correct":    0,
         "lecture_questions_incorrect":  0,
+        "lecture_time_spent_seconds":   0.0,  # cumulative time-to-answer across every
+                                               # lecture question ever answered, timed
+                                               # question-delivered -> question-answered
+                                               # (or timed out). See _record_time_spent
+                                               # and the year leaderboard, which ranks
+                                               # by correct count first, this second.
         "lecture_correct_streak_current": 0,
         "lecture_correct_streak_best":    0,
         "xp":                0,
         "level":             0,
         "achievements":      {k: 0 for k in ACHIEVEMENTS},
+        "daily_medals":      {"gold": 0, "silver": 0, "bronze": 0},  # lifetime Daily Quiz
+                                                                       # leaderboard finishes —
+                                                                       # see _finalize_daily_leaderboard
         "telegram_name":     None,   # full display name (first + last), Telegram side
         "telegram_username": None,   # @handle, without the @, or None if not set
         "nickname":          None,   # bot-side nickname (see SETTINGS/get_nickname) —
@@ -713,8 +722,10 @@ def _is_valid_analytics_entry(e) -> bool:
         return False
     if "achievements" in e and not isinstance(e["achievements"], dict):
         return False
+    if "daily_medals" in e and not isinstance(e["daily_medals"], dict):
+        return False
     for k in ("questions_created", "streak", "streak_best", "pdfs_exported", "lecture_questions_answered",
-              "lecture_questions_correct", "lecture_questions_incorrect", "xp", "level"):
+              "lecture_questions_correct", "lecture_questions_incorrect", "lecture_time_spent_seconds", "xp", "level"):
         if k in e and not isinstance(e[k], (int, float)):
             return False
     return True
@@ -827,16 +838,41 @@ def _get_entry(user_id: int) -> dict:
         entry["achievements"] = {k: 0 for k in ACHIEVEMENTS}
     for k in ACHIEVEMENTS:
         entry["achievements"].setdefault(k, 0)
+    if not isinstance(entry.get("daily_medals"), dict):
+        entry["daily_medals"] = {"gold": 0, "silver": 0, "bronze": 0}
+    for k in ("gold", "silver", "bronze"):
+        entry["daily_medals"].setdefault(k, 0)
     return entry
+
+def _record_time_spent(user_id: int, seconds: float | None) -> None:
+    """Adds to a user's cumulative lecture_time_spent_seconds — see the
+    field's own comment in _blank_entry for what it measures and why.
+    Silently ignores None/negative/absurd values (clock skew, a session
+    that somehow never recorded a delivery time) rather than letting one
+    bad reading corrupt a running total that can never be un-summed."""
+    if seconds is None or seconds < 0 or seconds > 3600:
+        return
+    entry = _get_entry(user_id)
+    entry["lecture_time_spent_seconds"] = entry.get("lecture_time_spent_seconds", 0.0) + seconds
+    _mark_analytics_dirty()
+
+def _format_duration(seconds: float) -> str:
+    """1234.5 -> '20m 34s' (or just '34s' under a minute) — used on the
+    year leaderboard next to each user's correct count."""
+    total = int(seconds)
+    m, s = divmod(total, 60)
+    return f"{m}m {s}s" if m else f"{s}s"
 
 def _year_leaderboard(year_class: str, limit: int = 15) -> list[dict]:
     """Top users in one Year/Class cohort (SETTINGS' year_class — see the
     onboarding question, NOT the quiz-browsing YEARS), ranked by all-time
-    lecture_questions_correct, highest first (ties broken by fewer
-    incorrect, so someone who got there more efficiently ranks above
-    someone who needed more attempts to reach the same correct count).
-    Only counts users who've actually set a Year/Class — that's the whole
-    filter, since ANALYTICS itself isn't year-scoped, SETTINGS is."""
+    lecture_questions_correct first (highest first), then by
+    lecture_time_spent_seconds (lowest first) as the tiebreaker — so
+    between two students with the same correct count, the one who got
+    there faster overall ranks higher. Falls back to fewer incorrect as a
+    final tiebreaker if both of those are somehow still tied. Only counts
+    users who've actually set a Year/Class — that's the whole filter,
+    since ANALYTICS itself isn't year-scoped, SETTINGS is."""
     rows = []
     for uid_str, entry in ANALYTICS.items():
         if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
@@ -852,9 +888,10 @@ def _year_leaderboard(year_class: str, limit: int = 15) -> list[dict]:
             "name":     get_nickname(uid) or entry.get("telegram_name") or f"مستخدم #{uid % 10000}",
             "correct":  correct,
             "incorrect": entry.get("lecture_questions_incorrect", 0),
+            "duration": entry.get("lecture_time_spent_seconds", 0.0),
             "level":    entry.get("level", 0),
         })
-    rows.sort(key=lambda r: (-r["correct"], r["incorrect"]))
+    rows.sort(key=lambda r: (-r["correct"], r["duration"], r["incorrect"]))
     return rows[:limit]
 
 def _update_telegram_name(user_id: int, tg_user) -> None:
@@ -1125,11 +1162,6 @@ async def restore_analytics_from_channel(app):
 #                              # that need to know their class/cohort.
 #   "daily_quiz_last_date": str | None,  # "YYYY-MM-DD" — once-per-day gate for
 #                                        # the 💥Daily Quiz💥 button
-#   "language": str,  # "ar" | "en" — UI language, see get_language() /
-#                     # STRINGS / t() in the I18N section. Defaults to "ar"
-#                     # (matches the bot's current all-Arabic behavior);
-#                     # nothing reads this yet beyond the Settings toggle
-#                     # itself until strings get migrated onto t().
 # }
 #
 # Mirrors the ANALYTICS system exactly: local JSON file, plus a pinned
@@ -1162,7 +1194,6 @@ def _blank_settings_entry() -> dict:
                                 # auto-closing; 0 = off. Cycles 0 -> 60 -> 30 -> 0.
         "year_class": None,    # "y1"/"y2"/"y3" — see YEAR_CLASS_NUMBER above
         "daily_quiz_last_date": None,   # "YYYY-MM-DD" (UTC) of the last completed Daily Quiz
-        "language": "ar",      # "ar" | "en" — see get_language() / I18N section
     }
 
 def load_settings() -> dict:
@@ -1234,62 +1265,6 @@ def year_class_label(year_class: str | None) -> str:
     if year_class not in YEAR_CLASS_NUMBER:
         return "لسه محدد"
     return f"{year_label(year_class)} (Class {YEAR_CLASS_NUMBER[year_class]})"
-
-SUPPORTED_LANGUAGES = ("ar", "en")
-
-def get_language(user_id: int) -> str:
-    # Defaults to "ar" for anyone not yet in SETTINGS (or missing the
-    # key) — matches _blank_settings_entry()'s default and the bot's
-    # current all-Arabic behavior, so nobody's language silently changes
-    # just because this field is new.
-    return SETTINGS.get(str(user_id), {}).get("language", "ar")
-
-# ═══════════════════════════════════════════════════════════════
-# I18N — bilingual string lookup (infrastructure only for now)
-#
-# The bot's ~350 user-facing messages are still hardcoded Arabic
-# throughout the handlers below — this section is just the scaffolding
-# (the setting, the toggle, and the lookup helper) for migrating them
-# onto STRINGS/t() gradually, one message at a time, rather than a
-# single big-bang rewrite. Nothing is translated yet.
-#
-# To migrate a message:
-#   1. Add a key to STRINGS below, e.g.:
-#        "mystats_no_data": {
-#            "ar": "📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!",
-#            "en": "📊 No stats yet. Send some questions and they'll show up here!",
-#        },
-#   2. Replace the hardcoded literal at its call site with
-#        t("mystats_no_data", user_id)
-#      — or t("key", user_id, name=x) if the original string had an
-#      f-string value baked in; use {name} inside the STRINGS text and
-#      pass name=x as a kwarg, the same way str.format works.
-#
-# Deliberately ONE shared dict (not one file per language) — see the
-# /report_issue-adjacent conversation this came out of: two files means
-# two things to keep in sync by hand, and it's easy for one language to
-# quietly fall behind. Keeping ar/en side by side per key makes a
-# missing translation obvious at a glance instead of a silent gap in a
-# second file nobody's looking at.
-STRINGS: dict[str, dict[str, str]] = {
-    # populated incrementally as messages get migrated — see the how-to above
-}
-
-def t(key: str, user_id: int, **kwargs) -> str:
-    """Looks up STRINGS[key] for this user's language (get_language) and
-    fills in any {placeholder} kwargs, the same way str.format works.
-    Falls back to Arabic if this key hasn't been given an "en" entry yet
-    (so migrating one string at a time never breaks anything for users
-    who've already switched to English), and falls back to a visibly
-    broken placeholder — not a crash, not a silent blank — if the key
-    doesn't exist in STRINGS at all, so a typo'd key is obvious in the
-    chat immediately instead of quietly showing nothing."""
-    lang  = get_language(user_id)
-    entry = STRINGS.get(key)
-    if not entry:
-        return f"[[missing string: {key}]]"
-    text = entry.get(lang) or entry.get("ar") or f"[[missing string: {key}]]"
-    return text.format(**kwargs) if kwargs else text
 
 def year_class_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
     """The Year 1/2/3 (Class 46/45/44) picker, reused for both onboarding
@@ -1733,6 +1708,75 @@ DAILY_QUIZ_TOTAL_COUNT    = 10  # total questions in one Daily Quiz run — alwa
                                  # this long even when the mistakes bank is empty
 DAILY_QUIZ_MISTAKES_COUNT = 3   # cap on how many of those can come from the mistakes bank
 
+# ═══════════════════════════════════════════════════════════════
+# DAILY QUIZ LEADERBOARD — deliberately RAM-only, unlike everything else
+# in this file. It resets every day anyway (today's ranking is
+# meaningless once a new day's questions exist), so there's no reason to
+# spend backup/restore machinery keeping it alive across a bot restart —
+# worst case, a restart mid-day just clears today's board a little
+# early, which is harmless. Contrast with daily_medals on the ANALYTICS
+# entry (_blank_entry), which IS persistent — that's the lifetime medal
+# count this board hands out before resetting, and that has to survive.
+#
+# Note each Daily Quiz run uses this user's OWN personalized question
+# set (their mistakes bank + random pool — see build_daily_quiz_
+# questions), not one shared set — so this ranks "who did best on
+# their own run today," not a level playing field of identical
+# questions. Good enough for a casual daily leaderboard; flagging it
+# so it's a known tradeoff, not a surprise.
+# ═══════════════════════════════════════════════════════════════
+DAILY_QUIZ_LEADERBOARD_DATE: str | None = None   # which day's date the board below is for
+DAILY_QUIZ_LEADERBOARD: dict[int, dict] = {}      # user_id -> {"name", "correct", "total", "duration"}
+
+def _finalize_daily_leaderboard() -> None:
+    """Awards lifetime medals (ANALYTICS[uid]['daily_medals']) to
+    whatever's currently in DAILY_QUIZ_LEADERBOARD's top 3, then clears
+    the board — called right before the first write/read of a new day
+    detects the date has rolled over (see _ensure_daily_leaderboard_
+    fresh), so this always runs exactly once per day transition, without
+    needing its own scheduled job."""
+    global DAILY_QUIZ_LEADERBOARD
+    ranked = _rank_daily_leaderboard()
+    for i, medal_key in enumerate(("gold", "silver", "bronze")):
+        if i >= len(ranked):
+            break
+        entry = _get_entry(ranked[i]["user_id"])
+        entry["daily_medals"][medal_key] += 1
+    if ranked:
+        _mark_analytics_dirty()
+    DAILY_QUIZ_LEADERBOARD = {}
+
+def _ensure_daily_leaderboard_fresh() -> None:
+    """Call before any read or write of DAILY_QUIZ_LEADERBOARD. No-ops on
+    every call within the same day; the first call after midnight
+    finalizes (awards medals for) the outgoing day's board and clears it
+    for the new day."""
+    global DAILY_QUIZ_LEADERBOARD_DATE
+    today = _today()
+    if DAILY_QUIZ_LEADERBOARD_DATE == today:
+        return
+    if DAILY_QUIZ_LEADERBOARD_DATE is not None:   # skip on the very first call ever (nothing to finalize)
+        _finalize_daily_leaderboard()
+    DAILY_QUIZ_LEADERBOARD_DATE = today
+
+def _rank_daily_leaderboard() -> list[dict]:
+    """Today's Daily Quiz finishers, ranked the same way as the year
+    leaderboard: correct count highest first, total duration lowest
+    first as the tiebreaker."""
+    rows = list(DAILY_QUIZ_LEADERBOARD.values())
+    rows.sort(key=lambda r: (-r["correct"], r["duration"]))
+    return rows
+
+def _record_daily_leaderboard_finish(user_id: int, correct: int, total: int, duration: float) -> None:
+    _ensure_daily_leaderboard_fresh()
+    DAILY_QUIZ_LEADERBOARD[user_id] = {
+        "user_id":  user_id,
+        "name":     get_nickname(user_id) or f"مستخدم #{user_id % 10000}",
+        "correct":  correct,
+        "total":    total,
+        "duration": duration,
+    }
+
 # Push time for the daily 💥Daily Quiz💥 button (see job_queue.run_daily in
 # MAIN, and next_daily_quiz_time() / /time below — all three read from
 # these two so the schedule only ever needs to change in one place).
@@ -1964,6 +2008,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
         session["current_poll_id"] = None
         session["current_correct_id"] = None
         session["current_message_id"] = None
+        session["current_delivered_at"] = None
         return False
     q = session["queue"].pop(0)
     timer_seconds = get_question_timer_seconds(user_id)
@@ -1980,18 +2025,24 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     session["current_poll_id"]    = msg.poll.id
     session["current_correct_id"] = q["correct_option_id"]
     session["current_message_id"] = msg.message_id
+    session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
     return True
 
-async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None):
+async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None, delivered_at: float | None = None):
     """Daily Quiz's counterpart to _advance_lecture_session: same XP
     (15/5/+25 completion) and same lecture_questions/lecture_streak
     achievement tracking (a Daily Quiz question is still practice, so it
-    counts toward those same stats) — but no lecture_key, so no dead-poll
-    pruning, no legacy-content recovery, and no _record_lecture_result/
-    leaderboard involvement at all; there's no single lecture for this to
-    be an "attempt" of."""
+    counts toward those same stats — and therefore toward the year
+    leaderboard's correct-count/duration ranking too) — but no
+    lecture_key, so no dead-poll pruning, no legacy-content recovery, and
+    no _record_lecture_result/PER-LECTURE leaderboard involvement; there's
+    no single lecture for this to be an "attempt" of."""
     session["answered"] += 1
     session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    if delivered_at is not None:
+        elapsed = time.time() - delivered_at
+        _record_time_spent(user_id, elapsed)
+        session["duration_seconds"] = session.get("duration_seconds", 0.0) + elapsed
 
     sent_next = await _deliver_next_daily_question(context, user_id, session)
     is_last   = not sent_next
@@ -2037,6 +2088,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
         correct   = session["correct"]
         incorrect = session["answered"] - correct
         pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+        _record_daily_leaderboard_finish(user_id, correct, session["answered"], session.get("duration_seconds", 0.0))
         summary = (
             f"💥 <b>خلصت الـ Daily Quiz!</b>\n\n"
             f"✅ صح: {correct}\n"
@@ -2050,6 +2102,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
             await context.bot.send_message(
                 chat_id=user_id, text=summary, parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏆 Daily Leaderboard", callback_data="daily_quiz_leaderboard"),
                     InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
                 ]]),
             )
@@ -2192,11 +2245,13 @@ async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int
         MISTAKES_RETAKE_SESSIONS.pop(user_id, None)
         await context.bot.send_message(chat_id=user_id, text="⚠️ حصلت مشكلة في تجهيز الأسئلة — جرب تاني.")
 
-async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None):
+async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None, delivered_at: float | None = None):
     """Mistakes-retake counterpart to _advance_daily_quiz_session — same
     XP/streak/achievement bookkeeping, its own completion summary text."""
     session["answered"] += 1
     session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    if delivered_at is not None:
+        _record_time_spent(user_id, time.time() - delivered_at)
 
     sent_next = await _deliver_next_daily_question(context, user_id, session)
     is_last   = not sent_next
@@ -3263,6 +3318,7 @@ def start_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🏆 Leaderboard", callback_data="year_leaderboard"),
+            InlineKeyboardButton("💥 Daily Leaderboard", callback_data="daily_quiz_leaderboard"),
         ],
     ])
 
@@ -3277,12 +3333,9 @@ def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     timer      = get_question_timer_seconds(user_id)
     timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
     yc_label   = year_class_label(get_year_class(user_id))
-    lang       = get_language(user_id)
-    lang_tag   = "English" if lang == "en" else "العربية"
     rows = [
         [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
         [InlineKeyboardButton(f"📚 Year/Class: {yc_label}", callback_data="edit_year_class")],
-        [InlineKeyboardButton(f"🌐 Language: {lang_tag}", callback_data="toggle_language")],
         [InlineKeyboardButton(f"🎭 Reactions: {_tag(reactions)}", callback_data="toggle_reactions")],
         [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
         [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
@@ -3790,8 +3843,92 @@ async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # even for polls the bot didn't create. If the original quiz's creator
 # later ends it, we quietly backfill the answer with no user action needed.
 # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# QUIZ POLL TIMEOUT — a session used to get stuck forever if a poll's
+# open_period (the Settings question-timer) expired with nobody voting.
+#
+# Root cause: session progression only ever happened inside
+# handle_poll_answer, which fires on a PollAnswer update — and Telegram
+# ONLY sends PollAnswer when someone actually votes. If the timer runs
+# out unanswered, Telegram still sends an Update.poll (is_closed=True —
+# same shape as any other poll closing) but NEVER a PollAnswer for it,
+# since nobody voted. Nothing was listening for that case, so the
+# session just sat there permanently waiting for an answer that could
+# never arrive.
+#
+# Fix: poll_update_handler (already registered for every Update.poll)
+# now also checks, on every closed poll, whether it's still the
+# in-flight question for a Daily Quiz / Mistakes Retake / lecture
+# session — i.e. nothing has advanced that session past it yet, which
+# is only possible if no PollAnswer ever came in for it. If so, treats
+# it exactly like an incorrect answer and advances the session, same
+# as handle_poll_answer would for any other wrong answer.
+#
+# If the user DID answer in time, handle_poll_answer has already
+# advanced the session (cleared current_poll_id / popped it out of
+# pending_polls) well before this ever runs, so the match below simply
+# fails and this is a no-op — it only ever fires for a genuine timeout.
+# ═══════════════════════════════════════════════════════════════
+async def _handle_quiz_poll_timeout(context: ContextTypes.DEFAULT_TYPE, poll) -> None:
+    poll_id = poll.id
+
+    for user_id, session in list(DAILY_QUIZ_SESSIONS.items()):
+        if session.get("current_poll_id") == poll_id:
+            await _advance_daily_quiz_session(
+                context, user_id, session, False, session.get("current_message_id"),
+                session.get("current_delivered_at"),
+            )
+            return
+
+    for user_id, session in list(MISTAKES_RETAKE_SESSIONS.items()):
+        if session.get("current_poll_id") == poll_id:
+            await _advance_mistakes_retake_session(
+                context, user_id, session, False, session.get("current_message_id"),
+                session.get("current_delivered_at"),
+            )
+            return
+
+    for user_id, session in list(LECTURE_SESSIONS.items()):
+        if session.get("mode") == "batch":
+            pending = session.get("pending_polls", {})
+            if poll_id in pending:
+                _, message_id, mid, delivered_at = pending.pop(poll_id)
+                await _advance_lecture_session(context, user_id, session, False, message_id, mid, delivered_at)
+                return
+        elif session.get("current_poll_id") == poll_id:
+            await _advance_lecture_session(
+                context, user_id, session, False,
+                session.get("current_message_id"), session.get("current_mid"),
+                session.get("current_delivered_at"),
+            )
+            return
+
+async def _delayed_poll_timeout_check(context: ContextTypes.DEFAULT_TYPE, poll) -> None:
+    """A short grace window before treating a closed poll as a genuine
+    timeout. Without this, a vote cast in the same instant the timer
+    expires — poll_answer and the closing Update.poll landing almost
+    simultaneously, with no guaranteed order between them — could get
+    double-counted: once here as a timeout, once for real once its
+    poll_answer actually arrives. Waiting lets a same-instant real
+    answer land and advance the session first, which makes the match
+    in _handle_quiz_poll_timeout fail naturally, same as any other
+    already-answered poll."""
+    await asyncio.sleep(1.0)
+    try:
+        await _handle_quiz_poll_timeout(context, poll)
+    except Exception as e:
+        print(f"QUIZ POLL TIMEOUT: failed to advance a session for poll {poll.id}: {e}")
+
 async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll = update.poll
+
+    # Independent of everything else below (which is about the ORIGINAL
+    # channel poll an admin uploaded) — this is about whichever poll
+    # Telegram is telling us just closed, full stop, checking whether
+    # it's a per-user delivered lecture/Daily-Quiz/retake question that
+    # timed out unanswered. See the QUIZ POLL TIMEOUT section above.
+    if poll is not None and poll.is_closed:
+        asyncio.create_task(_delayed_poll_timeout_check(context, poll))
 
     # ── Quiz-channel poll tracking: mark it closed once stopped ──
     # poll.id is a Telegram-generated UUID, unique across all years, so a
@@ -3944,6 +4081,31 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
                     status.update(question=question, options=options,
                                    correct_option_id=correct_id, explanation=explanation)
                     await save_quiz_poll_status(year)
+                else:
+                    # No QUIZ_POLL_STATUS entry existed for this mid AT ALL
+                    # (fully legacy — predates poll-status tracking, not
+                    # just missing a field on an existing entry). Without
+                    # this branch the recovered content only lived in the
+                    # local variables above long enough to build and send
+                    # THIS poll, then vanished — poll_status_by_mid.get(mid)
+                    # would find nothing on the way back, so
+                    # _advance_lecture_session's mistakes-bank gate would
+                    # silently see status=None and never call
+                    # record_mistake for this question, even though it was
+                    # correctly delivered and correctly marked wrong. Keyed
+                    # by probe.poll.id to match how a normal entry is keyed
+                    # (see the QUIZ_POLL_STATUS[year][msg.poll.id] = {...}
+                    # assignment where entries are first created), so this
+                    # is indistinguishable from a normal entry afterwards.
+                    new_status = {
+                        "lecture": session["lecture_key"], "message_id": mid,
+                        "closed": True, "correct_option_id": correct_id,
+                        "question": question, "options": options,
+                        "explanation": explanation,
+                    }
+                    QUIZ_POLL_STATUS[year][probe.poll.id] = new_status
+                    poll_status_by_mid[mid] = new_status
+                    await save_quiz_poll_status(year)
             try:
                 await context.bot.delete_message(chat_id=user_id, message_id=probe.message_id)
             except Exception:
@@ -3967,12 +4129,14 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         session["current_correct_id"] = correct_id
         session["current_message_id"] = msg.message_id
         session["current_mid"]        = mid
+        session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
         return True
 
     session["current_poll_id"]    = None
     session["current_correct_id"] = None
     session["current_message_id"] = None
     session["current_mid"]        = None
+    session["current_delivered_at"] = None
     return False
 
 async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> int:
@@ -3989,7 +4153,8 @@ async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, use
         if not sent:
             break
         session["pending_polls"][session["current_poll_id"]] = (
-            session["current_correct_id"], session["current_message_id"], session["current_mid"],
+            session["current_correct_id"], session["current_message_id"],
+            session["current_mid"], session["current_delivered_at"],
         )
         sent_count += 1
     # These are meaningless in batch mode (there's no single "current"
@@ -4019,6 +4184,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         is_correct = chosen is not None and chosen == daily_session.get("current_correct_id")
         await _advance_daily_quiz_session(
             context, user_id, daily_session, is_correct, daily_session.get("current_message_id"),
+            daily_session.get("current_delivered_at"),
         )
         return
 
@@ -4028,6 +4194,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         is_correct = chosen is not None and chosen == retake_session.get("current_correct_id")
         await _advance_mistakes_retake_session(
             context, user_id, retake_session, is_correct, retake_session.get("current_message_id"),
+            retake_session.get("current_delivered_at"),
         )
         return
 
@@ -4057,10 +4224,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pending = session.get("pending_polls", {})
         if poll_id not in pending:
             return   # not one of this lecture's questions (or already answered)
-        correct_id, message_id, mid = pending.pop(poll_id)
+        correct_id, message_id, mid, delivered_at = pending.pop(poll_id)
         chosen     = answer.option_ids[0] if answer.option_ids else None
         is_correct = chosen is not None and chosen == correct_id
-        await _advance_lecture_session(context, user_id, session, is_correct, message_id, mid)
+        await _advance_lecture_session(context, user_id, session, is_correct, message_id, mid, delivered_at)
         return
 
     # ── Spaced Repetition re-ask answer ──────────────────────────
@@ -4106,6 +4273,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _advance_lecture_session(
         context, user_id, session, is_correct,
         session.get("current_message_id"), session.get("current_mid"),
+        session.get("current_delivered_at"),
     )
 
 
@@ -4239,7 +4407,7 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
         pass
     LECTURE_SESSIONS.pop(user_id, None)
 
-async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None = None, mid: int | None = None):
+async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None = None, mid: int | None = None, delivered_at: float | None = None):
     """Called once handle_poll_answer confirms the user answered their
     current lecture question, and whether it was right. Awards XP —
     15 correct, 5 incorrect — silently (no per-question message) and
@@ -4248,6 +4416,8 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     right/wrong count and the XP total accumulated across the lecture."""
     session["answered"] += 1
     session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    if delivered_at is not None:
+        _record_time_spent(user_id, time.time() - delivered_at)
     if not is_correct and mid is not None:
         session.setdefault("wrong_mids", []).append(mid)
         # Also pool this question into the user's own mistakes bank, for
@@ -4264,8 +4434,28 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         year   = session["year"]
         status = session.get("poll_status_by_mid", {}).get(mid)
         if status and status.get("question") and status.get("options") and status.get("correct_option_id") is not None:
-            if await record_mistake(user_id, mid, year, session["module"], session["subject"]):
-                await backup_mistakes_bank_to_channel(context)
+            try:
+                if await record_mistake(user_id, mid, year, session["module"], session["subject"]):
+                    await backup_mistakes_bank_to_channel(context)
+            except Exception as e:
+                # Recording a mistake should never be able to break the
+                # user's flow to their next question — but it also should
+                # never fail silently (that's the exact bug being fixed
+                # here), so this prints a clear, specific line rather than
+                # relying on whatever the caller further up happens to do
+                # with an uncaught exception.
+                print(f"MISTAKES BANK: record_mistake failed for user {user_id}, mid {mid}, year {year}: {e}")
+        else:
+            # This is the other half of the bug this fixes: previously,
+            # ANY question that reached here without fully-populated
+            # status (question/options/correct_option_id) silently never
+            # got recorded — no exception, nothing printed, nothing to
+            # notice. Most of those cases are now prevented upstream (see
+            # the legacy-recovery branch in _deliver_next_lecture_question
+            # that persists recovered content instead of discarding it),
+            # but if this still triggers for some other reason, at least
+            # it's now visible instead of invisible.
+            print(f"MISTAKES BANK: skipped recording mistake for user {user_id}, mid {mid}, year {year} — status incomplete: {status!r}")
 
     if session.get("mode") == "batch":
         # Everything was already sent up front — "last" means every
@@ -6155,7 +6345,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = [title, ""]
             for i, r in enumerate(rows):
                 rank = medal.get(i, f"{i + 1}.")
-                lines.append(f"{rank} {html.escape(r['name'])} (Lv.{r['level']}) — {r['correct']} ✅")
+                lines.append(
+                    f"{rank} {html.escape(r['name'])} (Lv.{r['level']}) — "
+                    f"{r['correct']} ✅ · ⏱️ {_format_duration(r['duration'])}"
+                )
+            text = "\n".join(lines)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+            ]]),
+        )
+        return
+
+    if query.data == "daily_quiz_leaderboard":
+        _ensure_daily_leaderboard_fresh()
+        rows = _rank_daily_leaderboard()
+        title = "🏆 <b>Daily Quiz Leaderboard — النهاردة</b>"
+        if not rows:
+            text = f"{title}\n\nمفيش حد خلص الـ Daily Quiz النهاردة لسه."
+        else:
+            medal = {0: "🥇", 1: "🥈", 2: "🥉"}
+            lines = [title, ""]
+            for i, r in enumerate(rows):
+                rank = medal.get(i, f"{i + 1}.")
+                lines.append(
+                    f"{rank} {html.escape(r['name'])} — "
+                    f"{r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}"
+                )
             text = "\n".join(lines)
         await query.edit_message_text(
             text, parse_mode=ParseMode.HTML,
@@ -6238,18 +6455,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = _get_settings_entry(user_id)
         current = entry.get("question_timer", 0)
         entry["question_timer"] = {0: 60, 60: 30, 30: 0}.get(current, 0)
-        await save_settings()
-        await backup_settings_to_channel(context)
-        await _send_settings(context, user_id, query.message, edit=True)
-        return
-
-    if query.data == "toggle_language":
-        # 2-way cycle: ar -> en -> ar. Only flips the stored preference —
-        # see the I18N section for how (and how little, so far) anything
-        # actually reads it yet.
-        entry = _get_settings_entry(user_id)
-        current = entry.get("language", "ar")
-        entry["language"] = "en" if current == "ar" else "ar"
         await save_settings()
         await backup_settings_to_channel(context)
         await _send_settings(context, user_id, query.message, edit=True)
@@ -7063,6 +7268,13 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
 
     ach_text = "\n".join(ach_lines) if ach_lines else "  لسه مفيش إنجازات"
 
+    # Daily Quiz leaderboard medals — lifetime top-3 finishes, see
+    # _finalize_daily_leaderboard. Always shows all three, 0 included,
+    # so it reads as a running tally rather than only appearing once
+    # someone's actually won something.
+    medals = entry.get("daily_medals", {"gold": 0, "silver": 0, "bronze": 0})
+    medals_line = f"🥇({medals['gold']}) 🥈({medals['silver']}) 🥉({medals['bronze']})"
+
     send = reply_target.edit_text if edit else reply_target.reply_text
     await send(
         f"╔══════════════════╗\n"
@@ -7081,6 +7293,8 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         f"   Accuracy: {accuracy:.1f}%\n\n"
         f"🧠 Mistakes Bank\n"
         f"  current: {mistake_count} questions\n\n"
+        f"Your medals\n"
+        f"{medals_line}\n\n"
         f"🏆 <b>Achievements</b>\n{ach_text}",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
@@ -7238,10 +7452,10 @@ async def _post_init(app):
     if app.job_queue is None:
         print(
             "⚠️ No JobQueue available — periodic backup reconciliation, the "
-            "analytics flush, and the Daily Quiz push are disabled. Local "
-            "analytics from poll answers will only hit disk on the next "
-            "immediate-save call site (restore/reset/import) or on a clean "
-            "shutdown, not every 60s. Install with: "
+            "analytics flush, stale-session cleanup, and the Daily Quiz push "
+            "are disabled. Local analytics from poll answers will only hit "
+            "disk on the next immediate-save call site (restore/reset/import) "
+            "or on a clean shutdown, not every 60s. Install with: "
             "pip install \"python-telegram-bot[job-queue]\""
         )
     else:
@@ -7250,6 +7464,9 @@ async def _post_init(app):
         )
         app.job_queue.run_repeating(
             _flush_analytics_job, interval=ANALYTICS_FLUSH_INTERVAL, first=ANALYTICS_FLUSH_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _cleanup_stale_sessions_job, interval=STALE_SESSION_CHECK_INTERVAL, first=STALE_SESSION_CHECK_INTERVAL,
         )
         app.job_queue.run_daily(
             _daily_quiz_push_job, time=dt_time(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, tzinfo=DAILY_QUIZ_TZ),
@@ -7260,6 +7477,68 @@ async def _flush_analytics_job(context: ContextTypes.DEFAULT_TYPE):
     _analytics_dirty: writes analytics.json only if a poll answer marked it
     dirty since the last tick. No-ops (no deepcopy, no I/O) on a quiet tick."""
     await _flush_analytics_if_dirty()
+
+# ═══════════════════════════════════════════════════════════════
+# STALE SESSION CLEANUP — a student who leaves mid-lecture (closes the
+# app, loses signal, just gets distracted) and never comes back leaves
+# LECTURE_SESSIONS[user_id] (or the Daily Quiz / Mistakes Retake
+# equivalent) sitting in memory forever — nothing removes it on its own.
+# The question-timer fix (see poll_update_handler) only closes a session
+# out once ITS poll actually closes, and with the timer set to Off (the
+# default), a poll never closes by itself at all.
+#
+# Not a crash or lockout risk — confirmed: starting a fresh lecture just
+# overwrites the old entry (LECTURE_SESSIONS[user_id] = session, no
+# "already in a lecture" guard anywhere), and @_serialize_per_user's
+# lock is released between updates, never held across a whole session.
+# It IS a genuine slow memory leak, though, and a stale poll left open
+# means Telegram would still silently accept a vote on it days later
+# even though nothing's listening for it anymore by then (whatever
+# session exists for that user_id won't match that old poll_id).
+#
+# STALE_SESSION_IDLE_SECONDS is deliberately generous — this must never
+# fire on someone taking a normal break mid-lecture who fully intends to
+# come back and finish; it's only meant to catch sessions that are,
+# realistically, abandoned for good.
+# ═══════════════════════════════════════════════════════════════
+STALE_SESSION_IDLE_SECONDS   = 6 * 3600  # 6 hours of no activity before a session is reclaimed
+STALE_SESSION_CHECK_INTERVAL = 3600      # check once an hour
+
+async def _cleanup_stale_sessions_job(context: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    for sessions in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS):
+        for user_id, session in list(sessions.items()):
+            if session.get("mode") == "batch":
+                # Several polls can be open at once with no single
+                # current_delivered_at — use the OLDEST of them (the
+                # longest-idle question) as this session's age, and
+                # close out every one of them, not just one.
+                pending = session.get("pending_polls", {})
+                if not pending:
+                    continue
+                timestamps = [t for (_, _, _, t) in pending.values() if t is not None]
+                delivered_at = min(timestamps) if timestamps else None
+                message_ids = [mid_ for (_, mid_, _, _) in pending.values()]
+            else:
+                delivered_at = session.get("current_delivered_at")
+                message_ids = [session["current_message_id"]] if session.get("current_message_id") else []
+
+            if delivered_at is None or now - delivered_at < STALE_SESSION_IDLE_SECONDS:
+                continue
+
+            sessions.pop(user_id, None)
+            for message_id in message_ids:
+                try:
+                    await context.bot.stop_poll(chat_id=user_id, message_id=message_id)
+                except Exception:
+                    pass  # already closed/deleted/blocked — any of these are fine, nothing to do
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="⏳ الجلسة اتقفلت لعدم النشاط لفترة طويلة — ابدأ تاني لما تكون جاهز.",
+                )
+            except Exception:
+                pass  # blocked the bot, deactivated account, etc. — skip silently, same as broadcast_cmd
 
 async def _post_shutdown(app):
     """Runs once on a clean shutdown (PTB's own stop-signal handling calls
@@ -7389,7 +7668,7 @@ def _describe_update(update: object) -> str:
     """A short, human-readable line describing what was happening when
     this update came in — who, and what they did (typed a command,
     tapped a button, sent a poll answer, ...) — so the errors channel
-    reads like 'Kareem tapped button toggle_language' instead of making
+    reads like 'Kareem tapped button toggle_reactions' instead of making
     a reader reconstruct that from the raw update JSON below it. Falls
     back to a plain label if update isn't a normal Update (e.g. an error
     raised from a job_queue task, which has no update at all)."""
