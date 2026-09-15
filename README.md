@@ -1,2 +1,3 @@
-# The-Quizician
-it was once a joke, now a great machine
+# Quizician Bot
+
+Test update from Termux 🚀
