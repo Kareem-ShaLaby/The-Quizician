@@ -36,7 +36,7 @@ from zoneinfo import ZoneInfo
 #          into a full question dict on demand via _snapshot_from_mid +
 #          QUIZ_POLL_STATUS[year].
 #          Grep "_resolve_mistake" for every call site that needs resolved
-#          content (build_daily_quiz_questions, start_mistakes_retake).
+#          content (_build_daily_quiz_questions, start_mistakes_retake).
 # 1749   MISTAKES BANK RETAKE — 🧠 Mistakes Bank menu button, one-shot
 #          practice quiz over _scoped_mistakes_bank() (resolved first)
 # 1863   PASSWORD-GATED STORAGE (private group) — unrelated to quiz
@@ -778,7 +778,7 @@ _analytics_backup_msg_id: int | None = None
 # like lecture-answer XP can fire dozens of times a minute and would
 # otherwise risk hitting Telegram's rate limits.
 _last_analytics_backup_at: float = 0.0
-ANALYTICS_BACKUP_MIN_INTERVAL = 300  # seconds
+ANALYTICS_BACKUP_MIN_INTERVAL = 30  # seconds
 
 # ── Local-disk debounce for the hot answer path ──────────────────
 # save_analytics() itself (deepcopy + atomic write of the WHOLE file, every
@@ -1194,6 +1194,7 @@ def _blank_settings_entry() -> dict:
                                 # auto-closing; 0 = off. Cycles 0 -> 60 -> 30 -> 0.
         "year_class": None,    # "y1"/"y2"/"y3" — see YEAR_CLASS_NUMBER above
         "daily_quiz_last_date": None,   # "YYYY-MM-DD" (UTC) of the last completed Daily Quiz
+        "daily_notifs": True,   # the 2pm 💥Daily Quiz💥 push — see get_daily_notifs_enabled
     }
 
 def load_settings() -> dict:
@@ -1218,7 +1219,7 @@ _settings_backup_msg_id: int | None = None
 # Same debounce pattern as analytics — local save_settings() always
 # happens immediately; only the channel mirror is throttled.
 _last_settings_backup_at: float = 0.0
-SETTINGS_BACKUP_MIN_INTERVAL = 300  # seconds
+SETTINGS_BACKUP_MIN_INTERVAL = 30  # seconds
 
 def _get_settings_entry(user_id: int) -> dict:
     key   = str(user_id)
@@ -1250,6 +1251,12 @@ def get_achievement_notifs_enabled(user_id: int) -> bool:
 
 def get_spaced_repetition_enabled(user_id: int) -> bool:
     return _get_bool_setting(user_id, "spaced_repetition")
+
+def get_daily_notifs_enabled(user_id: int) -> bool:
+    """Whether this user should still get the 2pm 💥Daily Quiz💥 push —
+    see _daily_quiz_push_job. Doesn't affect the quiz itself, which stays
+    reachable from the main menu either way."""
+    return _get_bool_setting(user_id, "daily_notifs")
 
 def get_question_timer_seconds(user_id: int) -> int:
     # Defaults to 0 (off) for anyone not yet in SETTINGS — matches
@@ -1376,7 +1383,7 @@ _lecture_results_backup_msg_id: int | None = None
 # Same debounce pattern as analytics/settings — local save always
 # happens immediately; only the channel mirror is throttled.
 _last_lecture_results_backup_at: float = 0.0
-LECTURE_RESULTS_BACKUP_MIN_INTERVAL = 300  # seconds
+LECTURE_RESULTS_BACKUP_MIN_INTERVAL = 30  # seconds
 
 def _lr_key(year: str, lecture_key: str) -> str:
     """LECTURE_RESULTS is one shared file across all years — prefix with
@@ -1598,7 +1605,7 @@ _mistakes_bank_backup_msg_id: int | None = None
 # Same debounce pattern as lecture results — local save always happens
 # immediately; only the channel mirror is throttled.
 _last_mistakes_bank_backup_at: float = 0.0
-MISTAKES_BANK_BACKUP_MIN_INTERVAL = 300  # seconds
+MISTAKES_BANK_BACKUP_MIN_INTERVAL = 30  # seconds
 
 async def record_mistake(user_id: int, mid: int, year: str, module: str, subject: str) -> bool:
     """Adds a wrong-answer REFERENCE to the bank — just the question id
@@ -1678,35 +1685,40 @@ async def restore_mistakes_bank_from_channel(app):
     await _run_restore_with_retries(app, "mistakes_bank", "Mistakes bank", _do)
 
 # ═══════════════════════════════════════════════════════════════
-# DAILY QUIZ — 💥Daily Quiz💥: 10 questions total — up to 3 pulled from the
-# user's own MISTAKES_BANK entries, topped up with random questions from
-# random subjects (any subject can contribute more than one — this is not
-# a one-per-subject pick) so the run is always 10 long even when the
-# user's mistakes bank is empty or short. Both slices are restricted to the
-# admin-set /daily_module scope when one is set (see get_daily_quiz_scope),
-# or span every configured year/module otherwise. Pushed to everyone at 2pm Cairo time
-# once a day (see the job_queue.run_daily call in MAIN); the push itself
-# is just a button — tapping it is what actually starts the quiz and is
-# gated to once per person per day via each user's settings
-# "daily_quiz_last_date".
+# DAILY QUIZ — 💥Daily Quiz💥: each day, every configured year gets ONE
+# shared run of DAILY_QUIZ_TOTAL_COUNT (10) random
+# questions — built once per (year, day) and then IDENTICAL for every
+# user in that year, so everyone's run (and the leaderboard ranking it
+# feeds) is a level playing field. No mistakes-bank content is used here
+# at all (that's exclusively the 🧠 Mistakes Bank menu button's own
+# retake flow). Restricted to that year's DAILY_QUIZ_ACTIVE_MODULE by
+# default, or to the admin-set /daily_module scope when one is set for
+# that year as a temporary override (see get_daily_quiz_scope).
+#
+# Tapping the 💥Daily Quiz💥 main-menu button opens a small hub
+# (show_daily_quiz_menu) that always shows the day's leaderboard for the
+# user's own Year/Class (get_year_class — prompting them to set it first
+# if they haven't), plus a Start button if they haven't run today's quiz
+# yet. Gated to once per person per day via each user's settings
+# "daily_quiz_last_date". Pushed to everyone at 2pm Cairo time once a day
+# (see the job_queue.run_daily call in MAIN) as just a button into that
+# same hub.
 #
 # Deliberately its own session type (DAILY_QUIZ_SESSIONS), separate from
 # LECTURE_SESSIONS, rather than shoehorned into the lecture-session shape:
 # a lecture session's dead-poll pruning, legacy-content recovery, and
 # result-recording are all keyed to one specific year+lecture_key, which
-# doesn't make sense for a session mixing many years/lectures/subjects at
-# once. A Daily Quiz question is fully self-contained (question/options/
+# doesn't make sense for a session mixing many lectures/subjects at once.
+# A Daily Quiz question is fully self-contained (question/options/
 # correct_id baked in directly, same shape as a MISTAKES_BANK entry) so
 # delivery never needs to touch any year's live channel/state at all.
 # ═══════════════════════════════════════════════════════════════
 DAILY_QUIZ_SESSIONS = {}   # user_id -> {"queue": [question dict, ...], "current_poll_id",
                            #             "current_correct_id", "current_message_id",
+                           #             "year",
                            #             "total", "answered", "correct", "xp_earned"}
 
-DAILY_QUIZ_TOTAL_COUNT    = 10  # total questions in one Daily Quiz run — always
-                                 # topped up from the random pool so a run is
-                                 # this long even when the mistakes bank is empty
-DAILY_QUIZ_MISTAKES_COUNT = 3   # cap on how many of those can come from the mistakes bank
+DAILY_QUIZ_TOTAL_COUNT = 10   # random questions per year, per day
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY QUIZ LEADERBOARD — deliberately RAM-only, unlike everything else
@@ -1718,39 +1730,38 @@ DAILY_QUIZ_MISTAKES_COUNT = 3   # cap on how many of those can come from the mis
 # entry (_blank_entry), which IS persistent — that's the lifetime medal
 # count this board hands out before resetting, and that has to survive.
 #
-# Note each Daily Quiz run uses this user's OWN personalized question
-# set (their mistakes bank + random pool — see build_daily_quiz_
-# questions), not one shared set — so this ranks "who did best on
-# their own run today," not a level playing field of identical
-# questions. Good enough for a casual daily leaderboard; flagging it
-# so it's a known tradeoff, not a surprise.
+# One board PER YEAR — since every user in a year plays the exact same
+# shared run (see DAILY QUIZ above), ranking is only meaningful within a
+# year, not across years.
 # ═══════════════════════════════════════════════════════════════
-DAILY_QUIZ_LEADERBOARD_DATE: str | None = None   # which day's date the board below is for
-DAILY_QUIZ_LEADERBOARD: dict[int, dict] = {}      # user_id -> {"name", "correct", "total", "duration"}
+DAILY_QUIZ_LEADERBOARD_DATE: str | None = None   # which day's date the boards below are for
+DAILY_QUIZ_LEADERBOARD: dict[str, dict[int, dict]] = {}   # year -> user_id -> {"name", "correct", "total", "duration"}
 
 def _finalize_daily_leaderboard() -> None:
-    """Awards lifetime medals (ANALYTICS[uid]['daily_medals']) to
-    whatever's currently in DAILY_QUIZ_LEADERBOARD's top 3, then clears
-    the board — called right before the first write/read of a new day
-    detects the date has rolled over (see _ensure_daily_leaderboard_
-    fresh), so this always runs exactly once per day transition, without
-    needing its own scheduled job."""
+    """Awards lifetime medals (ANALYTICS[uid]['daily_medals']) to the top 3
+    of each year's board, then clears every board — called right before
+    the first write/read of a new day detects the date has rolled over
+    (see _ensure_daily_leaderboard_fresh), so this always runs exactly
+    once per day transition, without needing its own scheduled job."""
     global DAILY_QUIZ_LEADERBOARD
-    ranked = _rank_daily_leaderboard()
-    for i, medal_key in enumerate(("gold", "silver", "bronze")):
-        if i >= len(ranked):
-            break
-        entry = _get_entry(ranked[i]["user_id"])
-        entry["daily_medals"][medal_key] += 1
-    if ranked:
+    any_ranked = False
+    for year in list(DAILY_QUIZ_LEADERBOARD):
+        ranked = _rank_daily_leaderboard(year)
+        for i, medal_key in enumerate(("gold", "silver", "bronze")):
+            if i >= len(ranked):
+                break
+            entry = _get_entry(ranked[i]["user_id"])
+            entry["daily_medals"][medal_key] += 1
+            any_ranked = True
+    if any_ranked:
         _mark_analytics_dirty()
     DAILY_QUIZ_LEADERBOARD = {}
 
 def _ensure_daily_leaderboard_fresh() -> None:
     """Call before any read or write of DAILY_QUIZ_LEADERBOARD. No-ops on
     every call within the same day; the first call after midnight
-    finalizes (awards medals for) the outgoing day's board and clears it
-    for the new day."""
+    finalizes (awards medals for) the outgoing day's boards and clears
+    them for the new day."""
     global DAILY_QUIZ_LEADERBOARD_DATE
     today = _today()
     if DAILY_QUIZ_LEADERBOARD_DATE == today:
@@ -1759,17 +1770,20 @@ def _ensure_daily_leaderboard_fresh() -> None:
         _finalize_daily_leaderboard()
     DAILY_QUIZ_LEADERBOARD_DATE = today
 
-def _rank_daily_leaderboard() -> list[dict]:
-    """Today's Daily Quiz finishers, ranked the same way as the year
-    leaderboard: correct count highest first, total duration lowest
-    first as the tiebreaker."""
-    rows = list(DAILY_QUIZ_LEADERBOARD.values())
+def _rank_daily_leaderboard(year: str) -> list[dict]:
+    """Today's Daily Quiz finishers for one year, ranked the same way as
+    the year leaderboard: correct count highest first, total duration
+    lowest first as the tiebreaker."""
+    rows = list(DAILY_QUIZ_LEADERBOARD.get(year, {}).values())
     rows.sort(key=lambda r: (-r["correct"], r["duration"]))
     return rows
 
-def _record_daily_leaderboard_finish(user_id: int, correct: int, total: int, duration: float) -> None:
+def _record_daily_leaderboard_finish(user_id: int, year: str, correct: int, total: int, duration: float) -> None:
+    """Records this user's (one-per-day) finish on today's board for
+    `year`."""
     _ensure_daily_leaderboard_fresh()
-    DAILY_QUIZ_LEADERBOARD[user_id] = {
+    board = DAILY_QUIZ_LEADERBOARD.setdefault(year, {})
+    board[user_id] = {
         "user_id":  user_id,
         "name":     get_nickname(user_id) or f"مستخدم #{user_id % 10000}",
         "correct":  correct,
@@ -1791,44 +1805,57 @@ def next_daily_quiz_time() -> datetime:
     today_push = now.replace(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, second=0, microsecond=0)
     return today_push if now < today_push else today_push + timedelta(days=1)
 
-_DAILY_QUIZ_POOL_CACHE: dict = {"pool": None, "built_at": 0.0, "scope_key": None}
+_DAILY_QUIZ_POOL_CACHE: dict[str, dict] = {}   # year -> {"pool", "built_at", "scope_key"}
 _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS = 120
+
+# Each year's Daily Quiz is restricted to ONE currently-active module by
+# default — whatever's currently being taught — rather than that year's
+# whole curriculum. Update this whenever the active module changes; an
+# admin can also temporarily override a given year via /daily_module
+# (see get_daily_quiz_scope), which takes priority over this default.
+DAILY_QUIZ_ACTIVE_MODULE = {
+    "y1": "Foundation (1)",
+    "y2": "Respiratory",
+    "y3": "Endocrine",
+}
+
 # Rebuilding this pool means: for every (module, subject) pair, scanning
 # the ENTIRE year's QUIZ_INDEX to find lectures matching that pair (see
 # ready_lecture_keys), on top of a QUIZ_POLL_STATUS scan. That's fine once
 # — it's expensive when 700 students all tap "Daily Quiz" inside the same
 # push window and each one triggers a fresh rebuild. The pool doesn't
-# depend on which student is asking, so it's cached for a couple of
-# minutes; a lecture that gets closed mid-window just joins the pool the
-# next time the cache refreshes rather than instantly, which is fine for
-# a once-a-day quiz. Invalidated early if the admin changes /daily_module
-# scope, so a scope change is never stuck behind a stale cache.
-def _daily_quiz_subject_pool() -> dict:
-    """Every ready (closed-poll) question mid, across all subjects,
-    grouped by (year, module, subject) — the pool build_daily_quiz_questions
-    draws its 7 random questions from (any subject can contribute more
-    than one; this is just how the mids are organized so a scope filter
-    can narrow it before picking). Normally spans every configured
-    year/module; if an admin has set a scope via /daily_module, narrowed
-    to just that one module. Cached briefly — see _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS."""
+# depend on which student is asking, so it's cached (per year) for a
+# couple of minutes; a lecture that gets closed mid-window just joins the
+# pool the next time the cache refreshes rather than instantly, which is
+# fine for a once-a-day quiz. Invalidated early if the admin changes
+# /daily_module scope, so a scope change is never stuck behind a stale
+# cache.
+def _daily_quiz_subject_pool(year: str) -> dict:
+    """Every ready (closed-poll) question mid for ONE year, grouped by
+    (module, subject) — the pool _build_daily_quiz_questions draws its random
+    questions from (any subject can contribute more than one; this is
+    just how the mids are organized so a scope filter can narrow it
+    before picking). Restricted to that year's DAILY_QUIZ_ACTIVE_MODULE by
+    default; if the admin has set a /daily_module scope for this same
+    year, that overrides the default instead. Cached briefly per year —
+    see _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS."""
     scope = get_daily_quiz_scope()
-    scope_key = (scope["year"], scope["module"]) if scope else None
+    if scope and scope["year"] == year:
+        scoped_module = scope["module"]
+    else:
+        scoped_module = DAILY_QUIZ_ACTIVE_MODULE.get(year)
 
     now = time.monotonic()
-    cache = _DAILY_QUIZ_POOL_CACHE
+    cache = _DAILY_QUIZ_POOL_CACHE.setdefault(year, {"pool": None, "built_at": 0.0, "scope_key": None})
     if (cache["pool"] is not None
-            and cache["scope_key"] == scope_key
+            and cache["scope_key"] == scoped_module
             and now - cache["built_at"] < _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS):
         return cache["pool"]
 
-    years = [scope["year"]] if scope else configured_years()
-
-    pool = {}   # (year, module, subject) -> [mid, ...]
-    for year in years:
-        if year not in configured_years():
-            continue   # scoped year's channel got unconfigured since — skip rather than crash
+    pool = {}   # (module, subject) -> [mid, ...]
+    if year in configured_years():
         closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS[year].values() if v["closed"]}
-        modules = [scope["module"]] if scope else ready_modules(year)
+        modules = [scoped_module] if scoped_module else ready_modules(year)
         for module in modules:
             for subject in ready_subjects(year, module):
                 mids = []
@@ -1836,11 +1863,11 @@ def _daily_quiz_subject_pool() -> dict:
                     ids = QUIZ_INDEX[year][lecture_key]["ids"]
                     mids.extend(mid for mid in ids if mid in closed_message_ids)
                 if mids:
-                    pool[(year, module, subject)] = mids
+                    pool[(module, subject)] = mids
 
     cache["pool"] = pool
     cache["built_at"] = now
-    cache["scope_key"] = scope_key
+    cache["scope_key"] = scoped_module
     return pool
 
 async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid: int, module: str, subject: str,
@@ -1952,52 +1979,63 @@ async def _resolve_mistakes(context: ContextTypes.DEFAULT_TYPE, entries: list) -
             resolved.append(snap)
     return resolved
 
-async def build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list:
-    """The full DAILY_QUIZ_TOTAL_COUNT-question set for one Daily Quiz run:
-    up to DAILY_QUIZ_MISTAKES_COUNT from this user's own mistakes bank,
-    then topped up with random questions pulled from random subjects (a
-    subject can contribute more than one — this is NOT one-per-subject) so
-    the run is always DAILY_QUIZ_TOTAL_COUNT questions long — even when
-    this user's mistakes bank is empty or short, the random pool fills the
-    rest. Both slices respect the admin-set /daily_module scope, if any.
-    Falls short of DAILY_QUIZ_TOTAL_COUNT gracefully if there isn't enough
-    ready random content yet — callers just get a shorter (or empty)
-    list."""
-    mistakes = _scoped_mistakes_bank(user_id)
-    mistake_sample = random.sample(mistakes, k=min(DAILY_QUIZ_MISTAKES_COUNT, len(mistakes))) if mistakes else []
-    questions = await _resolve_mistakes(context, mistake_sample) if mistake_sample else []
+# ── Per-day, per-year shared Daily Quiz questions ────────────────────
+# Built once per (year, day) — the first user of that year to tap Daily
+# Quiz that day pays the build cost, everyone else in that year that day
+# just reads the cached result. Deliberately RAM-only, same tradeoff as
+# DAILY_QUIZ_LEADERBOARD: a restart mid-day just regenerates that year's
+# questions (a small chance of overlap with what's already been played),
+# which is harmless for a casual daily feature.
+_DAILY_QUIZ_QUESTIONS_DATE: str | None = None
+_DAILY_QUIZ_QUESTIONS: dict[str, list] = {}   # year -> [question dict, ...] (up to DAILY_QUIZ_TOTAL_COUNT)
 
-    # Whatever the mistakes bank didn't cover (including all of it, when
-    # empty) gets filled from the random pool below, so the total is always
-    # DAILY_QUIZ_TOTAL_COUNT rather than a fixed random count + leftover mistakes.
-    subject_pool = _daily_quiz_subject_pool()
-    # Flatten to one (year, module, subject, mid) tuple per ready question,
-    # so picking random_needed is a plain random sample over individual
-    # questions — not a pick-a-subject-then-one-question-from-it scheme,
-    # which is what was capping this to one question per subject before.
+def _ensure_daily_quiz_questions_fresh() -> None:
+    """Call before any read of _DAILY_QUIZ_QUESTIONS. Clears every year's
+    cached questions the first time it's called on a new day, so the
+    day's first request per year rebuilds fresh content."""
+    global _DAILY_QUIZ_QUESTIONS_DATE, _DAILY_QUIZ_QUESTIONS
+    today = _today()
+    if _DAILY_QUIZ_QUESTIONS_DATE != today:
+        _DAILY_QUIZ_QUESTIONS = {}
+        _DAILY_QUIZ_QUESTIONS_DATE = today
+
+async def _build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str) -> list:
+    """Up to DAILY_QUIZ_TOTAL_COUNT (10) questions, drawn
+    at random from `year`'s ready pool — no mistakes-bank content.
+    Respects the admin-set /daily_module scope if it's set for this year.
+    Falls short gracefully (a shorter, or empty, run) if there isn't
+    enough ready content yet."""
+    subject_pool = _daily_quiz_subject_pool(year)
+    # Flatten to one (module, subject, mid) tuple per ready question, so
+    # picking is a plain random sample over individual questions — not a
+    # pick-a-subject-then-one-question-from-it scheme, which would cap
+    # this at one question per subject.
     all_mids = [
-        (year, module, subject, mid)
-        for (year, module, subject), mids in subject_pool.items()
+        (module, subject, mid)
+        for (module, subject), mids in subject_pool.items()
         for mid in mids
     ]
     random.shuffle(all_mids)
 
-    # One poll-status index per distinct year touched, built once here
-    # rather than _snapshot_from_mid scanning QUIZ_POLL_STATUS[year] fresh
-    # for every one of up to random_needed questions.
-    status_by_mid_by_year: dict = {}
+    status_by_mid = _poll_status_index(year)   # one scan, reused for every pick below
 
-    for year, module, subject, mid in all_mids:
+    questions = []
+    for module, subject, mid in all_mids:
         if len(questions) >= DAILY_QUIZ_TOTAL_COUNT:
             break
-        if year not in status_by_mid_by_year:
-            status_by_mid_by_year[year] = _poll_status_index(year)
-        snap = await _snapshot_from_mid(context, year, mid, module, subject, status_by_mid_by_year[year])
+        snap = await _snapshot_from_mid(context, year, mid, module, subject, status_by_mid)
         if snap:
             questions.append(snap)
 
-    random.shuffle(questions)
     return questions
+
+async def get_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str) -> list:
+    """Today's shared Daily Quiz questions for `year`, building and
+    caching them on first request of the day."""
+    _ensure_daily_quiz_questions_fresh()
+    if year not in _DAILY_QUIZ_QUESTIONS:
+        _DAILY_QUIZ_QUESTIONS[year] = await _build_daily_quiz_questions(context, year)
+    return _DAILY_QUIZ_QUESTIONS[year]
 
 async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
     """Same idea as _deliver_next_lecture_question, but for a self-
@@ -2088,7 +2126,8 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
         correct   = session["correct"]
         incorrect = session["answered"] - correct
         pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
-        _record_daily_leaderboard_finish(user_id, correct, session["answered"], session.get("duration_seconds", 0.0))
+        year      = session["year"]
+        _record_daily_leaderboard_finish(user_id, year, correct, session["answered"], session.get("duration_seconds", 0.0))
         summary = (
             f"💥 <b>خلصت الـ Daily Quiz!</b>\n\n"
             f"✅ صح: {correct}\n"
@@ -2102,7 +2141,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
             await context.bot.send_message(
                 chat_id=user_id, text=summary, parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🏆 Daily Leaderboard", callback_data="daily_quiz_leaderboard"),
+                    InlineKeyboardButton("🏆 Daily Leaderboard", callback_data="daily_quiz"),
                     InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
                 ]]),
             )
@@ -2114,10 +2153,12 @@ def get_daily_quiz_last_date(user_id: int) -> str | None:
     return SETTINGS.get(str(user_id), {}).get("daily_quiz_last_date")
 
 # ── Admin-set Daily Quiz scope ──────────────────────────────────
-# By default both the random-questions slice and the mistakes-bank
-# slice draw from every configured year/module. An admin can narrow both
-# to one specific module (e.g. whatever's currently being taught) via
-# /daily_module — see _daily_quiz_subject_pool and _scoped_mistakes_bank.
+# By default the random-questions pool for each year's Daily Quiz draws
+# from that year's whole curriculum. An admin can narrow one year to a
+# specific module (e.g. whatever's currently being taught) via
+# /daily_module — see _daily_quiz_subject_pool. (The mistakes bank has
+# its own separate 🧠 Mistakes Bank retake flow — see _scoped_mistakes_bank —
+# no longer feeds into the Daily Quiz.)
 #
 # Stored under a reserved key in SETTINGS (not a per-user key — this is a
 # single global switch) so it rides on the exact same backup/restore path
@@ -2134,30 +2175,94 @@ async def set_daily_quiz_scope(year: str | None, module: str | None) -> None:
         SETTINGS.pop("_daily_quiz_scope", None)
     await save_settings()
 
-async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
-    """Shared by the 💥Daily Quiz💥 button and (if ever wanted) any other
-    entry point. message, if given, gets edited with the "starting..."
-    line instead of a fresh message being sent (matches the lecture-start
-    button pattern). Once-per-day gating happens here, keyed off the
-    caller's local calendar date at the time they tap — not the push
-    time — so someone who gets the 2pm ping but taps it at 11pm still
-    only gets today's quiz once."""
-    today = _today()
-    if get_daily_quiz_last_date(user_id) == today:
-        text = f" !خلصت الكويز اليومي بتاع النهاردة خلاص\n\n{_next_daily_quiz_line()}"
-        if message:
-            await message.edit_text(text)
-        else:
-            await context.bot.send_message(chat_id=user_id, text=text)
+async def _prompt_daily_quiz_year_class(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """Shown in place of the Daily Quiz hub when the user hasn't set a
+    Year/Class in Settings yet — we need it to know which year's shared
+    quiz to give them. Reuses the same picker as onboarding/Settings, its
+    own "dqyc:" callback prefix routes back into show_daily_quiz_menu
+    once they pick one instead of Settings or the onboarding welcome."""
+    text = "📚 محتاج تحدد سنتك/فرقتك الأول، عشان نجيبلك الـ Daily Quiz بتاع سنتك:"
+    keyboard = year_class_keyboard("dqyc")
+    if message:
+        await message.edit_text(text, reply_markup=keyboard)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+
+async def show_daily_quiz_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """The 💥Daily Quiz💥 main-menu button's destination: always shows
+    today's Daily Quiz leaderboard for the user's own Year/Class
+    (get_year_class — prompting them to set it first if they haven't),
+    plus a Start button if they haven't run today's quiz yet — this is
+    also where the leaderboard lives now, instead of its own separate
+    main-menu button."""
+    year_class = get_year_class(user_id)
+    if year_class not in YEAR_CLASS_NUMBER:
+        await _prompt_daily_quiz_year_class(context, user_id, message)
         return
 
-    questions = await build_daily_quiz_questions(context, user_id)
+    _ensure_daily_leaderboard_fresh()
+    rows = _rank_daily_leaderboard(year_class)
+    board_title = f"🏆 <b>Daily Quiz Leaderboard — {year_class_label(year_class)} — النهاردة</b>"
+    if not rows:
+        board_text = f"{board_title}\n\nمفيش حد خلص الـ Daily Quiz النهاردة لسه."
+    else:
+        medal = {0: "🥇", 1: "🥈", 2: "🥉"}
+        lines = [board_title, ""]
+        for i, r in enumerate(rows):
+            rank = medal.get(i, f"{i + 1}.")
+            lines.append(
+                f"{rank} {html.escape(r['name'])} — "
+                f"{r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}"
+            )
+        board_text = "\n".join(lines)
+
+    already_done = get_daily_quiz_last_date(user_id) == _today()
+    status_line = (
+        f"✅ خلصت الـ Daily Quiz بتاع النهاردة خلاص.\n\n{_next_daily_quiz_line()}"
+        if already_done else
+        f"💥 اضغط تحت تبدأ الـ Daily Quiz بتاع النهاردة — {DAILY_QUIZ_TOTAL_COUNT} سؤال."
+    )
+    text = f"{board_text}\n\n{status_line}"
+
+    rows_buttons = []
+    if not already_done:
+        rows_buttons.append([InlineKeyboardButton("▶️ Start Daily Quiz", callback_data="daily_quiz_begin")])
+    rows_buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+    keyboard = InlineKeyboardMarkup(rows_buttons)
+
+    if message:
+        await message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """Starts the user's own year's shared Daily Quiz run. message, if
+    given, gets edited with the "starting..." line instead of a fresh
+    message being sent (matches the lecture-start button pattern).
+    Once-per-day gating happens here, keyed off the caller's local
+    calendar date at the time they tap — not the push time — so someone
+    who gets the 2pm ping but taps it at 11pm still only gets today's
+    quiz once."""
+    year_class = get_year_class(user_id)
+    if year_class not in YEAR_CLASS_NUMBER:
+        await _prompt_daily_quiz_year_class(context, user_id, message)
+        return
+
+    today = _today()
+    if get_daily_quiz_last_date(user_id) == today:
+        # Already done — send them back to the hub (leaderboard + status)
+        # rather than re-starting it.
+        await show_daily_quiz_menu(context, user_id, message)
+        return
+
+    questions = await get_daily_quiz_questions(context, year_class)
     if not questions:
-        text = "check again later :/"
+        text = "لسه مفيش أسئلة كفاية النهاردة — جرب تاني بعدين."
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
         if message:
-            await message.edit_text(text)
+            await message.edit_text(text, reply_markup=keyboard)
         else:
-            await context.bot.send_message(chat_id=user_id, text=text)
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
         return
 
     entry = _get_settings_entry(user_id)
@@ -2166,12 +2271,13 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
     await backup_settings_to_channel(context)
 
     session = {
-        "queue": questions, "current_poll_id": None, "current_correct_id": None,
+        "queue": list(questions), "current_poll_id": None, "current_correct_id": None,
         "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
+        "year": year_class,
     }
     DAILY_QUIZ_SESSIONS[user_id] = session
 
-    text = f"💥 <b>Daily Quiz</b> — {len(questions)} أس~لة من مواد مختلفة 👇"
+    text = f"💥 <b>Daily Quiz</b> — {len(questions)} سؤال 👇"
     if message:
         await message.edit_text(text, parse_mode=ParseMode.HTML)
     else:
@@ -2185,8 +2291,13 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
 async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
     """The 2pm-Cairo push (see job_queue.run_daily in MAIN): just a
     button in each user's chat, not an auto-started quiz — tapping it is
-    what calls start_daily_quiz and applies the once-per-day gate."""
+    what calls start_daily_quiz and applies the once-per-day gate. Skips
+    anyone who's turned it off via Settings -> More Settings -> Daily
+    Notification (get_daily_notifs_enabled) — the quiz itself stays
+    reachable from the main menu either way, this only silences the ping."""
     for uid in list(USERS):
+        if not get_daily_notifs_enabled(uid):
+            continue
         try:
             await context.bot.send_message(
                 chat_id=uid,
@@ -2797,7 +2908,7 @@ REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id",
 
 _report_threads_backup_msg_id: int | None = None
 _last_report_threads_backup_at: float = 0.0
-REPORT_THREADS_BACKUP_MIN_INTERVAL = 300   # seconds — same debounce as mistakes bank; local save is never throttled
+REPORT_THREADS_BACKUP_MIN_INTERVAL = 30   # seconds — same debounce as mistakes bank; local save is never throttled
 
 async def backup_report_threads_to_channel(context):
     global _report_threads_backup_msg_id, _last_report_threads_backup_at
@@ -3318,13 +3429,22 @@ def start_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🏆 Leaderboard", callback_data="year_leaderboard"),
-            InlineKeyboardButton("💥 Daily Leaderboard", callback_data="daily_quiz_leaderboard"),
         ],
     ])
 
-def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
     def _tag(on: bool) -> str:
         return "🟢 On" if on else "🔴 Off"
+
+    if page == 2:
+        daily_notifs = get_daily_notifs_enabled(user_id)
+        rows = [
+            [InlineKeyboardButton(f"🔔 Daily Notification: {_tag(daily_notifs)}", callback_data="toggle_daily_notifs")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings_page:1")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+        ]
+        return InlineKeyboardMarkup(rows)
+
     reactions  = get_reactions_enabled(user_id)
     auto_next  = get_auto_next_enabled(user_id)
     randomize  = get_randomize_enabled(user_id)
@@ -3343,6 +3463,7 @@ def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🔁 Spaced Repetition: {_tag(spaced_rep)}", callback_data="toggle_spaced_repetition")],
         [InlineKeyboardButton(f"⏱️ Question Timer: {timer_tag}", callback_data="toggle_question_timer")],
         [InlineKeyboardButton("🗑 Clear Mistake Bank", callback_data="clear_mistakes_bank_ask")],
+        [InlineKeyboardButton("➡️ More Settings", callback_data="settings_page:2")],
         [InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -5157,13 +5278,12 @@ async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def daily_module_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: pick a year, then a module, to restrict BOTH the Daily
-    Quiz's random-questions slice and its mistakes-bank slice to just
-    that module (e.g. whatever's currently being taught) instead of the
-    whole curriculum. Own callback_data namespace (dqy:/dqm:/dq_scope_off)
-    — deliberately separate from the yr:/module: user-facing browsing
-    flow, since this is a one-time admin scope pick, not lecture
-    navigation."""
+    """Admin: pick a year, then a module, to temporarily override that
+    year's DAILY_QUIZ_ACTIVE_MODULE default (e.g. to switch early, before
+    the code constant itself gets updated). Own callback_data namespace
+    (dqy:/dqm:/dq_scope_off) — deliberately separate from the yr:/module:
+    user-facing browsing flow, since this is a one-time admin scope pick,
+    not lecture navigation."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
@@ -6359,32 +6479,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "daily_quiz_leaderboard":
-        _ensure_daily_leaderboard_fresh()
-        rows = _rank_daily_leaderboard()
-        title = "🏆 <b>Daily Quiz Leaderboard — النهاردة</b>"
-        if not rows:
-            text = f"{title}\n\nمفيش حد خلص الـ Daily Quiz النهاردة لسه."
-        else:
-            medal = {0: "🥇", 1: "🥈", 2: "🥉"}
-            lines = [title, ""]
-            for i, r in enumerate(rows):
-                rank = medal.get(i, f"{i + 1}.")
-                lines.append(
-                    f"{rank} {html.escape(r['name'])} — "
-                    f"{r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}"
-                )
-            text = "\n".join(lines)
-        await query.edit_message_text(
-            text, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
-            ]]),
-        )
+        # Kept as an alias for any older button still floating around in
+        # chat history — the hub (which "daily_quiz" opens) now always
+        # shows the leaderboard itself, so this just routes there too.
+        await show_daily_quiz_menu(context, user_id, query.message)
         return
 
     if query.data == "menu_settings":
         AWAITING_NICKNAME.pop(user_id, None)
         await _send_settings(context, user_id, query.message, edit=True)
+        return
+
+    if query.data.startswith("settings_page:"):
+        page = int(query.data.split(":")[1])
+        await _send_settings(context, user_id, query.message, edit=True, page=page)
+        return
+
+    if query.data == "toggle_daily_notifs":
+        entry = _get_settings_entry(user_id)
+        entry["daily_notifs"] = not entry.get("daily_notifs", True)
+        await save_settings()
+        await backup_settings_to_channel(context)
+        await _send_settings(context, user_id, query.message, edit=True, page=2)
         return
 
     if query.data == "edit_nickname":
@@ -6404,11 +6520,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── set_yc: / onboard_yc: — year/class picker tap, from Settings or ──
-    # from the onboarding flow (right after the first-ever nickname save).
-    if query.data.startswith("set_yc:") or query.data.startswith("onboard_yc:"):
+    # ── set_yc: / onboard_yc: / dqyc: — year/class picker tap, from ──
+    # Settings, from onboarding (right after the first-ever nickname
+    # save), or from the Daily Quiz hub prompting for it first.
+    if (query.data.startswith("set_yc:") or query.data.startswith("onboard_yc:")
+            or query.data.startswith("dqyc:")):
         prefix, year_class = query.data.split(":")
         is_onboarding = (prefix == "onboard_yc")
+        is_daily_quiz = (prefix == "dqyc")
         if year_class not in YEAR_CLASS_NUMBER:
             await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
             return
@@ -6431,6 +6550,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=start_menu_keyboard(),
             )
+        elif is_daily_quiz:
+            await show_daily_quiz_menu(context, user_id, query.message)
         else:
             await _send_settings(context, user_id, query.message, edit=True)
         return
@@ -6511,6 +6632,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "daily_quiz":
+        await show_daily_quiz_menu(context, user_id, message=query.message)
+        return
+
+    if query.data == "daily_quiz_begin":
         await start_daily_quiz(context, user_id, message=query.message)
         return
 
@@ -6582,7 +6707,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_settings_to_channel(context)
         await query.edit_message_text(
             f"✅ Daily Quiz دلوقتي محدد على: {year_label(year)} — {module_label(module)}\n\n"
-            f"(الأسئلة العشوائية وأسئلة الأخطاء القديمة هيتسحبوا من الموديول ده بس)",
+            f"(أسئلة الـ Daily Quiz لسنة {year_label(year)} هيتسحبوا من الموديول ده بس)",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -7304,20 +7429,23 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         ]]),
     )
 
-async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
+async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False, page: int = 1) -> None:
     """Builds and sends the Settings screen to reply_target (an
     update.message or a callback_query.message). Mirrors _send_mystats:
     edit=True rewrites reply_target in place (button flow), edit=False
-    sends a fresh reply."""
-    nickname = get_nickname(user_id)
-    nick_line = f"<b>{html.escape(nickname)}</b>" if nickname else "<i>مش متسجل — دوس تحت تحطه</i>"
+    sends a fresh reply. page 2 is the "➡️ More Settings" overflow page."""
+    if page == 2:
+        text = "⚙️ <b>الإعدادات — صفحة 2</b>"
+    else:
+        nickname = get_nickname(user_id)
+        nick_line = f"<b>{html.escape(nickname)}</b>" if nickname else "<i>مش متسجل — دوس تحت تحطه</i>"
+        text = f"⚙️ <b>الإعدادات</b>\n\n👤 الاسم المستعار: {nick_line}"
 
     send = reply_target.edit_text if edit else reply_target.reply_text
     await send(
-        f"⚙️ <b>الإعدادات</b>\n\n"
-        f"👤 الاسم المستعار: {nick_line}",
+        text,
         parse_mode=ParseMode.HTML,
-        reply_markup=settings_menu_keyboard(user_id),
+        reply_markup=settings_menu_keyboard(user_id, page=page),
     )
 
 async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
