@@ -33,7 +33,8 @@ from zoneinfo import ZoneInfo
 #          tiers + unlocked extras) rather than a normal field, and its
 #          tiers grant a permanent entry["xp_multiplier"] instead of a
 #          one-time XP bonus; every _award_xp call scales by it, and tier
-#          4 renames to "The Quizician". EXTRA_ACHIEVEMENTS holds 4 one-off
+#          5 (only reachable once literally everything else is unlocked)
+#          renames to "The Quizician". EXTRA_ACHIEVEMENTS holds 4 one-off
 #          (non-tiered) awards — quick_thinker, basmagy, perfect_run,
 #          insomniac (Curious intentionally not implemented) — unlocked
 #          via _check_extra_achievement and stored in
@@ -490,10 +491,13 @@ USERS = load_users()
 #       "questions_answered": 0-6, "correct_streak": 0-5,
 #       "lectures_completed": 0-5, "xp_levels": 0-6,
 #       "daily_quiz": 0-5, "daily_streak": 0-5,
-#       "achievement_collector": 0-4,   # meta: counts unlocks across every
+#       "achievement_collector": 0-5,   # meta: counts unlocks across every
 #                                        # OTHER category + extras (see
 #                                        # _total_achievements_unlocked);
-#                                        # tier 4 renames to "The Quizician"
+#                                        # tier 5 renames to "The Quizician"
+#                                        # (unlocks only once EVERY other
+#                                        # achievement — tiers + extras —
+#                                        # is unlocked)
 #       "extras": {key: True, ...}   # one-off EXTRA_ACHIEVEMENTS unlocked
 #   }
 # }
@@ -588,14 +592,17 @@ ACHIEVEMENTS = {
         # A meta-category: its threshold is checked against the total
         # number of OTHER achievements unlocked (every tiered category
         # above + every unlocked extra — see _total_achievements_unlocked),
-        # not a normal analytics field. Its 4th slot is a permanent XP
-        # multiplier, not a one-time XP bonus — see the special case in
+        # not a normal analytics field. Every slot's xp_bonus is a permanent
+        # XP multiplier, not a one-time XP bonus — see the special case in
         # _check_achievements and how _award_xp applies entry["xp_multiplier"].
-        # Tier 4 doubles as "The Quizician" — Curious is still not implemented.
+        # Tier 5 ("The Quizician") is appended below, right after
+        # EXTRA_ACHIEVEMENTS is defined, since its threshold has to equal
+        # the total count of every tier + extra that exists — Curious is
+        # still not implemented.
         (5,  "Achievement Collector", 1.1, "🔍"),
         (10, "Achievement Collector", 1.2, "🔍"),
         (20, "Achievement Collector", 1.3, "🔍"),
-        (30, "The Quizician",         1.5, "🪄"),
+        (30, "Achievement Collector", 1.4, "🔍"),
     ],
 }
 
@@ -611,6 +618,20 @@ EXTRA_ACHIEVEMENTS = {
     "perfect_run":   ("Perfect Run",   "💯", 100, "خلصت محاضرة كاملة بـ 100%"),
     "insomniac":     ("Insomniac",     "🌚", 75,  "خلصت كويز بين 2-5 الفجر"),
 }
+
+# "achievement_collector" tier 5 — "The Quizician" — only unlocks once
+# EVERY other achievement in the whole system (every tier in every other
+# category + every extra) has been unlocked. Computed here, right after
+# EXTRA_ACHIEVEMENTS exists, so the threshold always tracks the real total
+# instead of a hardcoded number that would silently drift the moment a
+# tier or extra is added/removed elsewhere in this file.
+_TOTAL_ACHIEVEMENTS_POSSIBLE = (
+    sum(len(tiers) for key, tiers in ACHIEVEMENTS.items() if key != "achievement_collector")
+    + len(EXTRA_ACHIEVEMENTS)
+)
+ACHIEVEMENTS["achievement_collector"].append(
+    (_TOTAL_ACHIEVEMENTS_POSSIBLE, "The Quizician", 1.5, "🪄")
+)
 
 LEVEL_TITLES = {
     0:  "مبتدئ",
@@ -6623,7 +6644,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         tier = ach.get(key, 0)
         if tier:
             name = ACHIEVEMENTS[key][tier - 1][1]
-            emoji = ACHIEVEMENTS[key][tier - 1][3]   # tier 4 swaps to 🪄 for "The Quizician"
+            emoji = ACHIEVEMENTS[key][tier - 1][3]   # tier 5 swaps to 🪄 for "The Quizician"
             if key == "achievement_collector":
                 mult = ACHIEVEMENTS[key][tier - 1][2]
                 ach_lines.append(f"  {emoji} {name} (x{mult})")
