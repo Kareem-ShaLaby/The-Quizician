@@ -8,7 +8,9 @@ import copy
 import asyncio
 import functools
 import html
+import unicodedata
 import tempfile
+import zipfile
 import traceback
 from io import BytesIO
 from datetime import time as dt_time, datetime, timedelta
@@ -34,9 +36,10 @@ from zoneinfo import ZoneInfo
 #          tiers grant a permanent entry["xp_multiplier"] instead of a
 #          one-time XP bonus; every _award_xp call scales by it, and tier
 #          5 (only reachable once literally everything else is unlocked)
-#          renames to "The Quizician". EXTRA_ACHIEVEMENTS holds 4 one-off
+#          renames to "The Quizician". EXTRA_ACHIEVEMENTS holds 5 one-off
 #          (non-tiered) awards — quick_thinker, basmagy, perfect_run,
-#          insomniac (Curious intentionally not implemented) — unlocked
+#          insomniac, curious (the last checked via _settings_customized,
+#          no dedicated tracker) — unlocked
 #          via _check_extra_achievement and stored in
 #          entry["achievements"]["extras"]. New counters this system
 #          added: lectures_completed (_finish_lecture_session, non-retake
@@ -117,9 +120,15 @@ from zoneinfo import ZoneInfo
 #          backup channel's pin and re-uploads if it's out of sync, so a
 #          missed pin/delete on the reactive path gets caught within a few
 #          seconds instead of waiting for the next real data change. Also
-#          registers _zikr_push_job (job_queue.run_repeating, every 3600s)
-#          — hourly zikr to users who opted in via Settings -> More
-#          Settings -> Hourly Zikr (get_zikr_enabled, off by default).
+#          registers _zikr_push_job (job_queue.run_repeating, every 3600s,
+#          first fire aligned to the next real clock-hour via
+#          _next_top_of_hour_delay) — hourly zikr to every user who hasn't
+#          opted out via Settings -> More Settings -> Hourly Zikr
+#          (get_zikr_enabled, on by default). Also registers
+#          _daily_backup_export_job (job_queue.run_daily,
+#          DAILY_BACKUP_EXPORT_HOUR/MIN) — zips every local data file and
+#          sends it to ERROR_LOG_GROUP_ID once a day, as a flat-file
+#          backup on top of the per-system pinned-message backups.
 #
 # NOTE ON save_*() FUNCTIONS: all 11 are async, writing via
 # asyncio.to_thread(_atomic_write_json, ...) — atomic (temp file + fsync +
@@ -140,6 +149,7 @@ from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyb
 from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError, RetryAfter
 from telegram.ext import (
     ApplicationBuilder,
+    ApplicationHandlerStop,
     MessageHandler,
     CommandHandler,
     CallbackQueryHandler,
@@ -168,9 +178,9 @@ ADMIN_ID = 940770584
 # ── Replace with your private GROUP's chat ID ────────────────────
 # 1. Create the group, add this bot to it as a member (admin not required
 #    unless you want it to survive being demoted/re-added later).
-# 2. Send any message in the group, then send /storage_id in the SAME
-#    group — the bot will reply with the chat ID (a negative number,
-#    e.g. -1001234567890). Paste it below.
+# 2. Add @userinfobot to the same group (or forward a message from the
+#    group to it in DM) — it replies with the chat ID (a negative number,
+#    e.g. -1001234567890). Paste it below, then remove @userinfobot.
 STORAGE_GROUP_ID = -1004447646576
 
 # ── YEARS — one quiz channel + curriculum per academic year ──────────
@@ -185,8 +195,8 @@ STORAGE_GROUP_ID = -1004447646576
 # To add/wire up a year's channel:
 #   1. Create a channel, add this bot as an ADMIN (channels require admin
 #      rights for the bot to receive posts at all).
-#   2. Forward any message from that channel to the bot in a private DM,
-#      then send /quiz_channel_id right after — the bot replies with the ID.
+#   2. Forward any message from that channel to @userinfobot in a private
+#      DM — it replies with the channel's chat ID.
 #   3. Paste that ID below as that year's "channel_id".
 #
 # The old single-channel setup (channel -1004402622263) is kept as Year 3
@@ -318,7 +328,7 @@ SETTINGS_GROUP_ID = -1004423684829
 # group (rather than folded into ANALYTICS_GROUP_ID) so a growing
 # leaderboard file never risks the analytics backup itself, and vice
 # versa. Set this up the same way as the others: create a group, add
-# the bot as admin, send /storage_id inside it, paste the ID below.
+# the bot as admin, add @userinfobot to it, paste the ID it replies with below.
 LECTURE_RESULTS_GROUP_ID = -1004292587669
 
 # ── Mistakes bank: every wrong lecture answer, kept per-user ──
@@ -527,8 +537,14 @@ LEVEL_CURVE_B = 550
 XP_PER_QUESTION   = 10
 
 # ── Achievement definitions ───────────────────────────────────
-# Each tiered achievement is (threshold, name, xp_bonus, emoji) — tier
-# counts now vary per category (4-6), so nothing below assumes exactly 5.
+# Each tiered achievement is (threshold, name, xp_bonus, emoji, quip) —
+# quip is a short flavor line shown alongside the unlock announcement
+# (see _announce_events) and in the achievements gallery (_send_achievements).
+# Tier counts vary per category (4-6), so nothing below assumes exactly 5.
+# A name/quip containing the literal token "{nick}" gets that token
+# replaced with the unlocking user's own nickname wherever it's actually
+# shown — see _personalize_ach_text — so it's a plain string here, not a
+# per-user value.
 # stat_key → the actual analytics entry field each category's threshold is
 # checked against (kept separate from the ACHIEVEMENTS dict key so the
 # lookup doesn't silently break if either name changes later).
@@ -542,51 +558,54 @@ ACHIEVEMENT_STAT_FIELD = {
 }
 ACHIEVEMENTS = {
     "questions_answered": [
-        (50,    "Rookie",      25,  "📚"),
-        (200,   "Apprentice",  75,  "📚"),
-        (500,   "Expert",      150, "📚"),
-        (1000,  "Master",      300, "📚"),
-        (4000,  "Grandmaster", 600, "📚"),
-        (10000, "Titan",       1200, "📚"),
+        (100,   "Rookie",      25,  "📚", "لسه يا دوب بنقول يا هادي"),
+        (500,   "Apprentice",  75,  "📚", "كدا دخلنا فالجد بقا"),
+        (1000,  "Expert",      150, "📚", "دماغك بدأت تنور أهي"),
+        (3000,  "Master",      300, "📚", "وصل الكبير"),
+        (5000,  "Grandmaster", 600, "📚", "يبني أرحم"),
+        (8000,  "Titan",       1200, "📚", "ولا حتى ليفاي يقدر يعملك حاجة"),
     ],
     "correct_streak": [
-        (5,   "Hot Start",        20,  "🔥"),
-        (15,  "On Fire",          50,  "🔥"),
-        (25,  "Unstoppable",      125, "🔥"),
-        (50,  "Monster Streak",   300, "🔥"),
-        (100, "Legendary Streak", 700, "🔥"),
+        (5,   "Hot Start",        20,  "🔥", "ولع يا باشا"),
+        (15,  "On Fire",          50,  "🔥", "ولعععع"),
+        (25,  "Unstoppable",      125, "🔥", "خلاص كفايه ولعة كدا"),
+        (50,  "Monster Streak",   300, "🔥", "💀 كفايه توليع يسطا"),
+        (60,  "Legendary Streak", 700, "🔥", "حد يتصل على المطافي"),
     ],
     "lectures_completed": [
-        (1,  "First Lecture",     25,  "📖"),
-        (8,  "Student",           100, "📖"),
-        (15, "Scholar",           200, "📖"),
-        (25, "Professor",         350, "📖"),
-        (50, "Walking Textbook",  700, "📖"),
+        (4,  "First Lecture",     25,  "📖", "هانت متقلقش أول يوم خلص أهو والأجازه قربت 🥹"),
+        (8,  "Student",           100, "📖", "Aaaand DOES... I mean DONE!"),
+        (15, "Scholar",           200, "📖", "💯 الدنيا بدأت توسع، بس أنت قدها"),
+        (25, "Professor",         350, "📖", "😏 دانت تشرحلنا الماده بقا"),
+        (50, "Walking Textbook",  700, "📖", "أنت مش هتسيب حاجة لباقي الدفعه؟"),
     ],
     "xp_levels": [
         # xp_levels' own threshold is checked against xp directly for its
         # first tier (First XP), then level for the rest — see the special
         # case in _check_achievements.
-        (1000, "First XP",     0,   "⭐"),
-        (5,    "Level Up!",    50,  "⭐"),
-        (10,   "Rising Star",  100, "⭐"),
-        (25,   "Powerhouse",   250, "⭐"),
-        (50,   "Legend",       500, "⭐"),
-        (100,  "Ascended",     1000, "⭐"),
+        (2000, "First XP",     0,   "⭐", "عبي يابا"),
+        (5,    "Level Up!",    50,  "⭐", "ما الدنيا حلوه أهي"),
+        (10,   "Rising Star",  100, "⭐", "دانا نسيبلك الطلعه دي بقا"),
+        (25,   "Powerhouse",   250, "⭐", "ربنا يعلي مراتبك يبني"),
+        (50,   "Legend",       500, "⭐", "مش سهلة دي خالي بالك"),
+        (100,  "Ascended",     1000, "⭐", "أنت قفلت البوت مش باقي غير تقفل المادة 😂"),
     ],
     "daily_quiz": [
-        (1,   "Daily Visitor", 25,  "📅"),
-        (7,   "Dedicated",     75,  "📅"),
-        (30,  "Committed",     200, "📅"),
-        (100, "Disciplined",   500, "📅"),
-        (365, "All Year Round", 1500, "📅"),
+        (1,   "Daily Visitor", 25,  "📅", "أول يوم مدرسة أول يوم مدرسة!!"),
+        (7,   "Dedicated",     75,  "📅", "أسبوع بحاله، دانت رايق بقا"),
+        (30,  "Committed",     200, "📅", "الشهر خلص، وأنت لا 💪"),
+        (100, "Disciplined",   500, "📅", "الترم قرب يخلص، بس أن شاء الله تلحق تلم الدنيا"),
+        # {nick} -> the unlocking user's nickname, resolved at display
+        # time (see _personalize_ach_text) — this is the only tiered
+        # achievement whose *name* (not just quip) is personalized.
+        (200, "{nick} was here", 1500, "📅", "i was there when it was written!"),
     ],
     "daily_streak": [
-        (3,   "Three-Peat",       20,  "🔥"),
-        (7,   "Week Warrior",     50,  "🔥"),
-        (30,  "Monthly Machine",  150, "🔥"),
-        (100, "Unbreakable",      400, "🔥"),
-        (365, "Immortal",         1000, "🔥"),
+        (3,   "Three-Peat",       20,  "🔥", "تلاته - صفر لينا"),
+        (7,   "Week Warrior",     50,  "🔥", "a week isn't for the weak"),
+        (30,  "Monthly Machine",  150, "🔥", "أنت واخدها تحدي شخصي بقا"),
+        (50,  "determined",       400, "🔥", "أنت لسه عايش يا بلدينا؟"),
+        (100, "Unstoppable",      1000, "🔥", "ميه ميه 😎"),
     ],
     "achievement_collector": [
         # A meta-category: its threshold is checked against the total
@@ -597,26 +616,29 @@ ACHIEVEMENTS = {
         # _check_achievements and how _award_xp applies entry["xp_multiplier"].
         # Tier 5 ("The Quizician") is appended below, right after
         # EXTRA_ACHIEVEMENTS is defined, since its threshold has to equal
-        # the total count of every tier + extra that exists — Curious is
-        # still not implemented.
-        (5,  "Achievement Collector", 1.1, "🔍"),
-        (10, "Achievement Collector", 1.2, "🔍"),
-        (20, "Achievement Collector", 1.3, "🔍"),
-        (30, "Achievement Collector", 1.4, "🔍"),
+        # the total count of every tier + extra that exists. Its quip uses
+        # {nick} too, same mechanism as daily_quiz's last tier above.
+        (5,  "Achievement Collector", 1.05, "🔍", "حلاوة البدايات"),
+        (10, "Achievement Collector", 1.10, "🔍", "عشرة فعين الحاسدين البهم بارك 😤😤"),
+        (20, "Achievement Collector", 1.15, "🔍", "this"),
+        (30, "Achievement Collector", 1.20, "🔍", "You are making me 'tier' up 🥹"),
     ],
 }
 
 # ── "Extras" — one-off achievements, not tiered thresholds ─────────
-# Each is (name, emoji, xp_bonus, description). Unlocked state lives in
-# entry["achievements"]["extras"] as {key: True}, checked by bespoke
+# Each is (name, emoji, xp_bonus, description, quip). Unlocked state lives
+# in entry["achievements"]["extras"] as {key: True}, checked by bespoke
 # conditions at the relevant event (see _check_extra_achievement and its
-# call sites) rather than a single numeric stat. Quizician and Curious
-# are intentionally not implemented yet.
+# call sites) rather than a single numeric stat. "curious" is checked by
+# _settings_customized/_maybe_award_curious — no dedicated tracker field,
+# just a live diff of the user's SETTINGS entry against
+# _blank_settings_entry() every time a preference toggle saves.
 EXTRA_ACHIEVEMENTS = {
-    "quick_thinker": ("Quick Thinker", "⚡️", 100, "خلصت محاضرة في أقل من 15 دقيقة"),
-    "basmagy":       ("Basmagy",       "😎", 150, "خلصت الـ Daily Quiz في أقل من 60 ثانية بـ 100%"),
-    "perfect_run":   ("Perfect Run",   "💯", 100, "خلصت محاضرة كاملة بـ 100%"),
-    "insomniac":     ("Insomniac",     "🌚", 75,  "خلصت كويز بين 2-5 الفجر"),
+    "quick_thinker": ("Quick Thinker", "⚡️", 100, "خلصت محاضرة في أقل من 15 دقيقة",         "سرعة نبيهه ⚡️"),
+    "basmagy":       ("Basmagy",       "😎", 150, "خلصت الـ Daily Quiz في أقل من 60 ثانية بـ 100%", "قوة بصمجتك محتاجة تدرس"),
+    "perfect_run":   ("Perfect Run",   "💯", 100, "خلصت محاضرة كاملة بـ 100%",                "متكلمنيش عن البيرفكشونزم"),
+    "insomniac":     ("Insomniac",     "🌚", 75,  "خلصت كويز بين 2-5 الفجر",                  "النوم دا لضعفاء القلب 👊"),
+    "curious":       ("Curious",       "🧐", 50,  "غيّرت أي حاجة في إعداداتك",                "هو أنت ديدي أخت ديكستر اللي بتتك على كل الزراير؟ 🤨"),
 }
 
 # "achievement_collector" tier 5 — "The Quizician" — only unlocks once
@@ -624,23 +646,34 @@ EXTRA_ACHIEVEMENTS = {
 # category + every extra) has been unlocked. Computed here, right after
 # EXTRA_ACHIEVEMENTS exists, so the threshold always tracks the real total
 # instead of a hardcoded number that would silently drift the moment a
-# tier or extra is added/removed elsewhere in this file.
+# tier or extra is added/removed elsewhere in this file. Its quip's
+# {nick} is resolved to the unlocking user's own nickname at display time
+# — see _personalize_ach_text.
 _TOTAL_ACHIEVEMENTS_POSSIBLE = (
     sum(len(tiers) for key, tiers in ACHIEVEMENTS.items() if key != "achievement_collector")
     + len(EXTRA_ACHIEVEMENTS)
 )
-ACHIEVEMENTS["achievement_collector"].append(
-    (_TOTAL_ACHIEVEMENTS_POSSIBLE, "The Quizician", 1.5, "🪄")
-)
+ACHIEVEMENTS["achievement_collector"].append((
+    _TOTAL_ACHIEVEMENTS_POSSIBLE, "The Quizician", 1.25, "🪄",
+    "you have become THE QUIZICIAN... The Creator sends you his kindest regards, "
+    "Thanks for quizzing along, Dr.{nick} ❤️",
+))
 
 LEVEL_TITLES = {
-    0:  "مبتدئ",
-    1:  "متعلم",
-    3:  "نشيط",
-    5:  "محترف",
-    8:  "خبير",
-    12: "أستاذ",
-    17: "أسطورة",
+    0:   "Beginner",
+    5:   "Active",
+    10:  "Pro",
+    15:  "Expert",
+    20:  "Master",
+    25:  "Sage",
+    30:  "Mythic",
+    40:  "Superhuman",
+    50:  "Genius",
+    60:  "Emperor of Quizzes",
+    70:  '"HIM"',
+    80:  "The star",
+    90:  "The Legend",
+    100: "The Quizician.",
 }
 
 def _level_title(level: int) -> str:
@@ -940,10 +973,24 @@ def _total_achievements_unlocked(entry: dict) -> int:
     extras_unlocked = sum(1 for v in ach.get("extras", {}).values() if v)
     return tiers_unlocked + extras_unlocked
 
+def _personalize_ach_text(text: str, user_id: int) -> str:
+    """Substitutes the literal "{nick}" token some achievement
+    names/quips use (daily_quiz's last tier, achievement_collector's
+    tier 5 quip) with the user's own nickname. A no-op for every other
+    achievement, which contains no such token. Call this on any
+    name/quip right before it's actually shown to someone — the
+    definitions in ACHIEVEMENTS/EXTRA_ACHIEVEMENTS stay generic strings,
+    not per-user values."""
+    if "{nick}" not in text:
+        return text
+    return text.replace("{nick}", get_nickname(user_id) or "حد ما")
+
 def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
     """Check one stat against its achievement tiers. Returns list of newly
-    unlocked tiers as dicts with keys: name, emoji, xp_bonus, tier
-    (1-based, tier counts vary by category — see ACHIEVEMENTS).
+    unlocked tiers as dicts with keys: name, emoji, xp_bonus, tier, quip
+    (1-based, tier counts vary by category — see ACHIEVEMENTS). name/quip
+    may still contain an unresolved "{nick}" token — see
+    _personalize_ach_text, applied by callers right before display.
 
     Special cases:
     - "xp_levels" mixes two fields — its first tier (First XP) checks raw
@@ -952,8 +999,10 @@ def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
       instead of any ACHIEVEMENT_STAT_FIELD entry, and its 4th tuple slot
       is a permanent XP multiplier (entry["xp_multiplier"]) rather than a
       one-time XP bonus — no _award_xp call for this category, and
-      "xp_bonus" in the returned dict holds the new multiplier instead
-      (see _announce_events, which renders it differently for this key).
+      "xp_bonus" in the returned dict holds the new multiplier instead,
+      alongside "prev_multiplier" (the value it just replaced, for
+      announcing the increase — see _announce_events, which renders this
+      category differently).
     Every other category checks a single field throughout, per
     ACHIEVEMENT_STAT_FIELD."""
     tiers    = ACHIEVEMENTS[stat_key]
@@ -961,7 +1010,7 @@ def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
     unlocked = []
     if stat_key != "achievement_collector":
         field = ACHIEVEMENT_STAT_FIELD.get(stat_key, stat_key)
-    for i, (threshold, name, xp_bonus, emoji) in enumerate(tiers):
+    for i, (threshold, name, xp_bonus, emoji, quip) in enumerate(tiers):
         tier = i + 1
         if tier <= current:
             continue
@@ -974,11 +1023,13 @@ def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
         if value >= threshold:
             entry["achievements"][stat_key] = tier
             if stat_key == "achievement_collector":
+                prev_multiplier = entry.get("xp_multiplier", 1.0)
                 entry["xp_multiplier"] = xp_bonus   # permanent multiplier, not a one-time bonus
-                unlocked.append({"name": name, "emoji": emoji,
-                                  "xp_bonus": xp_bonus, "tier": tier, "multiplier": True})
+                unlocked.append({"name": name, "emoji": emoji, "quip": quip,
+                                  "xp_bonus": xp_bonus, "prev_multiplier": prev_multiplier,
+                                  "tier": tier, "multiplier": True})
             else:
-                unlocked.append({"name": name, "emoji": emoji,
+                unlocked.append({"name": name, "emoji": emoji, "quip": quip,
                                   "xp_bonus": xp_bonus, "tier": tier})
                 _award_xp(entry, xp_bonus)
         else:
@@ -988,18 +1039,52 @@ def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
 def _check_extra_achievement(entry: dict, key: str) -> dict | None:
     """Awards a one-off EXTRA_ACHIEVEMENTS entry if not already unlocked.
     Returns the same shape _check_achievements' list entries use (name,
-    emoji, xp_bonus, tier) so _announce_events can treat both the same
-    way — tier is always 1 here (extras aren't leveled) with no ⭐ shown
-    (see _announce_events). Callers are expected to have already checked
-    the actual unlock condition; this only handles the "already have it"
-    guard + bookkeeping + XP."""
+    emoji, xp_bonus, tier, quip) so _announce_events can treat both the
+    same way — tier is always 1 here (extras aren't leveled) with no ⭐
+    shown (see _announce_events). Callers are expected to have already
+    checked the actual unlock condition; this only handles the "already
+    have it" guard + bookkeeping + XP."""
     extras = entry["achievements"].setdefault("extras", {})
     if extras.get(key):
         return None
-    name, emoji, xp_bonus, _desc = EXTRA_ACHIEVEMENTS[key]
+    name, emoji, xp_bonus, _desc, quip = EXTRA_ACHIEVEMENTS[key]
     extras[key] = True
     _award_xp(entry, xp_bonus)
-    return {"name": name, "emoji": emoji, "xp_bonus": xp_bonus, "tier": 1, "extra": True}
+    return {"name": name, "emoji": emoji, "xp_bonus": xp_bonus, "tier": 1, "extra": True, "quip": quip}
+
+# Preference toggles that count as "poking around in Settings" for the
+# "Curious" extra — deliberately excludes nickname/year_class, which
+# onboarding requires from everyone and so say nothing about curiosity.
+_CURIOUS_WATCHED_SETTINGS = (
+    "reactions", "auto_next", "randomize", "achievement_notifs",
+    "spaced_repetition", "question_timer", "daily_notifs", "zikr_reminders",
+)
+
+def _settings_customized(user_id: int) -> bool:
+    """True once this user has changed any _CURIOUS_WATCHED_SETTINGS
+    toggle away from its default. No dedicated tracker field for this —
+    just diffs the live SETTINGS entry against a fresh
+    _blank_settings_entry() on demand, which is why it's only ever
+    worth calling right after a settings mutation (see
+    _maybe_award_curious) rather than on some schedule."""
+    entry   = SETTINGS.get(str(user_id), {})
+    default = _blank_settings_entry()
+    return any(entry.get(k, default[k]) != default[k] for k in _CURIOUS_WATCHED_SETTINGS)
+
+async def _maybe_award_curious(context, user_id: int) -> None:
+    """Call right after any of the _CURIOUS_WATCHED_SETTINGS toggles
+    below save. Awards "Curious" (mutates the ANALYTICS entry via
+    _get_entry — a different dict than the SETTINGS one
+    _settings_customized reads, hence _mark_analytics_dirty rather than
+    a settings save here) the moment a user's settings first diverge
+    from default, then announces it immediately since a Settings tap is
+    already an interactive moment, same as any other achievement."""
+    if not _settings_customized(user_id):
+        return
+    ach = _check_extra_achievement(_get_entry(user_id), "curious")
+    if ach:
+        _mark_analytics_dirty()
+        await _announce_events(context, user_id, {"achievements": [ach], "level_up": 0})
 
 async def _record_activity(user_id: int, questions_delta: int = 0,
                      persist: bool = True) -> dict:
@@ -1048,27 +1133,33 @@ async def _record_activity(user_id: int, questions_delta: int = 0,
 
 async def _announce_events(context, chat_id: int, events: dict, settings_uid: int | None = None):
     """Send achievement unlocks and level-up notifications to chat_id.
-    settings_uid is whose achievement_notifs setting to check; defaults to
-    chat_id itself. Level-ups are a separate, more significant event and
-    always sent regardless."""
+    settings_uid is whose achievement_notifs setting to check (and whose
+    nickname any "{nick}" token in a name/quip resolves to — see
+    _personalize_ach_text); defaults to chat_id itself. Level-ups are a
+    separate, more significant event and always sent regardless."""
     if settings_uid is None:
         settings_uid = chat_id
     msgs = []
 
     if get_achievement_notifs_enabled(settings_uid):
         for ach in events.get("achievements", []):
+            name = _personalize_ach_text(ach["name"], settings_uid)
+            quip = _personalize_ach_text(ach.get("quip", ""), settings_uid)
             if ach.get("multiplier"):
+                prev = ach.get("prev_multiplier", 1.0)
                 msgs.append(
                     f"{ach['emoji']} <b>إنجاز جديد!</b>\n"
-                    f"<b>{ach['name']}</b>\n"
-                    f"<i>XP Multiplier: x{ach['xp_bonus']}</i>"
+                    f"<b>{name}</b>\n"
+                    f"<i>XP Multiplier: x{prev:g} → x{ach['xp_bonus']:g}</i>\n"
+                    f"<i>{quip}</i>"
                 )
                 continue
             stars = "" if ach.get("extra") else (" " + "⭐" * ach["tier"])
             msgs.append(
                 f"{ach['emoji']} <b>إنجاز جديد!</b>\n"
-                f"<b>{ach['name']}</b>{stars}\n"
-                f"<i>+{ach['xp_bonus']} XP</i>"
+                f"<b>{name}</b>{stars}\n"
+                f"<i>+{ach['xp_bonus']} XP</i>\n"
+                f"<i>{quip}</i>"
             )
 
     if events.get("level_up"):
@@ -1253,8 +1344,11 @@ def _blank_settings_entry() -> dict:
         "year_class": None,    # "y1"/"y2"/"y3" — see YEAR_CLASS_NUMBER above
         "daily_quiz_last_date": None,   # "YYYY-MM-DD" (UTC) of the last completed Daily Quiz
         "daily_notifs": True,   # the 2pm 💥Daily Quiz💥 push — see get_daily_notifs_enabled
-        "zikr_reminders": False,   # hourly automated zikr — see get_zikr_enabled / _zikr_push_job. Off by
-                                    # default since it's a devotional nudge, not core quiz functionality.
+        "zikr_reminders": True,   # hourly automated zikr — see get_zikr_enabled / _zikr_push_job. On by
+                                    # default; opt out via Settings -> More Settings -> Hourly Zikr.
+        "banned_until": None,   # epoch seconds (time.time()) this user's /ban lifts at, or None if not
+                                 # currently banned — see /ban (ban_cmd), get_ban_info, _ban_gate.
+        "ban_reason":   None,   # reason string from their most recent /ban (kept after it lifts too).
     }
 
 def load_settings() -> dict:
@@ -1292,6 +1386,50 @@ def _get_settings_entry(user_id: int) -> dict:
 def get_nickname(user_id: int) -> str | None:
     return SETTINGS.get(str(user_id), {}).get("nickname")
 
+# ── Nickname vulgarity filter ───────────────────────────────────────
+# Blocks a nickname that contains a vulgar/inappropriate English or
+# Arabic word — checked at set-time in the AWAITING_NICKNAME handler
+# below. Matching is substring-based on a *normalized* form of the
+# text (lowercased; Arabic tashkeel/alef-yaa/taa-marbuta variants and
+# tatweel collapsed; all spacing/punctuation stripped) so trivial
+# tricks like "a s s" or "كُسّ" don't just slip past it. This is a
+# simple blocklist, not a full profanity classifier — extend the two
+# sets below if something obvious gets through.
+_AR_DIACRITICS_RE = re.compile(r"[\u064B-\u065F\u0670\u06D6-\u06ED\u0640]")  # tashkeel + tatweel
+_AR_LETTER_NORM = {
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ى": "ي", "ة": "ه",
+}
+
+def _normalize_for_filter(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = _AR_DIACRITICS_RE.sub("", text)
+    text = text.translate(str.maketrans(_AR_LETTER_NORM))
+    text = text.lower()
+    return re.sub(r"[^a-z0-9\u0600-\u06FF]", "", text)
+
+_VULGAR_WORDS_EN = {
+    "fuck", "shit", "bitch", "asshole", "bastard", "dick", "pussy",
+    "cunt", "slut", "whore", "nigger", "nigga", "faggot", "retard",
+    "cock", "twat", "wanker", "motherfucker", "dumbass", "jackass",
+}
+_VULGAR_WORDS_AR = {
+    "كس", "كسمك", "كسم", "طيز", "زبي", "زب", "عرص", "عرصة",
+    "شرموطة", "شرموط", "قحبة", "قحبه", "متناك", "متناكة", "متناكه",
+    "خول", "منيك", "لبوة", "لبوه", "ابن الكلب", "يلعن",
+}
+# Precomputed once so every nickname check just does plain substring
+# lookups against already-normalized sets.
+_VULGAR_WORDS_AR_NORM = {_normalize_for_filter(w) for w in _VULGAR_WORDS_AR}
+
+def _contains_vulgar_word(text: str) -> bool:
+    """True if `text` (an attempted nickname) contains a blocked English
+    or Arabic word, after normalization."""
+    normalized = _normalize_for_filter(text)
+    if any(word in normalized for word in _VULGAR_WORDS_EN):
+        return True
+    return any(word in normalized for word in _VULGAR_WORDS_AR_NORM)
+
 def _get_bool_setting(user_id: int, key: str) -> bool:
     # Defaults to True for anyone not yet in SETTINGS (or missing the key) —
     # matches _blank_settings_entry() defaults, no backfill required to read.
@@ -1320,9 +1458,24 @@ def get_daily_notifs_enabled(user_id: int) -> bool:
 
 def get_zikr_enabled(user_id: int) -> bool:
     """Whether this user gets the hourly automated zikr reminder — see
-    _zikr_push_job. Off by default (opt-in via Settings -> More
-    Settings), unlike most toggles here which default to True."""
-    return SETTINGS.get(str(user_id), {}).get("zikr_reminders", False)
+    _zikr_push_job. On by default, like the other toggles here (opt out
+    via Settings -> More Settings -> Hourly Zikr)."""
+    return _get_bool_setting(user_id, "zikr_reminders")
+
+def get_ban_info(user_id: int) -> tuple[float | None, str | None]:
+    """(banned_until epoch seconds, reason) for an active /ban, or
+    (None, None) if the user was never banned or their ban already
+    lifted — a lifted ban is treated as not-banned without needing a
+    cleanup job, since this just compares against time.time() on every
+    call. See ban_cmd (/ban) and _ban_gate."""
+    entry = SETTINGS.get(str(user_id), {})
+    until = entry.get("banned_until")
+    if not until or time.time() >= until:
+        return None, None
+    return until, entry.get("ban_reason")
+
+def is_banned(user_id: int) -> bool:
+    return get_ban_info(user_id)[0] is not None
 
 def get_question_timer_seconds(user_id: int) -> int:
     # Defaults to 0 (off) for anyone not yet in SETTINGS — matches
@@ -1337,7 +1490,7 @@ def year_class_label(year_class: str | None) -> str:
     placeholder if the person hasn't set one yet."""
     if year_class not in YEAR_CLASS_NUMBER:
         return "لسه محدد"
-    return f"{year_label(year_class)} (Class {YEAR_CLASS_NUMBER[year_class]})"
+    return f"{year_label(year_class)} / Class {YEAR_CLASS_NUMBER[year_class]}"
 
 def year_class_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
     """The Year 1/2/3 (Class 46/45/44) picker, reused for both onboarding
@@ -1865,6 +2018,12 @@ DAILY_QUIZ_TZ   = ZoneInfo("Africa/Cairo")
 DAILY_QUIZ_HOUR = 14
 DAILY_QUIZ_MIN  = 0
 
+# Push time for the daily zipped-backup export (see _daily_backup_export_job
+# and job_queue.run_daily in MAIN). Off-peak hour, well clear of the Daily
+# Quiz push and the hourly Zikr, in the same DAILY_QUIZ_TZ.
+DAILY_BACKUP_EXPORT_HOUR = 3
+DAILY_BACKUP_EXPORT_MIN  = 0
+
 def next_daily_quiz_time() -> datetime:
     """The next upcoming 2pm-Cairo push moment — today's if it hasn't
     happened yet, otherwise tomorrow's."""
@@ -2385,12 +2544,23 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
         DAILY_QUIZ_SESSIONS.pop(user_id, None)
         await context.bot.send_message(chat_id=user_id, text="⚠️ حصلت مشكلة في تجهيز الأسئلة — جرب تاني.")
 
-# ── Hourly Zikr reminder — Settings toggle, OFF by default ─────────
-# One line sent once an hour (see job_queue.run_repeating in MAIN) to
-# every user who's opted in via Settings -> More Settings -> Hourly
-# Zikr. Purely a devotional nudge, no interaction/state of its own —
-# unlike the Daily Quiz push, there's no button or follow-up here.
+# ── Hourly Zikr reminder — Settings toggle, ON by default ──────────
+# One line sent once an hour, aligned to the real clock hour (1:00pm,
+# 2:00pm, 3:00pm, ... in DAILY_QUIZ_TZ — see _next_top_of_hour_delay
+# and job_queue.run_repeating in MAIN) to every user who's opted in via
+# Settings -> More Settings -> Hourly Zikr. Purely a devotional nudge,
+# no interaction/state of its own — unlike the Daily Quiz push, there's
+# no button or follow-up here.
 ZIKR_TEXT = "📿 سبحان الله، والحمدُ لله، ولا إله إلا اللهُ، واللهُ أكبرُ، ولا حولَ ولا قوةَ إلا بالله. ❤️"
+
+def _next_top_of_hour_delay(tz: ZoneInfo) -> float:
+    """Seconds from now until the next top of the hour (e.g. 1:00, 2:00,
+    3:00 ...) in `tz`. Used as the `first=` delay for the hourly Zikr
+    job so it lands on real clock-hours instead of firing an hour after
+    whatever moment the bot happened to start."""
+    now = datetime.now(tz)
+    next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+    return (next_hour - now).total_seconds()
 
 async def _zikr_push_job(context: ContextTypes.DEFAULT_TYPE):
     """Hourly push (see job_queue.run_repeating in MAIN): the same fixed
@@ -2404,6 +2574,65 @@ async def _zikr_push_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=uid, text=ZIKR_TEXT)
         except Exception:
             pass   # blocked the bot, deactivated account, etc. — skip silently, same as broadcast_cmd
+
+# ── Daily zipped backup export — a second, independent copy ────────
+# Every JSON file this bot maintains is already kept in sync with a
+# per-system pinned-message backup in its own channel/group (see the
+# backup_*_to_channel / restore_*_from_channel functions throughout this
+# file). This job is a belt-and-suspenders extra on top of that: once a
+# day it zips up every local data file that currently exists and drops
+# the archive straight into ERROR_LOG_GROUP_ID (a chat the admin already
+# watches), so there's a single flat file with everything in one place
+# even if a backup channel/group itself were ever lost or misconfigured.
+def _daily_backup_export_file_paths() -> list:
+    paths = [
+        USERS_FILE, ANALYTICS_FILE, SETTINGS_FILE, LECTURE_RESULTS_FILE,
+        MISTAKES_BANK_FILE, STORAGE_INDEX_FILE, STORAGE_BACKUP_STATE_FILE,
+        REPORT_THREADS_FILE,
+    ]
+    for year in YEAR_ORDER:
+        paths += [
+            QUIZ_INDEX_FILE_TMPL.format(year=year),
+            QUIZ_STATE_FILE_TMPL.format(year=year),
+            QUIZ_POLL_STATUS_FILE_TMPL.format(year=year),
+        ]
+    return paths
+
+async def _daily_backup_export_job(context: ContextTypes.DEFAULT_TYPE):
+    """Once a day (see job_queue.run_daily in MAIN, DAILY_BACKUP_EXPORT_HOUR/
+    MIN): zips every local data file that currently exists (a file that
+    was never created yet — e.g. a year with no channel configured — is
+    just skipped, not an error) and sends the archive to
+    ERROR_LOG_GROUP_ID. The zip is built off the event loop
+    (asyncio.to_thread) since zipping is blocking I/O, and the temp file
+    is always cleaned up afterwards, success or failure."""
+    if not ERROR_LOG_GROUP_ID:
+        return
+    existing = [p for p in _daily_backup_export_file_paths() if os.path.exists(p)]
+    if not existing:
+        return
+
+    date_str = datetime.now(DAILY_QUIZ_TZ).strftime("%Y-%m-%d")
+    zip_path = os.path.join(tempfile.gettempdir(), f"quizician_backup_{date_str}.zip")
+
+    def _make_zip():
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in existing:
+                zf.write(p, arcname=os.path.basename(p))
+
+    try:
+        await asyncio.to_thread(_make_zip)
+        with open(zip_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=ERROR_LOG_GROUP_ID,
+                document=InputFile(f, filename=os.path.basename(zip_path)),
+                caption=f"🗄 Daily backup export — {date_str} ({len(existing)} files)",
+            )
+    except Exception as e:
+        print(f"Daily backup export failed: {e}")
+    finally:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
 
 async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
     """The 2pm-Cairo push (see job_queue.run_daily in MAIN): just a
@@ -2965,6 +3194,8 @@ RETAKE_STAGING         = {}    # user_id -> {"year","module","subject","lecture_
                                 # — wrong-question mids from a just-finished lecture, offered via the
                                 # "🔁 Retake incorrect questions!" button; consumed (popped) once tapped
 AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is waiting on a nickname reply
+PENDING_QUIZ_DELETE    = {}    # admin_id -> (year, lecture_key), set by /quiz_delete while waiting on
+                                # the confirm/cancel tap (see quizdel_yes/quizdel_no in button_handler)
 
 # ── /edit_quiz support ────────────────────────────────────────────
 # QUIZ_INSERT_AFTER[year][lecture_key] = message_id (or None), set right
@@ -3437,10 +3668,8 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
     spaced_rep = get_spaced_repetition_enabled(user_id)
     timer      = get_question_timer_seconds(user_id)
     timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
-    yc_label   = year_class_label(get_year_class(user_id))
     rows = [
         [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
-        [InlineKeyboardButton(f"📚 Year/Class: {yc_label}", callback_data="edit_year_class")],
         [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
         [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
         [InlineKeyboardButton(f"🔁 Spaced Repetition: {_tag(spaced_rep)}", callback_data="toggle_spaced_repetition")],
@@ -4418,12 +4647,6 @@ async def handle_storage_message(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode=ParseMode.HTML,
     )
 
-async def storage_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Utility: run inside the storage group to get its chat ID for STORAGE_GROUP_ID."""
-    await update.message.reply_text(
-        f"🆔 Chat ID: <code>{update.effective_chat.id}</code>", parse_mode=ParseMode.HTML
-    )
-
 async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: force-create/refresh both pinned backups right now, instead of
     waiting for the next real change."""
@@ -4616,25 +4839,34 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         parse_mode=ParseMode.HTML,
     )
 
-async def quiz_channel_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Utility: forward any message from the quiz channel here first, then
-    run this command in the same DM — it reads the forward's source chat ID."""
-    fwd = update.message.forward_from_chat if update.message else None
-    if not fwd:
-        await update.message.reply_text(
-            "⚠️ فورورد أي رسالة من قناة الكويزات هنا الأول، وبعدين ابعت /quiz_channel_id تاني."
-        )
-        return
-    await update.message.reply_text(
-        f"🆔 Quiz channel ID: <code>{fwd.id}</code>", parse_mode=ParseMode.HTML
-    )
-
 async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User-facing: pick a year, then a module, then a subject, then a lecture."""
+    """User-facing: /quiz. Jumps straight to the module list for the
+    caller's own year/class (set via the onboarding/Settings year_class
+    prompt — see get_year_class, year_class_keyboard), skipping the "which
+    year?" step entirely. Falls back to the full year-picker (old
+    behaviour) if they haven't set a year yet, their set year isn't
+    currently configured/available, or it has no ready modules."""
+    user_id = update.effective_user.id if update.effective_user else None
     years = configured_years()
     if not years:
         await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
         return
+
+    year_class = get_year_class(user_id) if user_id else None
+    if year_class in years and year_channel_id(year_class):
+        modules = ready_modules(year_class)
+        if modules:
+            buttons = [
+                [InlineKeyboardButton(module_label(m), callback_data=f"module:{year_class}:{i}")]
+                for i, m in enumerate(modules)
+            ]
+            buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="quiz_years")])
+            await update.message.reply_text(
+                f"📚 <b>{year_label(year_class)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return
+
     buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
     await update.message.reply_text(
         "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
@@ -4721,9 +4953,11 @@ async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /quiz_delete <year> <n> — removes a lecture from that year's
-    index (does not delete the actual channel messages; only stops it
-    showing up in /quiz)."""
+    """Admin: /quiz_delete <year> <n> — asks for confirmation, then
+    removes a lecture from that year's index (does not delete the actual
+    channel messages; only stops it showing up in /quiz). The actual
+    removal happens in button_handler's quizdel_yes branch once the admin
+    taps to confirm; see PENDING_QUIZ_DELETE."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
@@ -4744,24 +4978,24 @@ async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if n < 1 or n > len(keys):
         await update.message.reply_text(f"❌ رقم غلط — فيه {len(keys)} محاضرة بس في {year_label(year)}")
         return
-    key = keys[n - 1]
-    removed = index.pop(key)
-    await save_quiz_index(year)
-    if QUIZ_STATE[year].get("current_lecture") == key:
-        QUIZ_STATE[year]["current_lecture"] = None
-        await save_quiz_state(year)
-    stale_polls = [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["lecture"] == key]
-    for pid in stale_polls:
-        QUIZ_POLL_STATUS[year].pop(pid, None)
-    await save_quiz_poll_status(year)
-    await backup_quiz_to_channel(context, year)
+    key     = keys[n - 1]
+    lecture = index[key]
+
+    admin_id = update.effective_user.id
+    PENDING_QUIZ_DELETE[admin_id] = (year, key)
     await update.message.reply_text(
-        f"🗑 اتشالت محاضرة من {year_label(year)}: {removed['module']} - {removed['subject']}: {removed['name']}\n"
-        "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)"
+        f"⚠️ <b>متأكد إنك عايز تمسح المحاضرة دي؟</b>\n\n"
+        f"{year_label(year)} — {lecture['module']} - {lecture['subject']}: {lecture['name']}\n"
+        f"(الرسايل نفسها هتفضل في القناة — العملية دي بس بتشيلها من /quiz)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 أيوه، امسح", callback_data="quizdel_yes")],
+            [InlineKeyboardButton("🔙 لأ، سيبها", callback_data="quizdel_no")],
+        ]),
     )
 
 async def edit_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /edit_quiz — browse year -> module -> subject -> lecture
+    """Admin: /edit_quiz (alias: /quiz_edit) — browse year -> module -> subject -> lecture
     (same drill-down as /quiz), then pick a question from that lecture to
     delete it or insert a new one right after it. Reuses the same
     yr:/module:/subject: browsing callback_data as /quiz so the flow
@@ -4902,6 +5136,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=settings_menu_keyboard(real_uid),
                 )
             return
+        if _contains_vulgar_word(nickname):
+            if onboarding:
+                # Same re-ask pattern as the empty-name case above — no
+                # main menu to fall back to yet during onboarding.
+                AWAITING_NICKNAME[real_uid] = "onboarding"
+                await update.message.reply_text(
+                    "⚠️ الاسم ده مش مناسب — اكتب اسم تاني.",
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ الاسم ده مش مناسب — جرب اسم تاني.",
+                    reply_markup=settings_menu_keyboard(real_uid),
+                )
+            return
         entry = _get_settings_entry(real_uid)
         entry["nickname"] = nickname
         await save_settings()
@@ -4911,11 +5159,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_analytics_to_channel(context)
         if onboarding:
             await update.message.reply_text(
-                f"✅ اتسجل! هنناديك <b>{html.escape(nickname)}</b> دلوقتي.",
+                f"What a lovely name Dr.{html.escape(nickname)} 🥰\n\n"
+                "What Year/Class are you currently in?\n\n"
+                "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)",
                 parse_mode=ParseMode.HTML,
-            )
-            await update.message.reply_text(
-                "📚 وانت في انهي سنة/فرقة؟",
                 reply_markup=year_class_keyboard("onboard_yc"),
             )
         else:
@@ -5850,14 +6097,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "year_leaderboard":
+        # year_class is guaranteed set by this point — mandatory onboarding
+        # (see _onboarding_gate) means no update reaches here otherwise.
         year_class = get_year_class(user_id)
-        if not year_class:
-            await query.edit_message_text(
-                "📚 محتاج تحدد سنتك/فرقتك الأول عشان تشوف الـ Leaderboard بتاعها.\n"
-                "اختار من هنا:",
-                reply_markup=year_class_keyboard("set_yc"),
-            )
-            return
         rows = _year_leaderboard(year_class)
         title = f"🏆 <b>Leaderboard — {year_class_label(year_class)}</b>"
         if not rows:
@@ -5900,6 +6142,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_settings()
         await backup_settings_to_channel(context)
         await _send_settings(context, user_id, query.message, edit=True, page=2)
+        await _maybe_award_curious(context, user_id)
         return
 
     if query.data == "toggle_zikr":
@@ -5908,6 +6151,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_settings()
         await backup_settings_to_channel(context)
         await _send_settings(context, user_id, query.message, edit=True, page=2)
+        await _maybe_award_curious(context, user_id)
         return
 
     if query.data == "edit_nickname":
@@ -5921,18 +6165,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if query.data == "edit_year_class":
-        await query.edit_message_text(
-            "📚 وانت في انهي سنة/فرقة؟",
-            reply_markup=year_class_keyboard("set_yc"),
-        )
-        return
-
-    # ── set_yc: / onboard_yc: / dqyc: — year/class picker tap, from ──
-    # Settings, from onboarding (right after the first-ever nickname
-    # save), or from the Daily Quiz hub prompting for it first.
-    if (query.data.startswith("set_yc:") or query.data.startswith("onboard_yc:")
-            or query.data.startswith("dqyc:")):
+    # ── onboard_yc: / dqyc: — year/class picker tap, from onboarding ──
+    # (right after the first-ever nickname save) or from the Daily Quiz
+    # hub prompting for it first — year/class is set once here and can't
+    # be changed afterwards (no Settings edit path anymore).
+    if query.data.startswith("onboard_yc:") or query.data.startswith("dqyc:"):
         prefix, year_class = query.data.split(":")
         is_onboarding = (prefix == "onboard_yc")
         is_daily_quiz = (prefix == "dqyc")
@@ -5944,24 +6181,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_settings()
         await backup_settings_to_channel(context)
         if is_onboarding:
-            nickname = get_nickname(user_id)
-            greeting = f"يا {html.escape(nickname)}! " if nickname else ""
+            onboard_lines = {
+                "y1": "Year 1? You are a new-comer! Oh You will love it here.",
+                "y2": "Year 2? Oh you are in for a trip! But don't worry it will be fun. 😉",
+                "y3": "Year 3? Wouldn't that be... Oh! You are becoming a Semi-Senior soon!!",
+            }
             await query.edit_message_text(
                 f"✅ تمام، {year_class_label(year_class)}.",
             )
             await context.bot.send_message(
                 chat_id=user_id,
-                text=(
-                    f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
-                    f"{greeting}تحب تعمل أي؟!:"
-                ),
+                text=quizzy_block(QUIZZY_WELCOME_ART, onboard_lines[year_class]),
                 parse_mode=ParseMode.HTML,
-                reply_markup=start_menu_keyboard(),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("what is this place?! 🙂", callback_data="onboard_how")],
+                    [InlineKeyboardButton("🗣️🗣️🔥 يلا بينا", callback_data="onboard_go")],
+                ]),
             )
         elif is_daily_quiz:
             await show_daily_quiz_menu(context, user_id, query.message)
         else:
             await _send_settings(context, user_id, query.message, edit=True)
+        return
+
+    # ── onboard_how / onboard_go — the two buttons shown right after the
+    # onboarding year/class quip above ("what is this place?!" vs "let's
+    # go"). onboard_how reuses HOW_TO_USE_TEXT (menu_how's content — will
+    # be tweaked separately later) but keeps a way back into onboarding
+    # instead of a "Back to Home" button, since there's no home yet;
+    # onboard_go is the actual finish line into the real main menu.
+    if query.data == "onboard_how":
+        await query.edit_message_text(
+            HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗣️🗣️🔥 يلا بينا", callback_data="onboard_go"),
+            ]]),
+        )
+        return
+
+    if query.data == "onboard_go":
+        nickname = get_nickname(user_id)
+        greeting = f"يا {html.escape(nickname)}! " if nickname else ""
+        await query.edit_message_text(
+            f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+            f"{greeting}تحب تعمل أي؟!:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=start_menu_keyboard(),
+        )
         return
 
     if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize", "toggle_achievement_notifs", "toggle_spaced_repetition"):
@@ -5986,6 +6252,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif key == "auto_next" and not entry["auto_next"] and entry.get("spaced_repetition", True):
             await query.answer("⚠️ قفلت Auto-Next، فـ Spaced Repetition مش هيشتغل لحد ما ترجعه", show_alert=True)
         await _send_settings(context, user_id, query.message, edit=True, page=page)
+        await _maybe_award_curious(context, user_id)
         return
 
     if query.data == "toggle_question_timer":
@@ -5996,6 +6263,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_settings()
         await backup_settings_to_channel(context)
         await _send_settings(context, user_id, query.message, edit=True)
+        await _maybe_award_curious(context, user_id)
         return
 
     # ── Settings: Clear Mistake Bank (with confirmation) ──
@@ -6032,6 +6300,71 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_mistakes_bank_to_channel(context)
         await query.answer(f"✅ اتمسح {cleared} سؤال من بنك الأخطاء بتاعك.", show_alert=True)
         await _send_settings(context, user_id, query.message, edit=True)
+        return
+
+    # ── /quiz_delete confirmation (admin) ────────────────────────────
+    # PENDING_QUIZ_DELETE[admin_id] was set by quiz_delete_cmd right
+    # before showing the confirm/cancel buttons — same tap-to-confirm
+    # pattern as Clear Mistake Bank above, keyed by (year, lecture_key)
+    # rather than position so it stays correct even if the index shifted
+    # between the confirm screen and this tap.
+    if query.data == "quizdel_yes":
+        if not is_admin(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        pending = PENDING_QUIZ_DELETE.pop(user_id, None)
+        if not pending:
+            await query.answer("⚠️ الطلب ده مش متاح دلوقتي — جرب /quiz_delete تاني.", show_alert=True)
+            return
+        year, key = pending
+        index = QUIZ_INDEX[year]
+        if key not in index:
+            await query.edit_message_text("⚠️ المحاضرة دي اتشالت أو اتغيرت أصلاً.")
+            return
+        removed = index.pop(key)
+        await save_quiz_index(year)
+        if QUIZ_STATE[year].get("current_lecture") == key:
+            QUIZ_STATE[year]["current_lecture"] = None
+            await save_quiz_state(year)
+        stale_polls = [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["lecture"] == key]
+        for pid in stale_polls:
+            QUIZ_POLL_STATUS[year].pop(pid, None)
+        await save_quiz_poll_status(year)
+        await backup_quiz_to_channel(context, year)
+        await query.edit_message_text(
+            f"🗑 اتشالت محاضرة من {year_label(year)}: {removed['module']} - {removed['subject']}: {removed['name']}\n"
+            "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)"
+        )
+        return
+
+    if query.data == "quizdel_no":
+        PENDING_QUIZ_DELETE.pop(user_id, None)
+        await query.edit_message_text("🔙 اتلغى — المحاضرة لسه موجودة.")
+        return
+
+    # ── /reset_analytics confirmation (admin) ────────────────────────
+    if query.data == "reset_analytics_yes":
+        if not is_admin(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        global _analytics_backup_msg_id, _analytics_dirty
+        ANALYTICS.clear()
+        await save_analytics()
+        _analytics_dirty = False   # disk now matches memory — nothing left for the periodic flush to do
+        if _analytics_backup_msg_id and ANALYTICS_GROUP_ID:
+            try:
+                await context.bot.delete_message(
+                    chat_id=ANALYTICS_GROUP_ID,
+                    message_id=_analytics_backup_msg_id,
+                )
+            except Exception:
+                pass
+        _analytics_backup_msg_id = None
+        await query.edit_message_text("🗑 Analytics wiped — local file cleared and backup deleted.")
+        return
+
+    if query.data == "reset_analytics_no":
+        await query.edit_message_text("🔙 اتلغى — الـ Analytics لسه زي ما هي.")
         return
 
     if query.data == "menu_quizzes":
@@ -6279,9 +6612,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             quizzy_block(
                 QUIZZY_AMAZED_ART,
                 "Hello there! My name is Quizzy! what's your name? "
-                "Use an appropriate name 🙊 — it'll be shown on the Leaderboard)",
+                "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
             ),
             parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if get_year_class(real_uid) not in YEAR_CLASS_NUMBER:
+        # Nickname's set but they never finished picking a year/class
+        # (or got interrupted mid-onboarding) — send them back to this
+        # step instead of the main menu. Also mandatory, also permanent.
+        await update.message.reply_text(
+            "What Year/Class are you currently in?\n\n"
+            "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)",
+            reply_markup=year_class_keyboard("onboard_yc"),
         )
         return
 
@@ -6306,20 +6650,21 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("/report_issue — send a message straight to the admin")
     lines.append("/quiz — browse lectures (year → module → subject → lecture) and pull their questions")
     lines.append("/time — current time, and when the next 💥Daily Quiz💥 push is")
-    lines.append("/storage_id — gets this chat's ID (for setting STORAGE_GROUP_ID or LECTURE_RESULTS_GROUP_ID)")
-    lines.append("/quiz_channel_id — gets a quiz channel's chat ID (forward a message from it first)")
     lines.append("/c — this list")
 
     if is_admin(update):
         lines.append("\n🔐 <b>Admin only</b>")
-        lines.append("/admincheck — confirms you're an admin")
-        lines.append("/health — bot status dashboard (users, lectures, backups, sessions, errors, uptime)")
-        lines.append("/restore — manually re-pull one system's data from its currently-pinned channel backup")
-        lines.append("/broadcast &lt;message&gt; — sends a message to every user")
-        lines.append("/backup_now — instantly refreshes every pinned backup (storage + each year's quiz index)")
-        lines.append("/quiz_list &lt;year&gt; — numbered list of every lecture (open and closed) in that year")
-        lines.append("/quiz_delete &lt;year&gt; &lt;number&gt; — removes a lecture from that year's index")
-        lines.append("/daily_module — restrict the Daily Quiz's subject pool to one module (or clear the restriction)")
+        lines.append("/admincheck")
+        lines.append("/health")
+        lines.append("/restore")
+        lines.append("/broadcast &lt;message&gt;")
+        lines.append("/ban &lt;ID&gt; &lt;hours&gt; &lt;reason&gt;")
+        lines.append("/unban &lt;ID&gt;")
+        lines.append("/backup_now")
+        lines.append("/quiz_list &lt;year&gt;")
+        lines.append("/quiz_delete &lt;year&gt; &lt;number&gt;")
+        lines.append("/daily_module")
+        lines.append("/edit_quiz, /quiz_edit")
         years_line = ", ".join(f"{y} ({year_label(y)})" for y in YEAR_ORDER)
         lines.append(f"    year keys: {years_line}")
 
@@ -6536,6 +6881,107 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await status_msg.edit_text(summary, parse_mode=ParseMode.HTML)
 
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /ban <user_id> <hours> <reason> — blocks that user from
+    using the bot for the given number of hours. What's actually saved
+    is the *unban* moment itself (banned_until, an epoch timestamp in
+    their settings — see get_ban_info), not the duration, so it's a
+    plain comparison against time.time() on every update (see
+    _ban_gate) rather than needing a scheduled unban job. A second
+    /ban on the same user just overwrites banned_until/ban_reason."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "⚠️ استخدام:\n<code>/ban ID عدد_الساعات السبب</code>\n"
+            "مثال: <code>/ban 123456789 24 سبام</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        target_id = int(args[0])
+        hours     = float(args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ الـ ID وعدد الساعات لازم يكونوا أرقام.")
+        return
+    if hours <= 0:
+        await update.message.reply_text("⚠️ عدد الساعات لازم يكون أكبر من صفر.")
+        return
+
+    reason = " ".join(args[2:])
+    until  = time.time() + hours * 3600
+
+    entry = _get_settings_entry(target_id)
+    entry["banned_until"] = until
+    entry["ban_reason"]   = reason
+    await save_settings()
+    await backup_settings_to_channel(context)
+
+    until_label = datetime.fromtimestamp(until, DAILY_QUIZ_TZ).strftime("%Y-%m-%d %I:%M %p")
+    await update.message.reply_text(
+        f"🚫 <b>{target_id}</b> اتعمله بان لمدة {hours:g} ساعة.\n"
+        f"⏰ هيترفع البان: {until_label}\n"
+        f"📝 السبب: {html.escape(reason)}",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"🚫 اتعمللك بان من البوت لمدة {hours:g} ساعة.\n"
+                f"📝 السبب: {html.escape(reason)}\n"
+                f"⏰ هيترفع البان: {until_label}"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass  # they may have blocked the bot, or never opened a DM with it — not fatal to the ban itself
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /unban <user_id> — clears banned_until/ban_reason early,
+    instead of waiting out the timer set by /ban. Safe to run on someone
+    who isn't currently banned (or whose ban already lifted on its own)
+    — it just reports that and does nothing further."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "⚠️ استخدام:\n<code>/unban ID</code>", parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ الـ ID لازم يكون رقم.")
+        return
+
+    until, _ = get_ban_info(target_id)
+    if until is None:
+        await update.message.reply_text(f"ℹ️ <b>{target_id}</b> مش متبنن أصلاً.", parse_mode=ParseMode.HTML)
+        return
+
+    entry = _get_settings_entry(target_id)
+    entry["banned_until"] = None
+    entry["ban_reason"]   = None
+    await save_settings()
+    await backup_settings_to_channel(context)
+
+    await update.message.reply_text(f"✅ اتشال البان عن <b>{target_id}</b>.", parse_mode=ParseMode.HTML)
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="✅ اتشال البان عنك — تقدر تستخدم البوت تاني.",
+        )
+    except Exception:
+        pass  # same best-effort DM as ban_cmd — not fatal if it fails
+
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
@@ -6567,22 +7013,26 @@ async def _send_achievements(context: ContextTypes.DEFAULT_TYPE, user_id: int, r
         current = ach.get(key, 0)
         label   = ACHIEVEMENT_CATEGORY_LABEL.get(key, key)
         lines.append(f"{label} ({current}/{len(tiers)})")
-        for i, (threshold, name, xp_bonus, emoji) in enumerate(tiers):
+        for i, (threshold, name, xp_bonus, emoji, quip) in enumerate(tiers):
             tier = i + 1
             if tier <= current:
+                name = _personalize_ach_text(name, user_id)
+                quip = _personalize_ach_text(quip, user_id)
                 if key == "achievement_collector":
                     lines.append(f"  ✅ {name} — x{xp_bonus} XP")
                 else:
                     lines.append(f"  ✅ {name} — {threshold}+")
+                lines.append(f"     💬 <i>{quip}</i>")
             else:
                 lines.append("  🔒 ???????? — ???")
         lines.append("")
 
     extras = ach.get("extras", {})
     lines.append(f"🌚 Extras ({sum(1 for v in extras.values() if v)}/{len(EXTRA_ACHIEVEMENTS)})")
-    for key, (name, emoji, xp_bonus, desc) in EXTRA_ACHIEVEMENTS.items():
+    for key, (name, emoji, xp_bonus, desc, quip) in EXTRA_ACHIEVEMENTS.items():
         if extras.get(key):
             lines.append(f"  ✅ {emoji} {name} — {desc}")
+            lines.append(f"     💬 <i>{_personalize_ach_text(quip, user_id)}</i>")
         else:
             lines.append("  🔒 ???????? — ????????")
 
@@ -6643,7 +7093,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
     for key, emoji in icons.items():
         tier = ach.get(key, 0)
         if tier:
-            name = ACHIEVEMENTS[key][tier - 1][1]
+            name = _personalize_ach_text(ACHIEVEMENTS[key][tier - 1][1], user_id)
             emoji = ACHIEVEMENTS[key][tier - 1][3]   # tier 5 swaps to 🪄 for "The Quizician"
             if key == "achievement_collector":
                 mult = ACHIEVEMENTS[key][tier - 1][2]
@@ -6652,7 +7102,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
                 ach_lines.append(f"  {emoji} {name} {'⭐' * tier}")
     for key, unlocked in ach.get("extras", {}).items():
         if unlocked:
-            name, emoji, _xp, _desc = EXTRA_ACHIEVEMENTS[key]
+            name, emoji, _xp, _desc, _quip = EXTRA_ACHIEVEMENTS[key]
             ach_lines.append(f"  {emoji} {name}")
 
     ach_text = "\n".join(ach_lines) if ach_lines else "  لسه مفيش إنجازات"
@@ -6713,13 +7163,14 @@ async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
     else:
         nickname = get_nickname(user_id)
         nick_line = f"<b>{html.escape(nickname)}</b>" if nickname else "<i>مش متسجل — دوس تحت تحطه</i>"
+        yc_line = html.escape(year_class_label(get_year_class(user_id)))
         spaced_rep_on = get_spaced_repetition_enabled(user_id)
         auto_next_on  = get_auto_next_enabled(user_id)
         text = (
             f"⚙️ <b>الإعدادات</b>\n\n"
             f"👤 الاسم المستعار: {nick_line}\n"
             f"⚠️ استخدم اسم لائق 🙊 — هو اللي هيظهر في الـ Leaderboard وقدام زمايلك.\n\n"
-            "📚 <b>Year/Class</b>: سنتك/فرقتك — بيتحدد بيها الـ Daily Quiz والـ Leaderboard بتوعك.\n"
+            f"📚 <b>Year/Class</b>: {yc_line}\n"
             "⏭️ <b>Auto-Next</b>: الأسئلة تتبعت واحد واحد بدل ما تتبعت كلها مرة واحدة.\n"
             "🔀 <b>Randomize</b>: ترتيب الأسئلة يبقى عشوائي كل مرة.\n"
             "🔁 <b>Spaced Repetition</b>: بيعيد سؤال غلطت فيه بعد شوية عشان يثبت في ذاكرتك."
@@ -6743,24 +7194,22 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reset_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: wipe all analytics data locally and delete the pinned
-    backup in the analytics group. Use when you need a clean slate."""
-    global _analytics_backup_msg_id, _analytics_dirty
+    """Admin-only: asks for confirmation, then wipes all analytics data
+    locally and deletes the pinned backup in the analytics group. The
+    actual wipe happens in button_handler's reset_analytics_yes branch
+    once the admin taps to confirm — this is irreversible, unlike most
+    other admin actions here."""
     if update.effective_chat.id != ADMIN_ID:
         return
-    ANALYTICS.clear()
-    await save_analytics()
-    _analytics_dirty = False   # disk now matches memory — nothing left for the periodic flush to do
-    if _analytics_backup_msg_id and ANALYTICS_GROUP_ID:
-        try:
-            await context.bot.delete_message(
-                chat_id=ANALYTICS_GROUP_ID,
-                message_id=_analytics_backup_msg_id,
-            )
-        except Exception:
-            pass
-    _analytics_backup_msg_id = None
-    await update.message.reply_text("🗑 Analytics wiped — local file cleared and backup deleted.")
+    await update.message.reply_text(
+        f"⚠️ <b>متأكد إنك عايز تمسح كل الـ Analytics؟</b>\n\n"
+        f"دلوقتي فيه بيانات <b>{len(ANALYTICS)}</b> يوزر، والعملية دي مش هترجع تاني.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 أيوه، امسح كل حاجة", callback_data="reset_analytics_yes")],
+            [InlineKeyboardButton("🔙 لأ، سيبها", callback_data="reset_analytics_no")],
+        ]),
+    )
 
 async def restore_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: manually re-pull analytics.json from the pinned backup
@@ -6866,9 +7315,10 @@ async def _post_init(app):
     if app.job_queue is None:
         print(
             "⚠️ No JobQueue available — periodic backup reconciliation, the "
-            "analytics flush, stale-session cleanup, the Daily Quiz push, and "
-            "the hourly Zikr reminder are disabled. Local analytics from poll "
-            "answers will only hit disk on the next immediate-save call site "
+            "analytics flush, stale-session cleanup, the Daily Quiz push, "
+            "the hourly Zikr reminder, and the daily zipped backup export "
+            "are disabled. Local analytics from poll answers will only hit "
+            "disk on the next immediate-save call site "
             "(restore/reset/import) or on a clean shutdown, not every 60s. "
             "Install with: pip install \"python-telegram-bot[job-queue]\""
         )
@@ -6886,7 +7336,11 @@ async def _post_init(app):
             _daily_quiz_push_job, time=dt_time(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, tzinfo=DAILY_QUIZ_TZ),
         )
         app.job_queue.run_repeating(
-            _zikr_push_job, interval=3600, first=3600,
+            _zikr_push_job, interval=3600, first=_next_top_of_hour_delay(DAILY_QUIZ_TZ),
+        )
+        app.job_queue.run_daily(
+            _daily_backup_export_job,
+            time=dt_time(hour=DAILY_BACKUP_EXPORT_HOUR, minute=DAILY_BACKUP_EXPORT_MIN, tzinfo=DAILY_QUIZ_TZ),
         )
 
 async def _flush_analytics_job(context: ContextTypes.DEFAULT_TYPE):
@@ -7203,6 +7657,73 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 app.add_error_handler(global_error_handler)
 
+async def _ban_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs in an earlier handler group than everything else (see the
+    group=-1 registrations right below), so it sees every update first.
+    A currently-banned user (get_ban_info/is_banned) gets a short notice
+    with their remaining time + reason instead of whatever they tried to
+    do, and ApplicationHandlerStop keeps the update from ever reaching
+    the real handlers in group 0. A user whose ban has lifted (or who
+    was never banned) just falls through untouched."""
+    user = update.effective_user
+    if not user:
+        return
+    until, reason = get_ban_info(user.id)
+    if until is None:
+        return
+    hours_left = (until - time.time()) / 3600
+    text = (
+        f"🚫 انت متبنن من البوت لسه.\n"
+        f"⏰ هيترفع البان بعد {hours_left:.1f} ساعة.\n"
+        f"📝 السبب: {html.escape(reason or '—')}"
+    )
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text(text)
+    raise ApplicationHandlerStop
+
+app.add_handler(MessageHandler(filters.ALL, _ban_gate), group=-1)
+app.add_handler(CallbackQueryHandler(_ban_gate), group=-1)
+
+async def _onboarding_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Same group=-1 pattern as _ban_gate, registered right after it, so
+    it also sees every update before the real handlers in group 0.
+    Nickname + year/class are now mandatory before ANYTHING else works.
+    Explicitly let through: /start itself (so onboarding is always
+    reachable), the nickname reply while AWAITING_NICKNAME is set (so
+    the text handler can actually save it), and the onboarding
+    year/class taps (onboard_yc:*, onboard_how, onboard_go) — every
+    other update gets a nudge back to /start instead of its real
+    handler. Channel posts (no effective_user) are never gated, same as
+    _ban_gate."""
+    user = update.effective_user
+    if not user:
+        return
+    real_uid = user.id
+
+    if update.message and update.message.text and update.message.text.startswith("/start"):
+        return
+    if update.message and AWAITING_NICKNAME.get(real_uid):
+        return
+    if update.callback_query:
+        data = update.callback_query.data or ""
+        if data.startswith("onboard_yc:") or data in ("onboard_how", "onboard_go"):
+            return
+
+    if get_nickname(real_uid) is not None and get_year_class(real_uid) in YEAR_CLASS_NUMBER:
+        return
+
+    text = "⚠️ لازم تعمل /start الأول وتسجل اسمك وسنتك/فرقتك قبل أي حاجة تانية."
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text(text)
+    raise ApplicationHandlerStop
+
+app.add_handler(MessageHandler(filters.ALL, _onboarding_gate), group=-1)
+app.add_handler(CallbackQueryHandler(_onboarding_gate), group=-1)
+
 app.add_handler(MessageHandler(
     filters.StatusUpdate.PINNED_MESSAGE & filters.Chat(BACKUP_CHAT_IDS),
     delete_pin_service_message,
@@ -7217,21 +7738,21 @@ app.add_handler(CommandHandler("admincheck",     admincheck_cmd))
 app.add_handler(CommandHandler("health",         health_cmd))
 app.add_handler(CommandHandler("restore",        restore_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
-# Storage group setup helper
+app.add_handler(CommandHandler("ban",            ban_cmd))
+app.add_handler(CommandHandler("unban",          unban_cmd))
 app.add_handler(CommandHandler("mystats",           mystats_cmd))
 app.add_handler(CommandHandler("restore_analytics", restore_analytics_cmd))
 app.add_handler(CommandHandler("import_analytics",  import_analytics_cmd))
 app.add_handler(CommandHandler("reset_analytics",   reset_analytics_cmd))
-app.add_handler(CommandHandler("storage_id",     storage_id_cmd))
 app.add_handler(CommandHandler("backup_now",     backup_now_cmd))
 # Quiz channel
-app.add_handler(CommandHandler("quiz_channel_id", quiz_channel_id_cmd))
 app.add_handler(CommandHandler("quiz",            quiz_lectures_cmd))
 app.add_handler(CommandHandler("daily_module",     daily_module_cmd))
 app.add_handler(CommandHandler("time",             time_cmd))
 app.add_handler(CommandHandler("quiz_list",       quiz_list_cmd))
 app.add_handler(CommandHandler("quiz_delete",     quiz_delete_cmd))
 app.add_handler(CommandHandler("edit_quiz",       edit_quiz_cmd))
+app.add_handler(CommandHandler("quiz_edit",       edit_quiz_cmd))
 
 # Poll handler before text handler (forwarded OR own quiz polls) —
 # excludes the quiz channel, which has its own dedicated handler below.
