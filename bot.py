@@ -73,10 +73,15 @@ from zoneinfo import ZoneInfo
 #          (backup_quiz_to_channel) and contains quiz_index + quiz_state +
 #          quiz_poll_status for that year — this is what MISTAKES BANK
 #          entries resolve against.
-# 2212   STATE (in-memory dicts: LECTURE_SESSIONS, QUIZ_POLL_STATUS, etc. —
-#          all purely in-memory, NOT persisted/restored across a restart;
-#          a crash mid-finals-night silently drops everyone's active
-#          quiz/lecture session)
+# 2212   STATE (in-memory dicts: LECTURE_SESSIONS, QUIZ_POLL_STATUS, etc.
+#          QUIZ_POLL_STATUS is persisted per-year alongside QUIZ_INDEX/
+#          QUIZ_STATE — see QUIZ CHANNELS above. LECTURE_SESSIONS,
+#          DAILY_QUIZ_SESSIONS, and MISTAKES_RETAKE_SESSIONS are now also
+#          persisted — see SESSION PERSISTENCE (grep the banner) for the
+#          local-file + SESSIONS_GROUP_ID channel backup, restored in
+#          _post_init. A crash within the ~30s SESSIONS_BACKUP_MIN_INTERVAL
+#          window can still lose that window's worth of session progress,
+#          same accepted risk shape as the analytics flush.)
 # 2238   CONSTANTS
 # 2247   PER-USER SERIALIZATION — @_serialize_per_user decorator, applied
 #          to handle_poll_answer and button_handler. Needed because
@@ -348,6 +353,16 @@ ERROR_LOG_GROUP_ID = -1004333428419
 # edited to show both sides with fresh Reply/Close buttons. A plain group
 # the bot posts to — not a backup destination.
 REPORT_ISSUE_GROUP_ID = -1004331095016
+
+# ── Dedicated group for LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/
+# MISTAKES_RETAKE_SESSIONS JSON backups ──────────────────────────────
+# Unlike every group above, this backs up data that changes on almost
+# every answered question across every active user, so it deletes the
+# previous pinned message on each new upload instead of keeping every
+# backup forever (see the SESSION PERSISTENCE section for the full
+# reasoning). Set up the same way as the others: create a group, add
+# the bot as admin, add @userinfobot to it, paste the ID it replies with.
+SESSIONS_GROUP_ID = -1004499530524
 
 # ── Curriculum structure for the quiz channels ─────────────────────
 # Each year in YEARS (above) has its own "modules" dict in this same shape.
@@ -1184,7 +1199,7 @@ RESTORE_RETRY_DELAY_BASE  = 4   # seconds; multiplied by attempt number (4s, the
 # fresh/empty local file over the good backup still sitting in the
 # channel. Fixed by a restart once the underlying Telegram/network issue
 # clears (or manually via /restore_analytics etc. for analytics).
-RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "lecture_results": True, "mistakes_bank": True, "report_threads": True}
+RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "lecture_results": True, "mistakes_bank": True, "report_threads": True, "sessions": True}
 RESTORE_OK.update({f"quiz_{y}": True for y in YEARS})  # one flag per year's quiz index
 
 async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_found_hint: str | None = None):
@@ -2208,10 +2223,14 @@ async def _resolve_mistakes(context: ContextTypes.DEFAULT_TYPE, entries: list) -
 # ── Per-day, per-year shared Daily Quiz questions ────────────────────
 # Built once per (year, day) — the first user of that year to tap Daily
 # Quiz that day pays the build cost, everyone else in that year that day
-# just reads the cached result. Deliberately RAM-only, same tradeoff as
-# DAILY_QUIZ_LEADERBOARD: a restart mid-day just regenerates that year's
-# questions (a small chance of overlap with what's already been played),
-# which is harmless for a casual daily feature.
+# just reads the cached result. Persisted through the same session-
+# persistence channel as LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/
+# MISTAKES_RETAKE_SESSIONS (see _sessions_snapshot / _restore_sessions_dict
+# / SESSION PERSISTENCE below) so a mid-day restart or redeploy doesn't
+# hand out a different question set than whatever's already been played
+# that day — restore just loads the raw values back in and lets
+# _ensure_daily_quiz_questions_fresh's date check below discard them
+# normally once the day actually rolls over.
 _DAILY_QUIZ_QUESTIONS_DATE: str | None = None
 _DAILY_QUIZ_QUESTIONS: dict[str, list] = {}   # year -> [question dict, ...] (up to DAILY_QUIZ_TOTAL_COUNT)
 
@@ -2261,6 +2280,12 @@ async def get_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str
     _ensure_daily_quiz_questions_fresh()
     if year not in _DAILY_QUIZ_QUESTIONS:
         _DAILY_QUIZ_QUESTIONS[year] = await _build_daily_quiz_questions(context, year)
+        # Persist right away rather than waiting for the next periodic
+        # sessions tick — this is the one moment (first build of the day
+        # for this year) a redeploy landing seconds later would otherwise
+        # regenerate a different set. See SESSION PERSISTENCE below.
+        await _flush_sessions_if_changed()
+        await backup_sessions_to_channel(context)
     return _DAILY_QUIZ_QUESTIONS[year]
 
 async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
@@ -2275,21 +2300,24 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
         session["current_delivered_at"] = None
         return False
     q = session["queue"].pop(0)
+    session["delivered_count"] = session.get("delivered_count", 0) + 1
     timer_seconds = get_question_timer_seconds(user_id)
     try:
         msg = await context.bot.send_poll(
-            chat_id=user_id, question=q["question"], options=q["options"],
+            chat_id=user_id, question=_numbered_question(q["question"], session["delivered_count"]), options=q["options"],
             type="quiz", correct_option_id=q["correct_option_id"], is_anonymous=False,
             explanation=(q.get("explanation") or None),
             open_period=(timer_seconds or None),
         )
     except Exception as e:
         print(f"Couldn't send daily quiz question: {e}")
+        session["delivered_count"] -= 1   # this send never went out — don't burn a number on it
         return await _deliver_next_daily_question(context, user_id, session)   # try the next one
     session["current_poll_id"]    = msg.poll.id
     session["current_correct_id"] = q["correct_option_id"]
     session["current_message_id"] = msg.message_id
     session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
+    _schedule_question_timeout(context, session.get("kind", "daily"), user_id, msg.poll.id, timer_seconds)
     return True
 
 async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None, delivered_at: float | None = None):
@@ -2368,8 +2396,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
             ach = _check_extra_achievement(user_entry, "basmagy")
             if ach:
                 daily_events.append(ach)
-        from datetime import timezone
-        now_hour = datetime.now(timezone.utc).hour
+        now_hour = datetime.now(DAILY_QUIZ_TZ).hour
         if 2 <= now_hour < 5:
             ach = _check_extra_achievement(user_entry, "insomniac")
             if ach:
@@ -2529,7 +2556,7 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
     session = {
         "queue": list(questions), "current_poll_id": None, "current_correct_id": None,
         "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
-        "year": year_class,
+        "year": year_class, "kind": "daily",
     }
     DAILY_QUIZ_SESSIONS[user_id] = session
 
@@ -2550,8 +2577,15 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
 # and job_queue.run_repeating in MAIN) to every user who's opted in via
 # Settings -> More Settings -> Hourly Zikr. Purely a devotional nudge,
 # no interaction/state of its own — unlike the Daily Quiz push, there's
-# no button or follow-up here.
-ZIKR_TEXT = "📿 سبحان الله، والحمدُ لله، ولا إله إلا اللهُ، واللهُ أكبرُ، ولا حولَ ولا قوةَ إلا بالله. ❤️"
+# no button or follow-up here. One line is picked at random from the
+# pool each time _zikr_push_job fires, so it's not the same line every
+# hour.
+ZIKR_POOL = [
+    "📿 سبحان الله، والحمدُ لله، ولا إله إلا اللهُ، واللهُ أكبرُ، ولا حولَ ولا قوةَ إلا بالله. ❤️",
+    "📿 سُبْحَانَ اللهِ وَبِحَمْدِهِ، سُبْحَانَ اللهِ الْعَظِيمِ. ❤️",
+    "📿 أَسْتَغْفِرُ اللهَ الَّذِي لَا إِلٰهَ إِلَّا هُوَ، الْحَيُّ الْقَيُّومُ، وَأَتُوبُ إِلَيْهِ. ❤️",
+    "📿 اللَّهُمَّ صَلِّ وَسَلِّمْ وَبَارِكْ عَلَى نَبِيِّنَا مُحَمَّدٍ. ❤️",
+]
 
 def _next_top_of_hour_delay(tz: ZoneInfo) -> float:
     """Seconds from now until the next top of the hour (e.g. 1:00, 2:00,
@@ -2563,15 +2597,18 @@ def _next_top_of_hour_delay(tz: ZoneInfo) -> float:
     return (next_hour - now).total_seconds()
 
 async def _zikr_push_job(context: ContextTypes.DEFAULT_TYPE):
-    """Hourly push (see job_queue.run_repeating in MAIN): the same fixed
-    zikr line to every user who's opted in (get_zikr_enabled). Skips
-    sleeping users the same way the Daily Quiz push skips opted-out ones —
-    no reason to nudge someone who's muted the bot."""
+    """Hourly push (see job_queue.run_repeating in MAIN): a random zikr
+    line from ZIKR_POOL, picked once per firing (so it's the same line
+    for everyone that hour, but varies hour to hour) to every user who's
+    opted in (get_zikr_enabled). Skips sleeping users the same way the
+    Daily Quiz push skips opted-out ones — no reason to nudge someone
+    who's muted the bot."""
+    text = random.choice(ZIKR_POOL)
     for uid in list(USERS):
         if uid in SLEEPING or not get_zikr_enabled(uid):
             continue
         try:
-            await context.bot.send_message(chat_id=uid, text=ZIKR_TEXT)
+            await context.bot.send_message(chat_id=uid, text=text)
         except Exception:
             pass   # blocked the bot, deactivated account, etc. — skip silently, same as broadcast_cmd
 
@@ -2695,6 +2732,7 @@ async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int
     session = {
         "queue": questions, "current_poll_id": None, "current_correct_id": None,
         "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
+        "kind": "retake",
     }
     MISTAKES_RETAKE_SESSIONS[user_id] = session
 
@@ -3197,6 +3235,19 @@ AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is wai
 PENDING_QUIZ_DELETE    = {}    # admin_id -> (year, lecture_key), set by /quiz_delete while waiting on
                                 # the confirm/cancel tap (see quizdel_yes/quizdel_no in button_handler)
 
+# ── /broadcast support ────────────────────────────────────────────
+# See the BROADCAST section (grep the banner) further down for the full
+# interactive composer this backs — audience picker, message entry,
+# live preview, estimated recipient count, then SEND with a progress
+# bar. BROADCAST_DRAFTS holds the in-progress composition per admin
+# (only one at a time each); AWAITING_BROADCAST_MESSAGE mirrors the
+# AWAITING_NICKNAME pattern above for capturing the next free-text
+# message as the broadcast body. Deliberately RAM-only, same as every
+# other AWAITING_*/PENDING_* dict here — a restart mid-compose just
+# means starting the /broadcast draft over, which is harmless.
+BROADCAST_DRAFTS            = {}    # admin_id -> {"audience": "all"|"y1"|"y2"|"y3"|"active"|"inactive", "text": str|None}
+AWAITING_BROADCAST_MESSAGE  = {}    # admin_id -> True, while waiting for the next text message to become the broadcast body
+
 # ── /edit_quiz support ────────────────────────────────────────────
 # QUIZ_INSERT_AFTER[year][lecture_key] = message_id (or None), set right
 # before an admin is sent back into the quiz channel to add question(s)
@@ -3322,6 +3373,340 @@ async def restore_report_threads_from_channel(app):
         print(f"Restored report threads: {len(REPORT_THREADS)} thread(s).")
 
     await _run_restore_with_retries(app, "report_threads", "Report threads", _do)
+
+# ═══════════════════════════════════════════════════════════════
+# SESSION PERSISTENCE — LECTURE_SESSIONS / DAILY_QUIZ_SESSIONS /
+# MISTAKES_RETAKE_SESSIONS were previously purely in-memory (see the file
+# index note at the top of this file) — a restart mid-quiz dropped every
+# active session, which is exactly the "الجلسة دي اتقفلت" path in
+# handle_poll_answer. This mirrors REPORT_THREADS' persistence pattern
+# (local JSON + a pinned backup in its own channel, restored on startup)
+# but tuned for much hotter, throwaway data:
+#
+#   - Change detection is a content hash taken once per tick, not a
+#     dirty flag set at each mutation site. Sessions are mutated from
+#     many call sites across lecture/daily-quiz/mistakes-retake delivery
+#     (_deliver_next_lecture_question, _advance_lecture_session,
+#     _deliver_next_daily_question, _advance_daily_quiz_session, and
+#     their mistakes-retake counterparts, plus the two session-creation
+#     sites) — flagging every one individually risks silently missing a
+#     spot as the file changes. A hash comparison of the whole snapshot
+#     costs one json.dumps per tick, which is cheap at this data's size.
+#   - The channel backup is throttled to once every
+#     SESSIONS_BACKUP_MIN_INTERVAL seconds (30s), same idea as every
+#     other backup_*_to_channel — but unlike analytics/settings/
+#     lecture_results/mistakes_bank/report_threads, which now keep every
+#     backup ever taken (see backup_analytics_to_channel's comment), this
+#     ONE deletes the previous pinned message on each new upload. A 30s
+#     cadence keeping full history would post thousands of documents a
+#     day for data nobody needs a history of.
+#   - A session older than SESSIONS_MAX_AGE_SECONDS (48h) is dropped on
+#     restore rather than revived — see _cleanup_stale_sessions_job's own
+#     6h idle-based cleanup, which already reclaims abandoned sessions
+#     during normal operation; this 48h check is just what keeps a
+#     restored snapshot from ever reviving something that old.
+#   - _sessions_stale_sweep_job additionally re-runs that same 48h check
+#     against the LIVE in-memory dicts every 48h, as an independent
+#     backstop in case _cleanup_stale_sessions_job's hourly job was ever
+#     down for an extended stretch (e.g. a JobQueue outage) — it only
+#     removes entries already past 48h old, never active sessions, so it
+#     can't interrupt anyone mid-quiz.
+# ═══════════════════════════════════════════════════════════════
+SESSIONS_FILE                = "sessions.json"
+SESSIONS_BACKUP_MARKER       = "🧩 QUIZICIAN_SESSIONS_BACKUP"
+SESSIONS_BACKUP_MIN_INTERVAL = 30          # seconds
+SESSIONS_MAX_AGE_SECONDS     = 48 * 3600   # 48 hours
+
+def _sessions_snapshot() -> dict:
+    """A plain-dict, JSON-safe snapshot of all three session stores.
+    Int keys (user_id, and poll_status_by_mid's message_id) become
+    strings here — see _restore_sessions_dict for the reverse. Shallow
+    per-session copies only (not a deep copy of the whole store): each
+    session dict is replaced wholesale by its owning function rather than
+    mutated field-by-field across an await, so this is safe against the
+    same kind of mid-serialization mutation save_analytics's comment
+    warns about — there's no in-place list/dict mutation left exposed
+    once a session is captured here except poll_status_by_mid, which is
+    built once at session start and never mutated afterward."""
+    def _clean(sessions: dict) -> dict:
+        out = {}
+        for uid, session in sessions.items():
+            s = dict(session)
+            if "poll_status_by_mid" in s:
+                s["poll_status_by_mid"] = {str(k): v for k, v in s["poll_status_by_mid"].items()}
+            if "sr_asked" in s:
+                # Spaced-repetition tracking (see _maybe_deliver_spaced_
+                # repetition) — a live set, not JSON-safe as-is. json.dumps
+                # raises TypeError on a bare set with no try/except around
+                # it anywhere in this chain (_flush_sessions_if_changed /
+                # backup_sessions_to_channel), so this isn't just cosmetic:
+                # left unconverted, every tick after the first lecture
+                # session with a spaced-repetition miss would throw here
+                # and silently break session persistence entirely for
+                # everyone, not just that one user — sort() keeps it
+                # deterministic in the change-detection JSON (see
+                # _last_sessions_snapshot_json above).
+                s["sr_asked"] = sorted(s["sr_asked"])
+            out[str(uid)] = s
+        return out
+    return {
+        "lecture_sessions":         _clean(LECTURE_SESSIONS),
+        "daily_quiz_sessions":      _clean(DAILY_QUIZ_SESSIONS),
+        "mistakes_retake_sessions": _clean(MISTAKES_RETAKE_SESSIONS),
+        # Shared per-day Daily Quiz question sets — see the "Per-day,
+        # per-year shared Daily Quiz questions" section above for why
+        # these ride along in the same snapshot/backup as the sessions.
+        "daily_quiz_questions_date": _DAILY_QUIZ_QUESTIONS_DATE,
+        "daily_quiz_questions":      _DAILY_QUIZ_QUESTIONS,
+    }
+
+def _session_age_seconds(session: dict) -> float:
+    """Best-effort age for the 48h checks above. Lecture sessions have
+    started_at; Daily Quiz / mistakes-retake sessions don't, so this
+    falls back to current_delivered_at (when the in-flight question was
+    sent). If neither is present, treat it as already-ancient rather
+    than immortal, so a malformed entry can never survive indefinitely."""
+    anchor = session.get("started_at") or session.get("current_delivered_at")
+    if anchor is None:
+        return SESSIONS_MAX_AGE_SECONDS + 1
+    return time.time() - anchor
+
+_last_sessions_snapshot_json: str | None = None   # change-detection only, never persisted itself
+
+async def _flush_sessions_if_changed() -> None:
+    """Writes sessions.json locally only if the snapshot actually changed
+    since the last tick. Called every SESSIONS_BACKUP_MIN_INTERVAL seconds
+    by _sessions_backup_job, and once more on a clean shutdown."""
+    global _last_sessions_snapshot_json
+    snapshot = _sessions_snapshot()
+    as_json  = json.dumps(snapshot, sort_keys=True)
+    if as_json == _last_sessions_snapshot_json:
+        return
+    _last_sessions_snapshot_json = as_json
+    await asyncio.to_thread(_atomic_write_json, SESSIONS_FILE, snapshot, indent=2, ensure_ascii=False)
+
+def _restore_sessions_dict(raw: dict) -> None:
+    """Populates LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS
+    in place from a loaded snapshot (channel backup or local file),
+    dropping anything already past SESSIONS_MAX_AGE_SECONDS. Also
+    restores the shared per-day Daily Quiz question cache (see the
+    "Per-day, per-year shared Daily Quiz questions" section) — loaded
+    as-is, with no date check here, since _ensure_daily_quiz_questions_fresh
+    already discards it the next time it's read if the date has since
+    rolled over."""
+    global _DAILY_QUIZ_QUESTIONS_DATE, _DAILY_QUIZ_QUESTIONS
+    targets = {
+        "lecture_sessions":         LECTURE_SESSIONS,
+        "daily_quiz_sessions":      DAILY_QUIZ_SESSIONS,
+        "mistakes_retake_sessions": MISTAKES_RETAKE_SESSIONS,
+    }
+    restored, dropped_stale = 0, 0
+    for key, target in targets.items():
+        target.clear()
+        for uid_str, session in raw.get(key, {}).items():
+            if _session_age_seconds(session) > SESSIONS_MAX_AGE_SECONDS:
+                dropped_stale += 1
+                continue
+            if "poll_status_by_mid" in session:
+                session["poll_status_by_mid"] = {int(k): v for k, v in session["poll_status_by_mid"].items()}
+            if "sr_asked" in session:
+                session["sr_asked"] = set(session["sr_asked"])   # reverse of the sorted-list conversion in _sessions_snapshot's _clean
+            target[int(uid_str)] = session
+            restored += 1
+    _DAILY_QUIZ_QUESTIONS_DATE = raw.get("daily_quiz_questions_date")
+    _DAILY_QUIZ_QUESTIONS      = raw.get("daily_quiz_questions") or {}
+    print(f"Restored {restored} session(s) ({dropped_stale} dropped as stale), "
+          f"daily quiz questions for {len(_DAILY_QUIZ_QUESTIONS)} year(s) dated {_DAILY_QUIZ_QUESTIONS_DATE}.")
+
+def load_sessions() -> dict | None:
+    if os.path.exists(SESSIONS_FILE):
+        with open(SESSIONS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+_sessions_backup_msg_id: int | None = None
+_last_sessions_backup_at: float = 0.0
+
+async def backup_sessions_to_channel(context) -> None:
+    """Same shape as every other backup_*_to_channel, but throttled AND —
+    unlike the others — deletes the previous pinned backup instead of
+    keeping it forever. See the section banner above for why."""
+    global _sessions_backup_msg_id, _last_sessions_backup_at
+    if not SESSIONS_GROUP_ID:
+        return
+    if not RESTORE_OK.get("sessions", True):
+        print("SESSIONS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if now - _last_sessions_backup_at < SESSIONS_BACKUP_MIN_INTERVAL:
+        return
+    _last_sessions_backup_at = now
+    data = json.dumps(_sessions_snapshot(), indent=2, ensure_ascii=False).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=SESSIONS_GROUP_ID,
+            document=InputFile(BytesIO(data), filename=_backup_filename("sessions.json")),
+            caption=SESSIONS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("SESSIONS BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=SESSIONS_GROUP_ID, message_id=sent.message_id, disable_notification=True,
+        )
+    except Exception as e:
+        print("SESSIONS PIN ERROR:", e)
+    old_msg_id = _sessions_backup_msg_id
+    _sessions_backup_msg_id = sent.message_id
+    if old_msg_id and old_msg_id != sent.message_id:
+        try:
+            await context.bot.delete_message(chat_id=SESSIONS_GROUP_ID, message_id=old_msg_id)
+        except Exception:
+            pass   # already gone, too old to delete, etc. — fine either way, next tick re-syncs
+
+async def restore_sessions_from_channel(app) -> None:
+    global _sessions_backup_msg_id
+    if not SESSIONS_GROUP_ID:
+        return
+
+    async def _do():
+        global _sessions_backup_msg_id
+        chat   = await app.bot.get_chat(SESSIONS_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document or (pinned.caption or "") != SESSIONS_BACKUP_MARKER:
+            return
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        _restore_sessions_dict(restored)
+        await _flush_sessions_if_changed()
+        _sessions_backup_msg_id = pinned.message_id
+
+    await _run_restore_with_retries(app, "sessions", "Sessions", _do)
+
+async def _sessions_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick, registered alongside every other job in _post_init:
+    flushes sessions.json locally if changed, then pushes the channel
+    backup (itself separately throttled to SESSIONS_BACKUP_MIN_INTERVAL)."""
+    await _flush_sessions_if_changed()
+    await backup_sessions_to_channel(context)
+
+SESSIONS_STALE_SWEEP_INTERVAL = 48 * 3600  # seconds
+
+async def _sessions_stale_sweep_job(context: ContextTypes.DEFAULT_TYPE):
+    """Independent backstop alongside _cleanup_stale_sessions_job's normal
+    6h idle-based cleanup — see the section banner above. Only removes
+    entries already older than SESSIONS_MAX_AGE_SECONDS; never touches an
+    active session, so this can't interrupt anyone mid-quiz."""
+    removed = 0
+    for sessions in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS):
+        for user_id, session in list(sessions.items()):
+            if _session_age_seconds(session) > SESSIONS_MAX_AGE_SECONDS:
+                sessions.pop(user_id, None)
+                removed += 1
+    if removed:
+        print(f"SESSIONS — 48h stale sweep removed {removed} session(s).")
+        await _flush_sessions_if_changed()
+        await backup_sessions_to_channel(context)
+
+# ═══════════════════════════════════════════════════════════════
+# QUESTION TIMEOUT — unsticking a timed quiz nobody's answering
+# ═══════════════════════════════════════════════════════════════
+# Auto-next delivery (Daily Quiz / lecture-auto / mistakes-retake /
+# wrong-answer-retake — anywhere a single question is in flight at a
+# time via session["current_poll_id"]) only ever advances from
+# handle_poll_answer, which only fires when the user actually taps an
+# option. A timed question's open_period makes Telegram auto-close the
+# poll once it expires, but Telegram never tells the bot "nobody
+# answered" — so with nothing else in place, a person who lets a timer
+# run out just leaves their own quiz stuck forever, waiting on a
+# poll_answer update that's never coming.
+#
+# The fix: _schedule_question_timeout books a one-off job a couple of
+# seconds after the question's own open_period should have elapsed. If
+# it's still the question the session is waiting on when that job fires
+# (the person hasn't answered — handle_poll_answer would have moved
+# current_poll_id on if they had), _handle_question_timeout treats it as
+# a miss: the first one in a row is skipped exactly like a wrong answer
+# and the quiz carries on as normal. A SECOND miss in a row instead
+# pauses the session (rather than silently auto-skipping through
+# whatever's left) and asks the person whether to resume or abandon it —
+# see the qresume:/qabandon: handlers in button_handler.
+#
+# Batch-mode lecture sessions (every question sent up front, answerable
+# in any order) have no single "current" question to time out this way,
+# so this deliberately does nothing there — see the mode=="batch" check
+# below.
+QUESTION_TIMEOUT_GRACE_SECONDS = 2   # buffer past the timer's own open_period, so we're never racing an answer landing right as Telegram auto-closes the poll
+
+_SESSION_STORE_BY_KIND = {
+    "daily":   DAILY_QUIZ_SESSIONS,
+    "retake":  MISTAKES_RETAKE_SESSIONS,
+    "lecture": LECTURE_SESSIONS,
+}
+_QUIZ_KIND_LABEL = {"daily": "Daily Quiz", "retake": "Retake", "lecture": "Lecture"}
+
+def _schedule_question_timeout(context: ContextTypes.DEFAULT_TYPE, kind: str, user_id: int, poll_id: str, timer_seconds: int | None) -> None:
+    """Call right after sending a timed poll as part of single-question
+    auto-next delivery. No-op if the question isn't timed (timer_seconds
+    falsy) or there's no JobQueue to schedule against."""
+    if not timer_seconds or context.job_queue is None:
+        return
+    context.job_queue.run_once(
+        _question_timeout_job, when=timer_seconds + QUESTION_TIMEOUT_GRACE_SECONDS,
+        data={"kind": kind, "user_id": user_id, "poll_id": poll_id},
+        name=f"qtimeout:{kind}:{user_id}:{poll_id}",
+    )
+
+async def _question_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    d = context.job.data
+    await _handle_question_timeout(context, d["kind"], d["user_id"], d["poll_id"])
+
+async def _advance_session_for_kind(context: ContextTypes.DEFAULT_TYPE, kind: str, user_id: int, session: dict, is_correct: bool) -> None:
+    """Dispatches to the right advance function for this session's kind,
+    reading the pending question's own message_id/mid/delivered_at
+    straight off the session — the same way handle_poll_answer's three
+    branches already do for a real answer, just with is_correct forced
+    by the caller (used here to skip a timed-out question as wrong)."""
+    message_id   = session.get("current_message_id")
+    delivered_at = session.get("current_delivered_at")
+    if kind == "daily":
+        await _advance_daily_quiz_session(context, user_id, session, is_correct, message_id, delivered_at)
+    elif kind == "retake":
+        await _advance_mistakes_retake_session(context, user_id, session, is_correct, message_id, delivered_at)
+    elif kind == "lecture":
+        await _advance_lecture_session(context, user_id, session, is_correct, message_id, session.get("current_mid"), delivered_at)
+
+async def _handle_question_timeout(context: ContextTypes.DEFAULT_TYPE, kind: str, user_id: int, poll_id: str) -> None:
+    store   = _SESSION_STORE_BY_KIND.get(kind)
+    session = store.get(user_id) if store is not None else None
+    if not session or session.get("current_poll_id") != poll_id:
+        return   # already answered, session finished/replaced/abandoned, or a stale job surviving a restart
+    if session.get("mode") == "batch":
+        return   # no single "current" question to time out in batch mode — see section banner above
+
+    session["timeout_streak"] = session.get("timeout_streak", 0) + 1
+    if session["timeout_streak"] == 1:
+        await _advance_session_for_kind(context, kind, user_id, session, is_correct=False)
+        return
+
+    # Second consecutive miss — pause instead of skipping again, so an
+    # absent user doesn't just get auto-skipped through their whole quiz
+    # unattended.
+    session["paused"] = True
+    label = _QUIZ_KIND_LABEL.get(kind, "Quiz")
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="It seems you have stopped quizzing, do wish to abandon the current session? (Quizzy will be sad)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"▶️ Resume {label}", callback_data=f"qresume:{kind}")],
+                [InlineKeyboardButton(f"🥀 Abandon {label}", callback_data=f"qabandon:{kind}")],
+            ]),
+        )
+    except Exception:
+        pass
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -3493,6 +3878,27 @@ def split_question_for_telegram(question: str):
     if len(overflow) > TELEGRAM_DESC_LIMIT:
         overflow = overflow[:TELEGRAM_DESC_LIMIT - 1] + "…"
     return main, overflow
+
+def _prefixed_question(question: str, prefix: str) -> str:
+    """Prepends prefix to a question, truncating the question itself
+    (never the prefix) if the combination would exceed Telegram's poll
+    question limit — shared by _numbered_question (quiz sequence
+    numbers) and the spaced-repetition re-ask's '🔁 Review:' tag."""
+    if len(prefix) + len(question) <= TELEGRAM_Q_LIMIT:
+        return prefix + question
+    return prefix + question[:TELEGRAM_Q_LIMIT - len(prefix) - 1].rstrip() + "…"
+
+def _numbered_question(question: str, number: int) -> str:
+    """Prefixes a question with its 1-based position in the quiz it's
+    being delivered as part of ('1) ...', '2) ...') — see
+    _deliver_next_daily_question / _deliver_next_lecture_question, which
+    number every question of every quiz (Daily Quiz, lecture, mistakes-
+    bank retake, wrong-answer retake) this way via a per-session
+    delivered_count counter. Truncates the question itself (never the
+    prefix) if the combination would exceed Telegram's poll question
+    limit — only ever triggers for a question already sitting right at
+    that cap, since the prefix only adds a few characters."""
+    return _prefixed_question(question, f"{number}) ")
 
 def options_too_long(options: list) -> bool:
     """Check if any single option exceeds Telegram's 100-char option limit."""
@@ -4019,15 +4425,17 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
                 continue  # still couldn't recover real quiz content — skip it
 
         timer_seconds = get_question_timer_seconds(user_id)
+        session["delivered_count"] = session.get("delivered_count", 0) + 1
         try:
             msg = await context.bot.send_poll(
-                chat_id=user_id, question=question, options=options,
+                chat_id=user_id, question=_numbered_question(question, session["delivered_count"]), options=options,
                 type="quiz", correct_option_id=correct_id, is_anonymous=False,
                 explanation=(explanation or None),
                 open_period=(timer_seconds or None),
             )
         except Exception as e:
             print(f"Couldn't send lecture question {mid}: {e}")
+            session["delivered_count"] -= 1   # this send never went out — don't burn a number on it
             continue
 
         session["current_poll_id"]    = msg.poll.id
@@ -4035,6 +4443,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         session["current_message_id"] = msg.message_id
         session["current_mid"]        = mid
         session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
+        _schedule_question_timeout(context, session.get("kind", "lecture"), user_id, msg.poll.id, timer_seconds)
         return True
 
     session["current_poll_id"]    = None
@@ -4085,6 +4494,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     daily_session = DAILY_QUIZ_SESSIONS.get(user_id)
     if daily_session and daily_session.get("current_poll_id") == poll_id:
+        daily_session["timeout_streak"] = 0
         chosen     = answer.option_ids[0] if answer.option_ids else None
         is_correct = chosen is not None and chosen == daily_session.get("current_correct_id")
         await _advance_daily_quiz_session(
@@ -4095,6 +4505,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     retake_session = MISTAKES_RETAKE_SESSIONS.get(user_id)
     if retake_session and retake_session.get("current_poll_id") == poll_id:
+        retake_session["timeout_streak"] = 0
         chosen     = answer.option_ids[0] if answer.option_ids else None
         is_correct = chosen is not None and chosen == retake_session.get("current_correct_id")
         await _advance_mistakes_retake_session(
@@ -4173,6 +4584,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if session.get("current_poll_id") != poll_id:
         return   # not the question we're tracking for this user right now
 
+    session["timeout_streak"] = 0
     chosen     = answer.option_ids[0] if answer.option_ids else None
     is_correct = chosen is not None and chosen == session.get("current_correct_id")
     await _advance_lecture_session(
@@ -4241,7 +4653,7 @@ async def _maybe_deliver_spaced_repetition(context: ContextTypes.DEFAULT_TYPE, u
 
     try:
         msg = await context.bot.send_poll(
-            chat_id=user_id, question=status["question"], options=status["options"],
+            chat_id=user_id, question=_prefixed_question(status["question"], "🔁 Review: "), options=status["options"],
             type="quiz", correct_option_id=status["correct_option_id"], is_anonymous=False,
             explanation=(status.get("explanation") or None),
         )
@@ -4300,8 +4712,7 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
             ach = _check_extra_achievement(user_entry, "perfect_run")
             if ach:
                 extra_events.append(ach)
-        from datetime import timezone
-        now_hour = datetime.now(timezone.utc).hour
+        now_hour = datetime.now(DAILY_QUIZ_TZ).hour
         if 2 <= now_hour < 5:
             ach = _check_extra_achievement(user_entry, "insomniac")
             if ach:
@@ -4839,33 +5250,59 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         parse_mode=ParseMode.HTML,
     )
 
+def _locked_year_modules_view(user_id: int | None, years: list) -> tuple[str, InlineKeyboardMarkup] | None:
+    """If this user has a year/class set whose channel is still configured
+    and has at least one ready module, returns the (text, keyboard) for
+    jumping straight to their module list — skipping the "which year?"
+    step entirely, since onboarding now makes year/class mandatory (see
+    _onboarding_gate) and there's normally no other year for them to
+    pick from anyway. Shared by quiz_lectures_cmd (/quiz) and the
+    quiz_years callback ("📚 More Quizzes" / "🔙 رجوع للسنين") so both
+    entry points skip consistently.
+
+    Returns None — meaning "fall back to the full year picker" — only
+    for the now-rare edge cases where locking straight to a year isn't
+    actually possible: no year_class on record (shouldn't happen post-
+    onboarding, but covers pre-onboarding-gate legacy sessions), that
+    year's channel no longer configured, or it has no ready modules yet."""
+    if not user_id:
+        return None
+    year_class = get_year_class(user_id)
+    if year_class not in years or not year_channel_id(year_class):
+        return None
+    modules = ready_modules(year_class)
+    if not modules:
+        return None
+    buttons = [
+        [InlineKeyboardButton(module_label(m), callback_data=f"module:{year_class}:{i}")]
+        for i, m in enumerate(modules)
+    ]
+    # Not "🔙 رجوع للسنين" here — with a locked year/class there's no
+    # other year behind it to go back to, so that button would just
+    # reopen this exact same screen. Back to Home is the only meaningful
+    # "out" from here now.
+    buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+    text = f"📚 <b>{year_label(year_class)}</b> — اختار الموديول:"
+    return text, InlineKeyboardMarkup(buttons)
+
 async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User-facing: /quiz. Jumps straight to the module list for the
     caller's own year/class (set via the onboarding/Settings year_class
-    prompt — see get_year_class, year_class_keyboard), skipping the "which
-    year?" step entirely. Falls back to the full year-picker (old
-    behaviour) if they haven't set a year yet, their set year isn't
-    currently configured/available, or it has no ready modules."""
+    prompt — see get_year_class, year_class_keyboard, _locked_year_modules_view),
+    skipping the "which year?" step entirely. Falls back to the full
+    year-picker (old behaviour) if that's not possible right now — see
+    _locked_year_modules_view for exactly when."""
     user_id = update.effective_user.id if update.effective_user else None
     years = configured_years()
     if not years:
         await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
         return
 
-    year_class = get_year_class(user_id) if user_id else None
-    if year_class in years and year_channel_id(year_class):
-        modules = ready_modules(year_class)
-        if modules:
-            buttons = [
-                [InlineKeyboardButton(module_label(m), callback_data=f"module:{year_class}:{i}")]
-                for i, m in enumerate(modules)
-            ]
-            buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="quiz_years")])
-            await update.message.reply_text(
-                f"📚 <b>{year_label(year_class)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
-            return
+    view = _locked_year_modules_view(user_id, years)
+    if view:
+        text, markup = view
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
 
     buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
     await update.message.reply_text(
@@ -5111,6 +5548,18 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print("REPORT THREAD EDIT FAILED (user followup):", e)
         await backup_report_threads_to_channel(context)
+        return
+
+    # ── AWAITING BROADCAST MESSAGE (/broadcast composer) ──────────
+    # Set only via the admin-gated "✏️ Set Message" button — the is_admin
+    # check here is just defense in depth, not the actual access control.
+    if AWAITING_BROADCAST_MESSAGE.pop(real_uid, None):
+        if not is_admin(update):
+            return
+        draft = BROADCAST_DRAFTS.setdefault(real_uid, {"audience": "all", "text": None})
+        draft["text"] = text
+        body, markup = _broadcast_composer_view(real_uid)
+        await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
 
     # ── AWAITING NICKNAME (Settings, or first-ever /start) ───────
@@ -5373,6 +5822,106 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await query.answer()
 
+    # ── QUESTION TIMEOUT — resume/abandon a paused session ────────────
+    # Only shown after two consecutive timed-out questions in a row (see
+    # _handle_question_timeout / QUESTION TIMEOUT section above).
+    if query.data.startswith("qresume:"):
+        kind    = query.data.split(":", 1)[1]
+        store   = _SESSION_STORE_BY_KIND.get(kind)
+        session = store.get(user_id) if store is not None else None
+        if not session or not session.get("paused"):
+            await query.edit_message_text("⚠️ مفيش جلسة متوقفة نكملها دلوقتي.")
+            return
+        session["paused"] = False
+        session["timeout_streak"] = 0
+        await query.edit_message_text("▶️ تمام، ياللا نكمل!")
+        # The question that triggered the pause was never answered —
+        # skip it as wrong now, same as the first timeout in a row does,
+        # then carry on delivering the rest of the queue as normal.
+        await _advance_session_for_kind(context, kind, user_id, session, is_correct=False)
+        return
+
+    if query.data.startswith("qabandon:"):
+        kind  = query.data.split(":", 1)[1]
+        store = _SESSION_STORE_BY_KIND.get(kind)
+        if store is not None:
+            store.pop(user_id, None)
+        label = _QUIZ_KIND_LABEL.get(kind, "الجلسة")
+        await query.edit_message_text(
+            f"🥀 تم إلغاء الـ {label}. تقدر تبدأ واحدة جديدة في أي وقت.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]]),
+        )
+        return
+
+    # ── BROADCAST composer (admin only) — see the BROADCAST COMMAND ──
+    # section for _broadcast_composer_view / _send_broadcast.
+    if query.data.startswith("bc") and query.data.split(":", 1)[0] in (
+        "bcaud", "bcmsg", "bcmsgcancel", "bcpreview", "bcsend", "bccancel"
+    ):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+
+        if query.data.startswith("bcaud:"):
+            key = query.data.split(":", 1)[1]
+            if key in BROADCAST_AUDIENCE_ORDER:
+                BROADCAST_DRAFTS.setdefault(user_id, {"audience": "all", "text": None})["audience"] = key
+            body, markup = _broadcast_composer_view(user_id)
+            await query.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        if query.data == "bcmsg":
+            AWAITING_BROADCAST_MESSAGE[user_id] = True
+            await query.edit_message_text(
+                "✏️ ابعت نص الرسالة اللي عايز تبثها دلوقتي.\n"
+                "HTML بسيط متاح: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;code&gt;</code>...",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="bcmsgcancel")]]),
+            )
+            return
+
+        if query.data == "bcmsgcancel":
+            AWAITING_BROADCAST_MESSAGE.pop(user_id, None)
+            body, markup = _broadcast_composer_view(user_id)
+            await query.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        if query.data == "bcpreview":
+            draft = BROADCAST_DRAFTS.get(user_id)
+            text  = draft.get("text") if draft else None
+            if not text:
+                await query.answer("⚠️ لسه مفيش رسالة.", show_alert=True)
+                return
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                await query.answer(f"⚠️ مشكلة في الرسالة (يمكن الـ HTML مش مظبوط): {e}", show_alert=True)
+            return
+
+        if query.data == "bccancel":
+            BROADCAST_DRAFTS.pop(user_id, None)
+            AWAITING_BROADCAST_MESSAGE.pop(user_id, None)
+            await query.edit_message_text("❌ Broadcast اتلغى.")
+            return
+
+        if query.data == "bcsend":
+            draft = BROADCAST_DRAFTS.get(user_id)
+            text  = draft.get("text") if draft else None
+            if not text:
+                await query.answer("⚠️ لسه مفيش رسالة.", show_alert=True)
+                return
+            audience   = draft["audience"]
+            recipients = _broadcast_audience_user_ids(audience)
+            if not recipients:
+                await query.answer("⚠️ مفيش مستخدمين في الجمهور ده دلوقتي.", show_alert=True)
+                return
+            BROADCAST_DRAFTS.pop(user_id, None)
+            AWAITING_BROADCAST_MESSAGE.pop(user_id, None)
+            await query.edit_message_text("📡 بيتجهز للإرسال…")
+            await _send_broadcast(context, query.message, audience, text, recipients)
+            return
+
+
     # ── /restore: run one system's restore-from-pin on demand ────────
     if query.data.startswith("restore_go:"):
         if not is_admin(update):
@@ -5470,6 +6019,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         years = configured_years()
         if not years:
             await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
+            return
+        view = _locked_year_modules_view(user_id, years)
+        if view:
+            text, markup = view
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             return
         buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
         await query.edit_message_text(
@@ -5680,6 +6234,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "award_xp": not already_attempted,   # no XP farming on repeat attempts
             "poll_status_by_mid": poll_status_by_mid,
             "started_at": time.time(),   # see EXTRA_ACHIEVEMENTS' quick_thinker, checked in _finish_lecture_session
+            "kind": "lecture",
         }
         LECTURE_SESSIONS[user_id] = session
 
@@ -5855,23 +6410,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         poll_status_by_mid = {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key}
-        buttons = []
+        # Text list (first 32 chars of each question) + a numbered grid of
+        # buttons below it — callback_data still carries the question's own
+        # immutable channel message_id (mid), NOT its position in `ids`,
+        # since positions shift whenever an earlier question in this same
+        # lecture gets deleted (see eqq:/eqdel:/eqins: below, which all
+        # look the question up by mid rather than trusting an index).
+        lines = []
+        number_buttons, row = [], []
         for i, mid in enumerate(ids, 1):
             status = poll_status_by_mid.get(mid)
-            preview = (status["question"][:16] if status and status.get("question") else "؟؟؟")
-            buttons.append([InlineKeyboardButton(f"{i}. {preview}", callback_data=f"eqq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{i - 1}")])
-        buttons.append([InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")])
+            preview = html.escape(status["question"][:32]) if status and status.get("question") else "؟؟؟"
+            lines.append(f"{i}. {preview}")
+            row.append(InlineKeyboardButton(str(i), callback_data=f"eqq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"))
+            if len(row) == 6:
+                number_buttons.append(row)
+                row = []
+        if row:
+            number_buttons.append(row)
+        number_buttons.append([InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")])
         await query.edit_message_text(
-            f"✏️ <b>{entry['name']}</b> — اختار السؤال اللي عايز تعدله:",
+            f"✏️ <b>{entry['name']}</b> — اختار رقم السؤال اللي عايز تعدله:\n\n" + "\n".join(lines),
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=InlineKeyboardMarkup(number_buttons),
         )
         return
 
     # ── EQQ: one question picked — show its preview + action buttons ──
+    # Identified by mid (the question's own channel message_id), not by
+    # position — see the comment on the eqlecture: button-building above.
     if query.data.startswith("eqq:"):
-        _, year, mod_idx_str, subj_idx_str, lec_idx_str, q_idx_str = query.data.split(":")
-        mod_idx, subj_idx, lec_idx, q_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(q_idx_str)
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
         if year not in YEARS or not year_channel_id(year):
             await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
             return
@@ -5892,20 +6462,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lecture_key = names[lec_idx]
         entry = QUIZ_INDEX[year][lecture_key]
         ids = entry["ids"]
-        if q_idx >= len(ids):
+        if mid not in ids:
             await query.edit_message_text("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.")
             return
-        mid = ids[q_idx]
+        q_pos = ids.index(mid)   # display-only (e.g. "3/12") — never used to look anything up
         status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
         preview = html.escape(status["question"]) if status and status.get("question") else "؟؟؟"
 
         buttons = [
-            [InlineKeyboardButton("🗑 Delete this poll", callback_data=f"eqdel:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{q_idx}")],
-            [InlineKeyboardButton("➕ Insert new poll after", callback_data=f"eqins:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{q_idx}")],
+            [InlineKeyboardButton("🗑 Delete this poll", callback_data=f"eqdel:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+            [InlineKeyboardButton("➕ Insert new poll after", callback_data=f"eqins:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
             [InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
         ]
         await query.edit_message_text(
-            f"✏️ <b>{entry['name']}</b> — سؤال {q_idx + 1}/{len(ids)}\n\n"
+            f"✏️ <b>{entry['name']}</b> — سؤال {q_pos + 1}/{len(ids)}\n\n"
             f"❓ {preview}\n\nاختار الإجراء:",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -5916,8 +6486,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (channel message itself is left untouched — same convention as
     # /quiz_delete for whole lectures.)
     if query.data.startswith("eqdel:"):
-        _, year, mod_idx_str, subj_idx_str, lec_idx_str, q_idx_str = query.data.split(":")
-        mod_idx, subj_idx, lec_idx, q_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(q_idx_str)
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
         if year not in YEARS or not year_channel_id(year):
             await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
             return
@@ -5938,10 +6508,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lecture_key = names[lec_idx]
         entry = QUIZ_INDEX[year][lecture_key]
         ids = entry["ids"]
-        if q_idx >= len(ids):
+        if mid not in ids:
             await query.edit_message_text("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.")
             return
-        mid = ids.pop(q_idx)
+        ids.remove(mid)   # by value (mid), not by position — see eqlecture: button comment above
         await save_quiz_index(year)
         for pid in [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
             QUIZ_POLL_STATUS[year].pop(pid, None)
@@ -5960,8 +6530,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── EQINS: reopen this lecture in the quiz channel so the admin can ──
     # post new poll(s) right after this question, then -END as usual.
     if query.data.startswith("eqins:"):
-        _, year, mod_idx_str, subj_idx_str, lec_idx_str, q_idx_str = query.data.split(":")
-        mod_idx, subj_idx, lec_idx, q_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(q_idx_str)
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, target_mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
         if year not in YEARS or not year_channel_id(year):
             await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
             return
@@ -5982,10 +6552,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lecture_key = names[lec_idx]
         entry = QUIZ_INDEX[year][lecture_key]
         ids = entry["ids"]
-        if q_idx >= len(ids):
+        if target_mid not in ids:
             await query.edit_message_text("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.")
             return
-        target_mid = ids[q_idx]
 
         other_current = QUIZ_STATE[year].get("current_lecture")
         if other_current and other_current != lecture_key:
@@ -6043,6 +6612,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "award_xp": True,      # retakes always earn XP
             "is_retake": True,     # ...but never touch the leaderboard/results file
             "poll_status_by_mid": poll_status_by_mid,
+            "kind": "lecture",
         }
         LECTURE_SESSIONS[user_id] = session
 
@@ -6374,6 +6944,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not years:
             await query.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
             return
+        view = _locked_year_modules_view(user_id, years)
+        if view:
+            text, markup = view
+            await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
         buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
         await query.message.reply_text(
             "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
@@ -6576,10 +7151,13 @@ async def report_issue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bails out of a pending image that's waiting for its question."""
+    """Bails out of a pending image that's waiting for its question, or
+    (admin only) a /broadcast composer waiting on the message text."""
     user_id = update.effective_chat.id
     was_doing_something = bool(PENDING_IMAGE.get(user_id))
     _clear_pending_image(user_id)
+    if AWAITING_BROADCAST_MESSAGE.pop(user_id, None):
+        was_doing_something = True
     if was_doing_something:
         await update.message.reply_text(MSG_CANCEL_DONE)
     else:
@@ -6807,48 +7385,165 @@ async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # BROADCAST COMMAND  (admin only)
 # ═══════════════════════════════════════════════════════════════
+# Interactive composer: pick an audience, set a message, preview it
+# exactly as recipients will see it, check the live estimated-recipient
+# count, then SEND with a progress bar + rolling ETA. State lives in
+# BROADCAST_DRAFTS (see the STATE section near the top for the field
+# shapes) — one in-progress draft per admin, RAM-only like every other
+# AWAITING_*/PENDING_* flow in this file.
+BROADCAST_ACTIVE_WINDOW_DAYS = 7   # "Active users" = engaged with the bot at least once in this many days
+BROADCAST_PROGRESS_EDIT_INTERVAL = 2.0   # seconds between progress-bar edits — Telegram's edit-rate limits are per-chat, so this only needs to be sane, not aggressive
+BROADCAST_SEND_DELAY             = 0.05  # seconds between sends — a light throttle against Telegram's global flood limits on a big broadcast
+
+BROADCAST_AUDIENCE_ORDER  = ["all", "y1", "y2", "y3", "active", "inactive"]
+BROADCAST_AUDIENCE_LABELS = {
+    "all": "All users", "y1": "Year 1", "y2": "Year 2", "y3": "Year 3",
+    "active": "Active users", "inactive": "Inactive users",
+}
+
+def _broadcast_audience_user_ids(audience: str) -> list:
+    """Resolves an audience key to the user_ids it currently matches.
+    y1/y2/y3 read each user's own locked year_class (get_year_class) —
+    mandatory since onboarding (see _onboarding_gate), so this is a
+    straight equality check, no guessing needed. active/inactive split
+    on whether ANALYTICS' last_active_date falls within
+    BROADCAST_ACTIVE_WINDOW_DAYS of today (UTC, matching _today()/
+    _record_activity elsewhere) — a user who's never been active at all
+    counts as inactive."""
+    if audience == "all":
+        return list(USERS)
+    if audience in ("y1", "y2", "y3"):
+        return [uid for uid in USERS if get_year_class(uid) == audience]
+    if audience in ("active", "inactive"):
+        from datetime import timezone
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=BROADCAST_ACTIVE_WINDOW_DAYS)).strftime("%Y-%m-%d")
+        def _is_active(uid):
+            last = ANALYTICS.get(str(uid), {}).get("last_active_date")
+            return bool(last) and last >= cutoff
+        want_active = (audience == "active")
+        return [uid for uid in USERS if _is_active(uid) == want_active]
+    return []
+
+def _broadcast_composer_view(admin_id: int) -> tuple:
+    """Renders the /broadcast composer screen: an audience picker
+    (radio-style — one selected at a time, marked with ✅), the current
+    message (or a prompt to set one), and a live estimated-recipient
+    count for whichever audience is currently selected. Shared by
+    broadcast_cmd and every bcaud:/bcmsg/bccancel button in
+    button_handler so the screen re-renders identically no matter which
+    one triggered it."""
+    draft    = BROADCAST_DRAFTS.setdefault(admin_id, {"audience": "all", "text": None})
+    audience = draft["audience"]
+    text     = draft["text"]
+    count    = len(_broadcast_audience_user_ids(audience))
+
+    lines = ["📡 <b>BROADCAST</b>", "", "👥 <b>Audience</b>"]
+    for i, key in enumerate(BROADCAST_AUDIENCE_ORDER):
+        branch = "└─" if i == len(BROADCAST_AUDIENCE_ORDER) - 1 else "├─"
+        mark   = "✅ " if key == audience else ""
+        lines.append(f"{branch} {mark}{BROADCAST_AUDIENCE_LABELS[key]}")
+    lines.append("")
+    lines.append("📝 <b>Message</b>")
+    if text:
+        preview = html.escape(text[:200]) + ("…" if len(text) > 200 else "")
+        lines.append(preview)
+    else:
+        lines.append("<i>⚠️ لسه مفيش رسالة — دوس ✏️ Set Message تحت</i>")
+    lines.append("")
+    lines.append(f"📊 <b>Estimated:</b> {count:,} recipient(s)")
+
+    buttons, row = [], []
+    for key in BROADCAST_AUDIENCE_ORDER:
+        mark  = "✅ " if key == audience else ""
+        row.append(InlineKeyboardButton(f"{mark}{BROADCAST_AUDIENCE_LABELS[key]}", callback_data=f"bcaud:{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    msg_row = [InlineKeyboardButton("✏️ Set Message", callback_data="bcmsg")]
+    if text:
+        msg_row.append(InlineKeyboardButton("👁 Preview", callback_data="bcpreview"))
+    buttons.append(msg_row)
+
+    action_row = []
+    if text and count:   # SEND only offered once there's actually something, to someone, to send
+        action_row.append(InlineKeyboardButton("🚀 SEND", callback_data="bcsend"))
+    action_row.append(InlineKeyboardButton("❌ CANCEL", callback_data="bccancel"))
+    buttons.append(action_row)
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
+    admin_id = update.effective_user.id
 
-    # Message text comes after /broadcast, or from a replied-to message
+    # Old shortcut still works: /broadcast <message>, or reply to a
+    # message with /broadcast — pre-fills the composer's message so the
+    # admin doesn't have to retype it via ✏️ Set Message. Audience stays
+    # whatever it was last set to (defaulting to "all" the first time).
+    prefilled = None
     if context.args:
-        text = " ".join(context.args)
+        prefilled = " ".join(context.args)
     elif update.message.reply_to_message and update.message.reply_to_message.text:
-        text = update.message.reply_to_message.text
-    else:
-        await update.message.reply_text(
-            "⚠️ استخدام:\n"
-            "<code>/broadcast رسالتك هنا</code>\n\n"
-            "أو رد بـ /broadcast على رسالة موجودة.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+        prefilled = update.message.reply_to_message.text
 
-    if not text.strip():
-        await update.message.reply_text("❌ الرسالة فارغة")
-        return
+    draft = BROADCAST_DRAFTS.setdefault(admin_id, {"audience": "all", "text": None})
+    if prefilled:
+        draft["text"] = prefilled
+    AWAITING_BROADCAST_MESSAGE.pop(admin_id, None)
 
-    users_list = list(USERS)
-    total      = len(users_list)
+    body, markup = _broadcast_composer_view(admin_id)
+    await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
 
-    status_msg = await update.message.reply_text(
-        f"📡 <b>جاري الإرسال لـ {total} مستخدم...</b>",
-        parse_mode=ParseMode.HTML,
-    )
+async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, audience: str, text: str, recipients: list) -> None:
+    """Sends text to every id in recipients, editing status_message into
+    a live progress bar + rolling ETA (re-estimated from the actual
+    send rate so far, refreshed at most every
+    BROADCAST_PROGRESS_EDIT_INTERVAL seconds) and finishing with the
+    same success/failed/blocked summary the old one-shot /broadcast
+    used to show, plus the audience and total duration."""
+    total = len(recipients)
+    success, failed, blocked = 0, 0, []
+    started   = time.monotonic()
+    last_edit = 0.0
 
-    success = 0
-    failed  = 0
-    blocked = []
+    def _bar(done: int) -> str:
+        filled = int((done / total) * 20) if total else 20
+        return "█" * filled + "░" * (20 - filled)
 
-    for uid in users_list:
+    def _fmt_duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60}m {seconds % 60}s" if seconds >= 60 else f"{seconds}s"
+
+    async def _update_progress(done: int, force: bool = False):
+        nonlocal last_edit
+        now = time.monotonic()
+        if not force and now - last_edit < BROADCAST_PROGRESS_EDIT_INTERVAL:
+            return
+        last_edit = now
+        elapsed = now - started
+        rate    = done / elapsed if elapsed > 0 else 0
+        eta     = (total - done) / rate if rate > 0 else 0
+        pct     = int(done / total * 100) if total else 100
         try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text=text,
+            await status_message.edit_text(
+                f"📡 <b>بيتبعت...</b>\n\n"
+                f"[{_bar(done)}] {pct}%\n"
+                f"{done}/{total} — ⏳ متبقي تقريبًا {_fmt_duration(eta)}",
                 parse_mode=ParseMode.HTML,
             )
+        except Exception:
+            pass   # a failed progress-bar edit should never interrupt the actual send loop below
+
+    await _update_progress(0, force=True)
+
+    for i, uid in enumerate(recipients, 1):
+        try:
+            await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
             success += 1
         except Forbidden:
             # The user actually blocked the bot (or deleted their account) —
@@ -6862,8 +7557,10 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # a real, still-active user.
             failed += 1
             print(f"Broadcast failed for {uid} (not removed — not a block):", e)
+        await _update_progress(i)
+        if BROADCAST_SEND_DELAY:
+            await asyncio.sleep(BROADCAST_SEND_DELAY)
 
-    # Remove users who blocked the bot
     if blocked:
         for uid in blocked:
             USERS.discard(uid)
@@ -6872,14 +7569,18 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     summary = (
         f"✅ <b>Broadcast اتبعت!</b>\n\n"
-        f"👥 المستخدمين: <b>{total}</b>\n"
+        f"👥 الجمهور: <b>{BROADCAST_AUDIENCE_LABELS.get(audience, audience)}</b>\n"
+        f"📨 المستهدفين: <b>{total}</b>\n"
         f"✔️ نجح: <b>{success}</b>\n"
-        f"❌ فشل / بلوك: <b>{failed}</b>"
+        f"❌ فشل / بلوك: <b>{failed}</b>\n"
+        f"⏱ المدة: <b>{_fmt_duration(time.monotonic() - started)}</b>"
     )
     if blocked:
         summary += f"\n🗑 تم حذف {len(blocked)} يوزر بلوك البوت من القائمة"
-
-    await status_msg.edit_text(summary, parse_mode=ParseMode.HTML)
+    try:
+        await status_message.edit_text(summary, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /ban <user_id> <hours> <reason> — blocks that user from
@@ -7139,7 +7840,6 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🏆 Achievements", callback_data="view_achievements"),
-            InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_years"),
             InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home"),
         ]]),
     )
@@ -7311,13 +8011,15 @@ async def _post_init(app):
     await restore_lecture_results_from_channel(app)
     await restore_mistakes_bank_from_channel(app)
     await restore_report_threads_from_channel(app)
+    await restore_sessions_from_channel(app)
 
     if app.job_queue is None:
         print(
             "⚠️ No JobQueue available — periodic backup reconciliation, the "
-            "analytics flush, stale-session cleanup, the Daily Quiz push, "
-            "the hourly Zikr reminder, and the daily zipped backup export "
-            "are disabled. Local analytics from poll answers will only hit "
+            "analytics flush, stale-session cleanup, session persistence, "
+            "the Daily Quiz push, the hourly Zikr reminder, and the daily "
+            "zipped backup export are disabled. Local analytics from poll "
+            "answers will only hit "
             "disk on the next immediate-save call site "
             "(restore/reset/import) or on a clean shutdown, not every 60s. "
             "Install with: pip install \"python-telegram-bot[job-queue]\""
@@ -7331,6 +8033,12 @@ async def _post_init(app):
         )
         app.job_queue.run_repeating(
             _cleanup_stale_sessions_job, interval=STALE_SESSION_CHECK_INTERVAL, first=STALE_SESSION_CHECK_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _sessions_backup_job, interval=SESSIONS_BACKUP_MIN_INTERVAL, first=SESSIONS_BACKUP_MIN_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _sessions_stale_sweep_job, interval=SESSIONS_STALE_SWEEP_INTERVAL, first=SESSIONS_STALE_SWEEP_INTERVAL,
         )
         app.job_queue.run_daily(
             _daily_quiz_push_job, time=dt_time(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, tzinfo=DAILY_QUIZ_TZ),
@@ -7418,6 +8126,7 @@ async def _post_shutdown(app):
     normal restart/redeploy never loses data. Only a hard crash (killed
     process, power loss) can still lose that window; a clean stop cannot."""
     await _flush_analytics_if_dirty()
+    await _flush_sessions_if_changed()
 
 # ── Backup reconciliation ────────────────────────────────────────
 # Every backup_*_to_channel() call above is reactive and fire-and-forget:
@@ -7450,6 +8159,7 @@ async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
         ("lecture_results", LECTURE_RESULTS_GROUP_ID, LECTURE_RESULTS_BACKUP_MARKER, backup_lecture_results_to_channel),
         ("mistakes_bank",   MISTAKES_BANK_GROUP_ID,   MISTAKES_BANK_BACKUP_MARKER,   backup_mistakes_bank_to_channel),
         ("storage",         STORAGE_GROUP_ID,         STORAGE_BACKUP_MARKER,         backup_storage_to_channel),
+        ("sessions",        SESSIONS_GROUP_ID,        SESSIONS_BACKUP_MARKER,        backup_sessions_to_channel),
     ]
     # One quiz check per configured year, each hitting its own channel.
     for y in configured_years():
@@ -7488,7 +8198,7 @@ async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 BACKUP_CHAT_IDS = [c for c in (
     STORAGE_GROUP_ID, *QUIZ_CHANNEL_IDS, ANALYTICS_GROUP_ID,
-    SETTINGS_GROUP_ID, LECTURE_RESULTS_GROUP_ID,
+    SETTINGS_GROUP_ID, LECTURE_RESULTS_GROUP_ID, SESSIONS_GROUP_ID,
 ) if c]
 
 async def delete_pin_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
