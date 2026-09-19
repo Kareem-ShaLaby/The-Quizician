@@ -47,6 +47,18 @@ from zoneinfo import ZoneInfo
 #          on completion).
 #  927   SETTINGS — per-user personalization (nickname, reactions,
 #          auto_next, randomize)
+#        🔎 SEARCH CONTENT — "Search Content 🔎" button on the Quizzes
+#          module list (and the rare no-locked-year fallback picker).
+#          search_pick_year:/search_year:/search_mod: callbacks (grep
+#          "SEARCH CONTENT" in button_handler) walk year -> module (or
+#          "All Modules") -> arms AWAITING_SEARCH_QUERY, then the user's
+#          next text message is matched against every ready lecture's
+#          poll questions via _search_quiz_questions (Arabic-aware
+#          substring match, same normalization as the nickname filter).
+#          Results are resent as fresh live quiz polls straight into the
+#          chat via deliver_quiz (channel is private, so linking out
+#          isn't reliable). See _send_search_results for the shared send
+#          used by both the search itself and its "🔎 Search Again" button.
 # 1114   LECTURE RESULTS — per-lecture leaderboard (own file + own
 #          backup channel: LECTURE_RESULTS_GROUP_ID)
 # 1267   MISTAKES BANK — per-user wrong-answer pool that seeds each user's
@@ -241,8 +253,8 @@ YEARS = {
         # This is the existing channel, repurposed — starting fresh.
         "channel_id": -1004402622263,
         "modules": {
-            "Endocrine":      ["Bio", "Physio", "Patho", "Histo", "Pharma"],
-            "Genitourinary":  ["Anatomy", "Physio", "Histo", "Patho", "Micro"],
+            "Endocrine":      ["Biochemistry", "Physiology", "Pathology", "Histology", "Pharmacology"],
+            "Genitourinary":  ["Anatomy", "Physiology", "Histology", "Pathology", "Microbiology"],
         },
     },
 }
@@ -368,7 +380,7 @@ SESSIONS_GROUP_ID = -1004499530524
 # Each year in YEARS (above) has its own "modules" dict in this same shape.
 # Lecture titles posted in a year's quiz channel must be formatted as:
 #   "<Module> - <Subject> Lecture <number>: <name>"
-#   e.g. "Endocrine - Physio Lecture 3: Insulin Signaling"
+#   e.g. "Endocrine - Physiology Lecture 3: Insulin Signaling"
 # Matching is case-insensitive; the canonical spelling from that year's
 # "modules" dict is what gets stored/displayed.
 
@@ -505,6 +517,11 @@ USERS = load_users()
 #   "lecture_questions_incorrect":  int,
 #   "lecture_correct_streak_current": int,
 #   "lecture_correct_streak_best":    int,
+#   "subject_stats":     {module: {subject: "correct/answered"}},  # per-subject accuracy,
+#                        # every answered question (lecture, Daily Quiz, retake).
+#                        # String-encoded on purpose — see _record_subject_answer.
+#   "last_module":       str | None,  # module of the user's most recent answer — /mystats
+#                        # falls back to it when no /daily_module scope is set
 #   "lectures_completed":       int,   # real (non-retake) lecture completions
 #   "daily_quizzes_completed":  int,   # Daily Quiz completions
 #   "xp":                int,
@@ -647,13 +664,15 @@ ACHIEVEMENTS = {
 # call sites) rather than a single numeric stat. "curious" is checked by
 # _settings_customized/_maybe_award_curious — no dedicated tracker field,
 # just a live diff of the user's SETTINGS entry against
-# _blank_settings_entry() every time a preference toggle saves.
+# _blank_settings_entry() every time a preference toggle saves. It needs
+# every watched setting (all except Daily Notification / Hourly Zikr) to be
+# off its default at the same moment.
 EXTRA_ACHIEVEMENTS = {
     "quick_thinker": ("Quick Thinker", "⚡️", 100, "خلصت محاضرة في أقل من 15 دقيقة",         "سرعة نبيهه ⚡️"),
     "basmagy":       ("Basmagy",       "😎", 150, "خلصت الـ Daily Quiz في أقل من 60 ثانية بـ 100%", "قوة بصمجتك محتاجة تدرس"),
     "perfect_run":   ("Perfect Run",   "💯", 100, "خلصت محاضرة كاملة بـ 100%",                "متكلمنيش عن البيرفكشونزم"),
     "insomniac":     ("Insomniac",     "🌚", 75,  "خلصت كويز بين 2-5 الفجر",                  "النوم دا لضعفاء القلب 👊"),
-    "curious":       ("Curious",       "🧐", 50,  "غيّرت أي حاجة في إعداداتك",                "هو أنت ديدي أخت ديكستر اللي بتتك على كل الزراير؟ 🤨"),
+    "curious":       ("Curious",       "🧐", 50,  "غيّرت كل الإعدادات (غير الإشعارات والزكر) عن الوضع الافتراضي",                "هو أنت ديدي أخت ديكستر اللي بتتك على كل الزراير؟ 🤨"),
 }
 
 # "achievement_collector" tier 5 — "The Quizician" — only unlocks once
@@ -741,6 +760,9 @@ def _blank_entry() -> dict:
                                                # by correct count first, this second.
         "lecture_correct_streak_current": 0,
         "lecture_correct_streak_best":    0,
+        "subject_stats":             {},  # {module: {subject: "correct/answered"}} — see
+                                            # _record_subject_answer / _send_mystats
+        "last_module":               None,  # module of the most recent answered question
         "lectures_completed":        0,   # real (non-retake) lecture completions —
                                             # see _finish_lecture_session. Backs the
                                             # "lectures_completed" achievement category.
@@ -778,6 +800,8 @@ def _is_valid_analytics_entry(e) -> bool:
     if "achievements" in e and not isinstance(e["achievements"], dict):
         return False
     if "daily_medals" in e and not isinstance(e["daily_medals"], dict):
+        return False
+    if "subject_stats" in e and not isinstance(e["subject_stats"], dict):
         return False
     for k in ("questions_created", "streak", "streak_best", "lecture_questions_answered",
               "lecture_questions_correct", "lecture_questions_incorrect", "lecture_time_spent_seconds",
@@ -896,11 +920,72 @@ def _get_entry(user_id: int) -> dict:
         entry["achievements"].setdefault(k, 0)
     if not isinstance(entry["achievements"].get("extras"), dict):
         entry["achievements"]["extras"] = {}
+    if not isinstance(entry.get("subject_stats"), dict):
+        entry["subject_stats"] = {}
     if not isinstance(entry.get("daily_medals"), dict):
         entry["daily_medals"] = {"gold": 0, "silver": 0, "bronze": 0}
     for k in ("gold", "silver", "bronze"):
         entry["daily_medals"].setdefault(k, 0)
     return entry
+
+def _record_subject_answer(entry: dict, module: str | None, subject: str | None, is_correct: bool) -> None:
+    """Bumps this user's per-subject tally for one answered question and
+    remembers which module it was in (entry["last_module"]).
+
+    Stored as {module: {subject: "correct/answered"}} — a short string
+    rather than a [correct, answered] list, because analytics.json is
+    written with indent=2 and a JSON list expands to four lines per
+    subject; the string stays on one line, which keeps the file (and the
+    channel backup document) noticeably smaller across thousands of users.
+
+    Silently ignores a missing module/subject (legacy sessions, or a
+    session shape that never carried them) rather than raising — this
+    sits on the hot path of every answered question and must never be
+    able to break someone's quiz flow."""
+    if not module or not subject:
+        return
+    stats = entry.setdefault("subject_stats", {})
+    subj_map = stats.setdefault(module, {})
+    correct, answered = _parse_subject_stat(subj_map.get(subject))
+    subj_map[subject] = f"{correct + (1 if is_correct else 0)}/{answered + 1}"
+    entry["last_module"] = module
+
+def _parse_subject_stat(value) -> tuple[int, int]:
+    """'88/120' -> (88, 120). Anything malformed -> (0, 0) so one bad
+    value from a restore can't crash /mystats or the answer path."""
+    try:
+        c, a = str(value).split("/", 1)
+        c, a = int(c), int(a)
+        if 0 <= c <= a:
+            return c, a
+    except (ValueError, TypeError):
+        pass
+    return 0, 0
+
+def _current_module_for_stats(entry: dict) -> str | None:
+    """The module /mystats reports on: the admin-set /daily_module scope
+    when there is one (that's the module currently being taught), else the
+    module of the user's own most recent answer, else None."""
+    scope = get_daily_quiz_scope()
+    if scope and scope.get("module"):
+        return scope["module"]
+    return entry.get("last_module")
+
+def _subject_ranking(entry: dict, module: str | None) -> list[tuple[str, float, int, int]]:
+    """[(subject, pct, correct, answered), ...] for `module`, strongest
+    first. Ties on percentage break toward MORE answered questions (a
+    90% over 200 questions is more trustworthy than a 90% over 10), then
+    alphabetically so the order is stable between /mystats calls.
+    Subjects with zero answers are omitted."""
+    if not module:
+        return []
+    rows = []
+    for subject, value in entry.get("subject_stats", {}).get(module, {}).items():
+        correct, answered = _parse_subject_stat(value)
+        if answered:
+            rows.append((subject, correct / answered * 100, correct, answered))
+    rows.sort(key=lambda r: (-r[1], -r[3], r[0]))
+    return rows
 
 def _record_time_spent(user_id: int, seconds: float | None) -> None:
     """Adds to a user's cumulative lecture_time_spent_seconds — see the
@@ -1070,30 +1155,39 @@ def _check_extra_achievement(entry: dict, key: str) -> dict | None:
 # Preference toggles that count as "poking around in Settings" for the
 # "Curious" extra — deliberately excludes nickname/year_class, which
 # onboarding requires from everyone and so say nothing about curiosity.
+# Every Settings button that has a default state EXCEPT Daily Notification
+# and Hourly Zikr (those two are opt-out reminders, not preferences about
+# how quizzing itself behaves). "Curious" needs ALL of these off their
+# default at the same time — see _settings_customized. Edit Nickname isn't
+# listed: onboarding forces everyone to set one, so it has no "default".
 _CURIOUS_WATCHED_SETTINGS = (
     "reactions", "auto_next", "randomize", "achievement_notifs",
-    "spaced_repetition", "question_timer", "daily_notifs", "zikr_reminders",
+    "spaced_repetition", "question_timer",
 )
 
 def _settings_customized(user_id: int) -> bool:
-    """True once this user has changed any _CURIOUS_WATCHED_SETTINGS
-    toggle away from its default. No dedicated tracker field for this —
-    just diffs the live SETTINGS entry against a fresh
-    _blank_settings_entry() on demand, which is why it's only ever
+    """True only while EVERY _CURIOUS_WATCHED_SETTINGS toggle is away from
+    its default at the same time. It's a live check, not a running tally:
+    flipping one back to its default makes this False again, so a user
+    has to reach the state where all of them differ at once. No dedicated
+    tracker field for this — just diffs the live SETTINGS entry against a
+    fresh _blank_settings_entry() on demand, which is why it's only ever
     worth calling right after a settings mutation (see
-    _maybe_award_curious) rather than on some schedule."""
+    _maybe_award_curious) rather than on some schedule. The achievement
+    itself stays unlocked once awarded (see _check_extra_achievement)."""
     entry   = SETTINGS.get(str(user_id), {})
     default = _blank_settings_entry()
-    return any(entry.get(k, default[k]) != default[k] for k in _CURIOUS_WATCHED_SETTINGS)
+    return all(entry.get(k, default[k]) != default[k] for k in _CURIOUS_WATCHED_SETTINGS)
 
 async def _maybe_award_curious(context, user_id: int) -> None:
     """Call right after any of the _CURIOUS_WATCHED_SETTINGS toggles
     below save. Awards "Curious" (mutates the ANALYTICS entry via
     _get_entry — a different dict than the SETTINGS one
     _settings_customized reads, hence _mark_analytics_dirty rather than
-    a settings save here) the moment a user's settings first diverge
-    from default, then announces it immediately since a Settings tap is
-    already an interactive moment, same as any other achievement."""
+    a settings save here) the moment ALL of a user's watched settings
+    differ from default at once, then announces it immediately since a
+    Settings tap is already an interactive moment, same as any other
+    achievement."""
     if not _settings_customized(user_id):
         return
     ach = _check_extra_achievement(_get_entry(user_id), "curious")
@@ -2233,6 +2327,114 @@ def _poll_status_index(year: str) -> dict:
     once per mid, not eliminating the scan altogether."""
     return {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values()}
 
+# ── 🔎 Search Content ──────────────────────────────────────────────
+# Matches are resent as fresh live quiz polls straight into the user's
+# DM (via deliver_quiz — the same single delivery path every other quiz
+# feature uses), NOT as links into the quiz channel — that channel is
+# private, so a t.me/c/ link wouldn't reliably open for everyone, and
+# resending keeps the whole search self-contained in the chat with
+# Quizzy. Kept small since each match is a handful of messages, not one
+# line — see _send_search_results.
+SEARCH_RESULTS_LIMIT = 8   # max questions resent per search — see _search_quiz_questions
+
+def _search_quiz_questions(year: str, module: str | None, query_text: str,
+                            limit: int = SEARCH_RESULTS_LIMIT) -> tuple[list, int]:
+    """Searches every *ready* (closed, non-empty — same bar as
+    ready_lecture_keys) lecture in `year`, optionally narrowed to one
+    `module`, for quiz-channel poll questions containing `query_text`.
+
+    Matching is substring-based on the same Arabic-aware normalized form
+    the nickname filter uses (_normalize_for_filter) — tashkeel, alef/yaa/
+    taa-marbuta letter variants, case, and spacing differences between
+    the query and the stored question text don't cause a false miss.
+
+    Returns (matches, total_count): `matches` is capped at `limit` (in
+    posting order — insertion order of QUIZ_INDEX[year], then ids[] order
+    within each lecture), `total_count` is how many actually matched, so
+    the caller can tell the user "showing 8 of 23" instead of silently
+    truncating. Each match dict has everything deliver_quiz needs to
+    resend it as a poll — "question", "options", "correct_option_id",
+    "explanation" — plus "lecture_name"/"module"/"subject" for the
+    caption shown above each resent poll. A poll whose content was never
+    captured (very old, pre-tracking content) can't be resent and is
+    silently skipped, same bar _snapshot_from_mid uses."""
+    needle = _normalize_for_filter(query_text)
+    if not needle:
+        return [], 0
+    status_by_mid = _poll_status_index(year)
+    matches, total = [], 0
+    for entry in QUIZ_INDEX.get(year, {}).values():
+        if not entry.get("closed") or not entry.get("ids"):
+            continue
+        if module and entry.get("module") != module:
+            continue
+        for mid in entry["ids"]:
+            status = status_by_mid.get(mid)
+            question    = status.get("question")           if status else None
+            options     = status.get("options")             if status else None
+            correct_id  = status.get("correct_option_id")   if status else None
+            if not question or not options or correct_id is None:
+                continue   # uncaptured/legacy content — can't be resent as a poll
+            if needle not in _normalize_for_filter(question):
+                continue
+            total += 1
+            if len(matches) < limit:
+                matches.append({
+                    "question":          question,
+                    "options":           options,
+                    "correct_option_id": correct_id,
+                    "explanation":       status.get("explanation"),
+                    "lecture_name":      entry.get("name", "؟"),
+                    "module":            entry.get("module", ""),
+                    "subject":           entry.get("subject", ""),
+                })
+    return matches, total
+
+SEARCH_MOD_ALL = "__ALL__"   # sentinel used in search_mod: callback_data for "search every module"
+
+def _search_scope_label(year: str, module: str | None) -> str:
+    scope = module_label(module) if module else "All Modules"
+    return f"{year_label(year)} — {scope}"
+
+def _search_again_markup(year: str, module: str | None) -> InlineKeyboardMarkup:
+    mod_token = module if module else SEARCH_MOD_ALL
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Search Again", callback_data=f"search_mod:{year}:{mod_token}")],
+        [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+    ])
+
+async def _send_search_results(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                                 year: str, module: str | None, query_text: str):
+    """Runs the search, then resends each match as its own fresh live
+    quiz poll (deliver_quiz) directly into chat_id, each preceded by a
+    one-line caption naming its subject/lecture. Ends with a "🔎 Search
+    Again" / "🏠 Back to Home" prompt either way — see _search_again_markup.
+    """
+    matches, total = _search_quiz_questions(year, module, query_text)
+    scope_line = f"📚 {_search_scope_label(year, module)}\n🔎 \"{html.escape(query_text[:80])}\""
+    again_markup = _search_again_markup(year, module)
+
+    if not matches:
+        await context.bot.send_message(
+            chat_id, scope_line + "\n\n📭 مفيش أسئلة اتطابقت مع البحث ده.",
+            parse_mode=ParseMode.HTML, reply_markup=again_markup,
+        )
+        return
+
+    note = "" if total <= len(matches) else f" (بتعرض {len(matches)} من {total} — دقق البحث أكتر لو مش لاقي اللي عايزه)"
+    await context.bot.send_message(
+        chat_id, scope_line + f"\n\n✅ لاقيت {len(matches)} سؤال{note}:",
+        parse_mode=ParseMode.HTML,
+    )
+    for i, m in enumerate(matches, 1):
+        where = f"{subject_label(m['subject'])} — {html.escape(m['lecture_name'])}"
+        await context.bot.send_message(chat_id, f"{i}. {where}", parse_mode=ParseMode.HTML)
+        await deliver_quiz(
+            context, chat_id, m["question"], m["options"], m["correct_option_id"],
+            explanation=m.get("explanation"),
+        )
+    await context.bot.send_message(chat_id, "🔎 عايز تبحث تاني؟", reply_markup=again_markup)
+
 async def _resolve_mistake(context: ContextTypes.DEFAULT_TYPE, entry: dict, status_by_mid: dict | None = None) -> dict | None:
     """Turns one lightweight MISTAKES_BANK entry ({mid, year, module,
     subject}) into a full self-contained question dict via
@@ -2402,6 +2604,11 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     session["current_correct_id"] = q["correct_option_id"]
     session["current_message_id"] = msg.message_id
     session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
+    # q was popped off the queue above, so stash its module/subject on the
+    # session — _advance_daily_quiz_session / _advance_mistakes_retake_session
+    # read these back to credit the right subject in /mystats.
+    session["current_module"]  = q.get("module")
+    session["current_subject"] = q.get("subject")
     _schedule_question_timeout(context, session.get("kind", "daily"), user_id, msg.poll.id, timer_seconds)
     return True
 
@@ -2434,6 +2641,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     user_entry["lecture_questions_answered"]  += 1
     user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
     user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_subject_answer(user_entry, session.get("current_module"), session.get("current_subject"), is_correct)
     if is_correct:
         user_entry["lecture_correct_streak_current"] += 1
         if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
@@ -2503,7 +2711,8 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
             f"📊 نسبة: {pct}%\n"
             f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
             f"✨ XP: <b>+{session['xp_earned']}</b>\n\n"
-            f"{_next_daily_quiz_line()}"
+            + (f"{QUIZZY_PERFECT_SCORE_LINE}\n\n" if session["answered"] > 0 and pct == 100 else "")
+            + f"{_next_daily_quiz_line()}"
         )
         try:
             await context.bot.send_message(
@@ -2858,6 +3067,7 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
     user_entry["lecture_questions_answered"]  += 1
     user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
     user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_subject_answer(user_entry, session.get("current_module"), session.get("current_subject"), is_correct)
     if is_correct:
         user_entry["lecture_correct_streak_current"] += 1
         if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
@@ -3095,7 +3305,7 @@ async def save_quiz_index(year: str):
 # year -> {lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}}
 QUIZ_INDEX: dict = {y: load_quiz_index(y) for y in YEARS}
 
-# Matches "<Subject> Lecture <number>", e.g. "Physio Lecture 3"
+# Matches "<Subject> Lecture <number>", e.g. "Physiology Lecture 3"
 _LECTURE_TITLE_RE = re.compile(r"^(.*?)\s+Lecture\s+(\d+)\s*$", re.IGNORECASE)
 
 def parse_lecture_title(year: str, text: str):
@@ -3110,7 +3320,7 @@ def parse_lecture_title(year: str, text: str):
         return None, None, None, (
             "⚠️ الصيغة غلط. لازم تكون:\n"
             "<code>Module - Subject Lecture Number: Name</code>\n"
-            "مثال: <code>Endocrine - Physio Lecture 3: Insulin Signaling</code>"
+            "مثال: <code>Endocrine - Physiology Lecture 3: Insulin Signaling</code>"
         )
     module_part, rest = text.split(" - ", 1)
     subj_lec_part, name = rest.split(":", 1)
@@ -3126,7 +3336,7 @@ def parse_lecture_title(year: str, text: str):
         return None, None, None, (
             "⚠️ الصيغة غلط بعد اسم الموديول. لازم تكون:\n"
             "<code>Subject Lecture Number</code>\n"
-            "مثال: <code>Physio Lecture 3</code>"
+            "مثال: <code>Physiology Lecture 3</code>"
         )
     subject_part, lecture_number = m.group(1).strip(), m.group(2).strip()
     subject_match = next((s for s in modules[module_match] if s.lower() == subject_part.lower()), None)
@@ -3325,6 +3535,16 @@ AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is wai
 PENDING_QUIZ_DELETE    = {}    # admin_id -> (year, lecture_key), set by /quiz_delete while waiting on
                                 # the confirm/cancel tap (see quizdel_yes/quizdel_no in button_handler)
 
+# ── 🔎 Search Content support ────────────────────────────────────
+# Set by the search_mod: callback (see button_handler) once the user has
+# picked a year (always their locked year_class in practice) and a
+# module (or "search all modules"); the next text message from that
+# real_uid is treated as the search query instead of anything else the
+# text handler would normally do with it — see the AWAITING_SEARCH_QUERY
+# check near the top of handle(). Same RAM-only, restart-is-harmless
+# convention as every other AWAITING_*/PENDING_* dict here.
+AWAITING_SEARCH_QUERY  = {}    # real_uid -> {"year": str, "module": str|None}
+
 # ── /broadcast support ────────────────────────────────────────────
 # See the BROADCAST section (grep the banner) further down for the full
 # interactive composer this backs — audience picker, message entry,
@@ -3359,7 +3579,25 @@ QUIZ_INSERT_AFTER: dict = {y: {} for y in YEARS}
 # from on startup. See restore_report_threads_from_channel /
 # backup_report_threads_to_channel below, and their registration
 # alongside every other system's restore/backup calls near MAIN.
-AWAITING_REPORT_ISSUE  = {}    # user_id -> True, while waiting on the user's issue text after /report_issue
+AWAITING_REPORT_ISSUE  = {}    # user_id -> float (time.time() when /report_issue ran). The next
+                                # text OR photo from this user is staged as a draft report (see
+                                # _stage_report_draft) — UNLESS more than REPORT_ISSUE_AWAIT_TIMEOUT
+                                # has passed, in which case it's left alone and that message is
+                                # handled normally instead. Also cleared by /cancel.
+                                #
+                                # Both the timeout and /cancel exist to fix the same bug: this used
+                                # to be a plain `True` with no expiry and no way out, so ANY message
+                                # sent any time after /report_issue — even an unrelated one hours or
+                                # days later, after the person forgot they'd typed the command —
+                                # got silently shipped to admins as a bogus report, and there was no
+                                # way for the person to back out once they'd started.
+REPORT_ISSUE_AWAIT_TIMEOUT   = 10 * 60   # seconds — how long /report_issue "listens" for the report
+REPORT_DRAFTS = {}   # user_id -> {"text": str, "photo_file_id": str|None, "created_at": float}
+                      # — a report the user has typed/sent but not yet confirmed via the Send/Cancel
+                      # preview. See _stage_report_draft (creates it) and the report_draft_send /
+                      # report_draft_cancel callback branches in button_handler (consume it).
+REPORT_DRAFT_CONFIRM_TIMEOUT = 30 * 60   # seconds — a Send tap older than this is rejected rather
+                                          # than silently posting a stale draft
 AWAITING_REPORT_REPLY  = {}    # admin_id -> {"group_message_id": int}
                                 # — set when the admin taps "↩️ Reply" on a report in REPORT_ISSUE_GROUP_ID;
                                 # the admin's next text message there becomes the reply sent back to that user
@@ -3402,6 +3640,14 @@ REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id",
                                                 # still read as a fallback for threads that predate this field
                                                 # — one entry per report ever filed, so the report message can be
                                                 # rebuilt (user text + every reply so far) each time it's edited
+                                                #
+                                                # "latest_group_message_id" / "latest_user_message_id": the
+                                                # message id of the most recent full-thread message on each
+                                                # side (group card / reporter's DM) — see _refresh_report_thread.
+                                                # Both start out equal to the dict key (the very first card IS
+                                                # the first full-thread message) and get reassigned on every
+                                                # reply; missing/None on a thread that predates this field or
+                                                # hasn't had its user-side DM refreshed yet.
 
 _report_threads_backup_msg_id: int | None = None
 _last_report_threads_backup_at: float = 0.0
@@ -4939,6 +5185,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     user_entry["lecture_questions_answered"]  += 1
     user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
     user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_subject_answer(user_entry, session.get("module"), session.get("subject"), is_correct)
     if is_correct:
         user_entry["lecture_correct_streak_current"] += 1
         if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
@@ -5032,6 +5279,25 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id  = update.effective_chat.id
     real_uid = update.effective_user.id if update.effective_user else user_id
+
+    # ── /report_issue waiting on this user's next message ──────────
+    # Same draft-staging path as the text branch in handle() — see
+    # AWAITING_REPORT_ISSUE's comment. Checked first (before SLEEPING and
+    # before the normal "image for a quiz question" flow below) so a
+    # screenshot sent right after /report_issue is never mistaken for a
+    # quiz-question image, and still works even while sleeping.
+    report_wait_started = AWAITING_REPORT_ISSUE.pop(real_uid, None)
+    if report_wait_started is not None and time.time() - report_wait_started <= REPORT_ISSUE_AWAIT_TIMEOUT:
+        if not REPORT_ISSUE_GROUP_ID:
+            await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
+            return
+        report_photo = update.message.photo[-1] if update.message.photo else None
+        if not report_photo:
+            return
+        report_caption = (update.message.caption or "").strip()
+        await _stage_report_draft(update, context, real_uid, text=report_caption, photo_file_id=report_photo.file_id)
+        return
+
     if user_id in SLEEPING:
         return
 
@@ -5108,11 +5374,44 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # STORAGE GROUP — AUTO-INDEXING
 # ═══════════════════════════════════════════════════════════════
+# Reserved vault key for the onboarding "Where are we?! 🙃" message. Post it
+# in the storage group like any other item, with a caption starting with
+# this exact word. It starts with an underscore on purpose: the password
+# DM lookup (see handle in the STORAGE PASSWORD LOOKUP block) lowercases
+# what a user types and matches it against STORAGE_INDEX, and the text
+# handler treats this as a normal password too — so a real word here would
+# let anyone who typed it read the message early. Guarded there too.
+ONBOARDING_STORAGE_KEY = "_onboarding"
+
 async def _index_item(caption: str, message_ids: list):
     password = caption.strip().split(maxsplit=1)[0].lower()
     STORAGE_INDEX.setdefault(password, []).append(sorted(message_ids))
     await save_storage_index()
     return password
+
+async def _send_onboarding_special(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Sends the admin's stored onboarding message (every item filed under
+    ONBOARDING_STORAGE_KEY, in the order they were posted), then a final
+    🗣️🗣️🔥 يلا بينا button.
+
+    Telegram's copyMessages can't attach a keyboard, so the button always
+    goes on its own small follow-up message. If nothing has been stored
+    yet (or a copy fails) the user still gets that button — onboarding
+    must never dead-end on a missing/broken vault item."""
+    for message_ids in STORAGE_INDEX.get(ONBOARDING_STORAGE_KEY, []):
+        try:
+            await context.bot.copy_messages(
+                chat_id=user_id, from_chat_id=STORAGE_GROUP_ID, message_ids=message_ids,
+            )
+        except Exception as e:
+            print(f"ONBOARDING: couldn't copy vault item {message_ids}: {e}")
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="👇",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗣️🗣️🔥 يلا بينا", callback_data="onboard_go"),
+        ]]),
+    )
 
 async def _finalize_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
     # Wait for the album's parts to stop arriving before filing it as one item.
@@ -5132,6 +5431,26 @@ async def _finalize_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: st
     await context.bot.send_message(
         STORAGE_GROUP_ID,
         f"✅ اتخزن ألبوم من {len(buf['ids'])} ملف تحت الكلمة: <code>{password}</code>\n"
+        f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def handle_storage_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Vault posts are normally media + a password caption (handle_storage_message
+    below), but the onboarding "Where are we?! 🙃" message is often plain
+    text. So a text post in the vault is filed too — but ONLY when its first
+    word is exactly ONBOARDING_STORAGE_KEY. Any other text in the storage
+    group is ignored, same as before, so nothing else about the vault changes."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    first_word = msg.text.strip().split(maxsplit=1)[0].lower() if msg.text.strip() else ""
+    if first_word != ONBOARDING_STORAGE_KEY:
+        return
+    await _index_item(msg.text, [msg.message_id])
+    await backup_storage_to_channel(context)
+    await msg.reply_text(
+        f"✅ اتخزن تحت الكلمة: <code>{ONBOARDING_STORAGE_KEY}</code>\n"
         f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
         parse_mode=ParseMode.HTML,
     )
@@ -5385,6 +5704,10 @@ def _locked_year_modules_view(user_id: int | None, years: list) -> tuple[str, In
         [InlineKeyboardButton(module_label(m), callback_data=f"module:{year_class}:{i}")]
         for i, m in enumerate(modules)
     ]
+    # Search Content 🔎 — scoped to this locked year; module (or "all
+    # modules") is picked on the next screen. See search_year:/search_mod:
+    # in button_handler and AWAITING_SEARCH_QUERY.
+    buttons.append([InlineKeyboardButton("Search Content 🔎", callback_data=f"search_year:{year_class}")])
     # Not "🔙 رجوع للسنين" here — with a locked year/class there's no
     # other year behind it to go back to, so that button would just
     # reopen this exact same screen. Back to Home is the only meaningful
@@ -5413,6 +5736,7 @@ async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
+    buttons.append([InlineKeyboardButton("Search Content 🔎", callback_data="search_pick_year")])
     await update.message.reply_text(
         "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -5605,30 +5929,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ الـ report ده مقفول بالفعل.")
             return
         _append_report_message(thread, "admin", reply_text)
-        await save_report_threads()
-        try:
-            await context.bot.send_message(
-                chat_id=thread["user_id"],
-                text=f"📩 <b>رد من الأدمن على مشكلتك:</b>\n\n{html.escape(reply_text)}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("↩️ Reply", callback_data=f"report_user_reply:{group_message_id}"),
-                ]]),
-            )
-        except Exception as e:
-            print("REPORT REPLY DELIVERY FAILED:", e)
-            await update.message.reply_text(
-                "⚠️ الرد اتسجل بس معرفتش أبعته للمستخدم (يمكن قافل البوت). هرجع أعدل الرسالة برضو."
-            )
-        try:
-            await context.bot.edit_message_text(
-                chat_id=REPORT_ISSUE_GROUP_ID, message_id=group_message_id,
-                text=_report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
-                reply_markup=_report_reply_keyboard(group_message_id, closed=thread["closed"]),
-            )
-        except Exception as e:
-            print("REPORT THREAD EDIT FAILED:", e)
-        await backup_report_threads_to_channel(context)
+        user_dm_ok = await _refresh_report_thread(context, group_message_id, thread)
+        if not user_dm_ok:
+            await update.message.reply_text("⚠️ الرد اتسجل بس معرفتش أبعته للمستخدم (يمكن قافل البوت).")
         return
 
     # ── AWAITING USER FOLLOWUP (reporter's own "↩️ Reply") ───────
@@ -5645,17 +5948,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ الـ report ده اتقفل، مينفعش ترد عليه تاني.")
             return
         _append_report_message(thread, "user", text)
-        await save_report_threads()
         await update.message.reply_text("✅ اتبعت للأدمن.")
-        try:
-            await context.bot.edit_message_text(
-                chat_id=REPORT_ISSUE_GROUP_ID, message_id=group_message_id,
-                text=_report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
-                reply_markup=_report_reply_keyboard(group_message_id, closed=thread["closed"]),
-            )
-        except Exception as e:
-            print("REPORT THREAD EDIT FAILED (user followup):", e)
-        await backup_report_threads_to_channel(context)
+        await _refresh_report_thread(context, group_message_id, thread)
         return
 
     # ── AWAITING BROADCAST MESSAGE (/broadcast composer) ──────────
@@ -5668,6 +5962,16 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         draft["text"] = text
         body, markup = _broadcast_composer_view(real_uid)
         await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── AWAITING SEARCH QUERY (🔎 Search Content) ─────────────────
+    # Set by the search_mod: callback once year (+ module, or "all") is
+    # picked — see button_handler. Keyed the same way (real_uid via
+    # query.from_user.id there, which is the same id as effective_user
+    # here).
+    pending_search = AWAITING_SEARCH_QUERY.pop(real_uid, None)
+    if pending_search:
+        await _send_search_results(context, user_id, pending_search["year"], pending_search["module"], text)
         return
 
     # ── AWAITING NICKNAME (Settings, or first-ever /start) ───────
@@ -5731,48 +6035,18 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── AWAITING REPORT ISSUE TEXT (/report_issue) ───────────────
-    # Keyed by real_uid, same as nickname above.
-    if AWAITING_REPORT_ISSUE.pop(real_uid, None):
+    # Keyed by real_uid, same as nickname above. Stages a draft (preview
+    # + Send/Cancel buttons) instead of posting straight to admins — see
+    # _stage_report_draft. Expired waits (see REPORT_ISSUE_AWAIT_TIMEOUT)
+    # fall through and this message is handled normally below instead.
+    report_wait_started = AWAITING_REPORT_ISSUE.pop(real_uid, None)
+    if report_wait_started is not None and time.time() - report_wait_started <= REPORT_ISSUE_AWAIT_TIMEOUT:
         if not REPORT_ISSUE_GROUP_ID:
             await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
             return
-        tg_user  = update.effective_user
-        name     = " ".join(p for p in (tg_user.first_name, tg_user.last_name) if p).strip() if tg_user else "?"
-        username = tg_user.username if tg_user else None
-        thread = {
-            "user_id":  real_uid,
-            "name":     name or "?",
-            "username": username,
-            "user_text": text,
-            "replies":  [],
-            "closed":   False,
-        }
-        try:
-            sent = await context.bot.send_message(
-                chat_id=REPORT_ISSUE_GROUP_ID,
-                text="📩 New issue report — loading…",   # placeholder; fixed up right below once we have the real id
-                reply_markup=_report_reply_keyboard(0, closed=False),   # placeholder id, fixed up right below too
-            )
-        except Exception as e:
-            print("REPORT ISSUE SEND FAILED:", e)
-            await update.message.reply_text("⚠️ مشكلة في إرسال الرسالة — جرب تاني لو سمحت.")
-            return
-        # Both the displayed Reply ID and the keyboard's callback_data need
-        # this message's own id, which we only get back after sending —
-        # one edit to fix up both text and keyboard together.
-        try:
-            await context.bot.edit_message_text(
-                chat_id=REPORT_ISSUE_GROUP_ID, message_id=sent.message_id,
-                text=_report_thread_text(thread, sent.message_id), parse_mode=ParseMode.HTML,
-                reply_markup=_report_reply_keyboard(sent.message_id, closed=False),
-            )
-        except Exception as e:
-            print("REPORT ISSUE ID FIXUP FAILED:", e)
-        REPORT_THREADS[sent.message_id] = thread
-        await save_report_threads()
-        await backup_report_threads_to_channel(context)
-        await update.message.reply_text("✅ اتبعتت. هيتم الرد عليك من هنا لما الأدمن يشوفها.")
+        await _stage_report_draft(update, context, real_uid, text=text, photo_file_id=None)
         return
+
 
     # ── AWAITING ADMIN REPLY TEXT (report_reply button) ──────────
     # Keyed by real_uid normally — but if this group has "remain
@@ -5801,35 +6075,14 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ الـ report ده مش لاقيه دلوقتي (يمكن البوت اتعمله restart).")
             return
         _append_report_message(thread, "admin", text)
-        await save_report_threads()
-        try:
-            await context.bot.send_message(
-                chat_id=thread["user_id"],
-                text=f"📩 <b>رد من الأدمن على مشكلتك:</b>\n\n{html.escape(text)}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("↩️ Reply", callback_data=f"report_user_reply:{group_message_id}"),
-                ]]),
-            )
-        except Exception as e:
-            print("REPORT REPLY DELIVERY FAILED:", e)
-            await update.message.reply_text(
-                "⚠️ الرد اتسجل بس معرفتش أبعته للمستخدم (يمكن قافل البوت). هرجع أعدل الرسالة برضو."
-            )
-        try:
-            await context.bot.edit_message_text(
-                chat_id=REPORT_ISSUE_GROUP_ID, message_id=group_message_id,
-                text=_report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
-                reply_markup=_report_reply_keyboard(group_message_id, closed=thread["closed"]),
-            )
-        except Exception as e:
-            print("REPORT THREAD EDIT FAILED:", e)
-        await backup_report_threads_to_channel(context)
+        user_dm_ok = await _refresh_report_thread(context, group_message_id, thread)
+        if not user_dm_ok:
+            await update.message.reply_text("⚠️ الرد اتسجل بس معرفتش أبعته للمستخدم (يمكن قافل البوت).")
         return
 
     # ── STORAGE PASSWORD LOOKUP ──────────────────────────────────
     if update.effective_chat.type == "private":
-        items = STORAGE_INDEX.get(text.lower())
+        items = STORAGE_INDEX.get(text.lower()) if text.lower() != ONBOARDING_STORAGE_KEY else None
         if items:
             for message_ids in items:
                 try:
@@ -5922,13 +6175,96 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("ERROR:", e)
 
 # ═══════════════════════════════════════════════════════════════
+# QUIZZY POPUP EASTER EGGS
+#
+# A handful of native Telegram alert popups (query.answer(text,
+# show_alert=True)) on top of specific button taps — Quizzy (the bot's
+# cat persona) getting a word in on top of whatever that button
+# normally does. None of these ever block or change the underlying
+# action; each fires (or doesn't) and the handler falls straight
+# through to its normal behavior right after.
+#
+# Two of the five scenarios this was scoped for don't fit this
+# mechanism at all, because Telegram's popup alert only exists as a
+# response to a button tap (a callback query) — there's no equivalent
+# for a poll answer:
+#   - "User gets 10/10" happens when the LAST question of a Daily
+#     Quiz is answered — that's a poll vote (handle_poll_answer),
+#     not a button tap, so there's no callback query to answer with
+#     a popup. The perfect-score line is appended to the completion
+#     summary message text instead — same joke, different delivery,
+#     see _finish-daily-quiz block in handle_poll_answer.
+#   - "User opens quizzes around 3–5 AM" is applied at every place a
+#     user actually starts a quiz session via a button tap (Daily
+#     Quiz, a lecture, a Mistakes Bank retake) rather than at every
+#     screen that merely mentions quizzes, since "opens quizzes" reads
+#     as starting one, not browsing a menu.
+# ═══════════════════════════════════════════════════════════════
+QUIZZY_LATE_NIGHT_START_HOUR = 3   # inclusive
+QUIZZY_LATE_NIGHT_END_HOUR   = 5   # exclusive — 3:00–4:59 local (DAILY_QUIZ_TZ)
+QUIZZY_LATE_NIGHT_MSG        = "🐱 Bro just go to sleep."
+QUIZZY_ALREADY_DONE_MSG      = "🐱 didn't I already give you one..."
+QUIZZY_PERFECT_SCORE_LINE    = "🐱 I would say I'm proud of you, but I'm literally a cat."
+QUIZZY_MISTAKES_EMPTY_MSG    = "🐱 Does this make you bankrupt?"
+QUIZZY_MISTAKES_HIGH_MSG     = "🐱 they say mistakes make you stronger, how much can you bench-press?"
+QUIZZY_MISTAKES_HIGH_THRESHOLD = 10   # mistake count at/above which the bench-press jab fires
+
+def _quizzy_is_late_night() -> bool:
+    """Same clock/timezone as the insomniac Extra achievement
+    (DAILY_QUIZ_TZ), but its own separate 3–5 AM window rather than
+    reusing that achievement's 2–5 AM — a popup and an Extra are
+    different things and don't need to agree on the exact cutoff."""
+    hour = datetime.now(DAILY_QUIZ_TZ).hour
+    return QUIZZY_LATE_NIGHT_START_HOUR <= hour < QUIZZY_LATE_NIGHT_END_HOUR
+
+async def _quizzy_late_night_popup(query) -> None:
+    """Best-effort — a failed/expired callback query here should never
+    stop the quiz it's attached to from starting."""
+    if _quizzy_is_late_night():
+        try:
+            await query.answer(QUIZZY_LATE_NIGHT_MSG, show_alert=True)
+        except Exception:
+            pass
+
+# ── Onboarding toasts ──────────────────────────────────────────────
+# Quizzy's onboarding quips are shown as a toast (query.answer(text) with
+# show_alert left False): a banner that appears at the top of the chat and
+# disappears by itself, instead of a message that stays in the chat. A
+# toast only exists as the answer to a button tap, so this covers the two
+# quips that ARE taps — the one after picking a Year/Class, and the
+# welcome line when tapping 🗣️🗣️🔥 يلا بينا. The typed-/start greetings
+# have no callback query to answer, so they remain ordinary messages.
+# Telegram truncates a toast at 200 characters; every line here is far under.
+ONBOARDING_YEAR_QUIPS = {
+    "y1": "Year 1? You are a new-comer! Oh You will love it here.",
+    "y2": "Year 2? Oh you are in for a trip! But don't worry it will be fun. 😉",
+    "y3": "Year 3? Wouldn't that be... Oh! You are becoming a Semi-Senior soon!!",
+}
+
+def _onboarding_toast(callback_data: str | None) -> str | None:
+    """Toast text for this tap, or None for no toast (the normal case —
+    None makes query.answer() behave exactly as a bare answer() did)."""
+    data = callback_data or ""
+    if data.startswith("onboard_yc:"):
+        quip = ONBOARDING_YEAR_QUIPS.get(data.split(":", 1)[1])
+        return f"🐱 {quip}" if quip else None
+    if data == "onboard_go":
+        return "🐱 " + random.choice(QUIZZY_WELCOME_LINES)
+    return None
+
+# ═══════════════════════════════════════════════════════════════
 # INLINE BUTTON HANDLER
 # ═══════════════════════════════════════════════════════════════
 @_serialize_per_user
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
-    await query.answer()
+    # Telegram takes ONE answerCallbackQuery per tap, and this is it — so a
+    # Quizzy toast (a small banner at the top of the screen that fades on
+    # its own, i.e. answer(text) WITHOUT show_alert) has to be decided
+    # right here rather than answered later inside the branch. See
+    # _onboarding_toast for which taps get one.
+    await query.answer(text=_onboarding_toast(query.data))
 
     # ── QUESTION TIMEOUT — resume/abandon a paused session ────────────
     # Only shown after two consecutive timed-out questions in a row (see
@@ -6053,6 +6389,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # ── REPORT ISSUE: draft confirmation (user's own Send/Cancel) ────
+    if query.data == "report_draft_send":
+        draft = REPORT_DRAFTS.pop(user_id, None)
+        if draft is None:
+            await query.edit_message_text("⚠️ مفيش بلاغ متسجل دلوقتي — جرب /report_issue تاني.")
+            return
+        if time.time() - draft["created_at"] > REPORT_DRAFT_CONFIRM_TIMEOUT:
+            await query.edit_message_text("⌛ البلاغ ده قديم شوية — جرب /report_issue تاني.")
+            return
+        ok = await _submit_report(context, user_id, query.from_user, draft["text"], draft["photo_file_id"])
+        if ok:
+            await query.edit_message_text("✅ اتبعتت. هيتم الرد عليك من هنا لما الأدمن يشوفها.")
+        else:
+            await query.edit_message_text("⚠️ مشكلة في إرسال الرسالة — جرب تاني لو سمحت.")
+        return
+
+    if query.data == "report_draft_cancel":
+        REPORT_DRAFTS.pop(user_id, None)
+        await query.edit_message_text("🗑 اتلغى. تقدر تبدأ بلاغ جديد بـ /report_issue في أي وقت.")
+        return
+
     # ── REPORT ISSUE: reply / close (admin-only, from REPORT_ISSUE_GROUP_ID) ──
     if query.data == "report_noop":
         return   # "🔒 Closed" button on an already-closed report — nothing to do
@@ -6122,6 +6479,63 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_report_threads_to_channel(context)
         return
 
+    # ── 🔎 SEARCH CONTENT ────────────────────────────────────────────
+    # search_pick_year  -> full year picker (only reachable when this user
+    #                      has no locked year/class — see _locked_year_modules_view)
+    # search_year:<year> -> module picker (+ "All Modules") for that year
+    # search_mod:<year>:<module|__ALL__> -> arms AWAITING_SEARCH_QUERY and
+    #                      prompts for the search text; also what
+    #                      "🔎 Search Again" reuses after a completed search.
+    if query.data == "search_pick_year":
+        years = configured_years()
+        if not years:
+            await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
+            return
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"search_year:{y}")] for y in years]
+        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="quiz_years")])
+        await query.edit_message_text(
+            "🔎 <b>Search Content</b> — اختار السنة:", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("search_year:"):
+        year = query.data.split(":", 1)[1]
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if not modules:
+            await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
+            return
+        buttons = [[InlineKeyboardButton("🔎 All Modules", callback_data=f"search_mod:{year}:{SEARCH_MOD_ALL}")]]
+        buttons += [[InlineKeyboardButton(module_label(m), callback_data=f"search_mod:{year}:{m}")] for m in modules]
+        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="quiz_years")])
+        await query.edit_message_text(
+            f"🔎 <b>Search Content</b> — {year_label(year)}: اختار الموديول (أو كله):",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("search_mod:"):
+        _, year, mod_token = query.data.split(":", 2)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        module = None if mod_token == SEARCH_MOD_ALL else mod_token
+        if module and module not in ready_modules(year):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        AWAITING_SEARCH_QUERY[user_id] = {"year": year, "module": module}
+        await query.edit_message_text(
+            f"🔎 <b>Search Content</b>\n📚 {_search_scope_label(year, module)}\n\n"
+            "Type a word or a part of a question and Quizzy will search for it!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="quiz_years")]]),
+        )
+        return
+
     # ── QUIZ YEARS: top-level list ──────────────────────────────────
     if query.data == "quiz_years":
         years = configured_years()
@@ -6134,6 +6548,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             return
         buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
+        buttons.append([InlineKeyboardButton("Search Content 🔎", callback_data="search_pick_year")])
         await query.edit_message_text(
             "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -6318,6 +6733,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if get_randomize_enabled(user_id):
             ready_ids = list(ready_ids)
             random.shuffle(ready_ids)
+
+        await _quizzy_late_night_popup(query)
 
         auto_next = get_auto_next_enabled(user_id)
         lr_key = _lr_key(year, lecture_key)
@@ -6859,22 +7276,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_settings()
         await backup_settings_to_channel(context)
         if is_onboarding:
-            onboard_lines = {
-                "y1": "Year 1? You are a new-comer! Oh You will love it here.",
-                "y2": "Year 2? Oh you are in for a trip! But don't worry it will be fun. 😉",
-                "y3": "Year 3? Wouldn't that be... Oh! You are becoming a Semi-Senior soon!!",
-            }
+            # Quizzy's year quip is no longer a chat message — it went out
+            # as a toast on this very tap (see _onboarding_toast /
+            # ONBOARDING_YEAR_QUIPS), so only the confirmation and the
+            # bully question remain in the chat. The bully question's two
+            # buttons lead to the "just kidding" step — see onboard_bully below.
             await query.edit_message_text(
                 f"✅ تمام، {year_class_label(year_class)}.",
             )
             await context.bot.send_message(
                 chat_id=user_id,
-                text=quizzy_block(QUIZZY_WELCOME_ART, onboard_lines[year_class]),
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("what is this place?! 🙂", callback_data="onboard_how")],
-                    [InlineKeyboardButton("🗣️🗣️🔥 يلا بينا", callback_data="onboard_go")],
-                ]),
+                text="Do you want me to bully you when you get questions wrong?",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("What???", callback_data="onboard_bully:what"),
+                    InlineKeyboardButton("No 😭",   callback_data="onboard_bully:no"),
+                ]]),
             )
         elif is_daily_quiz:
             await show_daily_quiz_menu(context, user_id, query.message)
@@ -6882,26 +7298,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_settings(context, user_id, query.message, edit=True)
         return
 
-    # ── onboard_how / onboard_go — the two buttons shown right after the
-    # onboarding year/class quip above ("what is this place?!" vs "let's
-    # go"). onboard_how reuses HOW_TO_USE_TEXT (menu_how's content — will
-    # be tweaked separately later) but keeps a way back into onboarding
-    # instead of a "Back to Home" button, since there's no home yet;
-    # onboard_go is the actual finish line into the real main menu.
-    if query.data == "onboard_how":
+    # ── onboarding steps after the year pick ─────────────────────────
+    # bully question -> "just kidding" (onboard_bully) -> either door
+    # (onboard_how / onboard_where) -> the admin's special message ->
+    # onboard_go, the actual finish line into the real main menu.
+    # Either answer to the bully question ("What???" / "No 😭") gets the
+    # same follow-up — the choice isn't stored or acted on, it's just the
+    # joke's setup. Edited in place so the question doesn't linger.
+    if query.data.startswith("onboard_bully:"):
         await query.edit_message_text(
-            HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML,
+            "Haha i am just kidding (maybe)",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗣️🗣️🔥 يلا بينا", callback_data="onboard_go"),
+                InlineKeyboardButton("what is this place?! 🙂", callback_data="onboard_how"),
+                InlineKeyboardButton("Where are we?! 🙃",       callback_data="onboard_where"),
             ]]),
         )
         return
 
+    # BOTH "what is this place?! 🙂" (onboard_how) and "Where are we?! 🙃"
+    # (onboard_where) deliver the same thing: the admin's special welcome
+    # message, filed in the storage vault under ONBOARDING_STORAGE_KEY (see
+    # _send_onboarding_special). They're two differently-worded doors into
+    # the same room. The 🗣️🗣️🔥 يلا بينا button goes on the LAST message
+    # sent, since a copied vault item can't carry its own buttons — see
+    # _send_onboarding_special. (The How To Use text is no longer part of
+    # onboarding; it's still on the main menu's 🦦 How To Use button.)
+    if query.data in ("onboard_how", "onboard_where"):
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)   # buttons are one-shot
+        except Exception:
+            pass
+        await _send_onboarding_special(context, user_id)
+        return
+
     if query.data == "onboard_go":
+        # The random Quizzy welcome line already showed as a toast on this
+        # tap (see _onboarding_toast), so the menu message itself is just
+        # the greeting — no ASCII cat block repeated underneath it.
         nickname = get_nickname(user_id)
         greeting = f"يا {html.escape(nickname)}! " if nickname else ""
         await query.edit_message_text(
-            f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
             f"{greeting}تحب تعمل أي؟!:",
             parse_mode=ParseMode.HTML,
             reply_markup=start_menu_keyboard(),
@@ -7058,6 +7494,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             return
         buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
+        buttons.append([InlineKeyboardButton("Search Content 🔎", callback_data="search_pick_year")])
         await query.message.reply_text(
             "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -7069,6 +7506,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "daily_quiz_begin":
+        # "Already done today" takes priority over the late-night nudge —
+        # this is the one place that race can actually surface (a stale
+        # Start button tapped after the quiz was already completed some
+        # other way), and it's the more specific joke for that exact case.
+        if get_daily_quiz_last_date(user_id) == _today():
+            try:
+                await query.answer(QUIZZY_ALREADY_DONE_MSG, show_alert=True)
+            except Exception:
+                pass
+        else:
+            await _quizzy_late_night_popup(query)
         await start_daily_quiz(context, user_id, message=query.message)
         return
 
@@ -7076,6 +7524,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "mistakes_bank_menu":
         scope = get_daily_quiz_scope()
         count = len(_scoped_mistakes_bank(user_id))
+        if count == 0:
+            try:
+                await query.answer(QUIZZY_MISTAKES_EMPTY_MSG, show_alert=True)
+            except Exception:
+                pass
+        elif count >= QUIZZY_MISTAKES_HIGH_THRESHOLD:
+            try:
+                await query.answer(QUIZZY_MISTAKES_HIGH_MSG, show_alert=True)
+            except Exception:
+                pass
         scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
         text = f"🧠 <b>بنك الأخطاء</b>\n\n{scope_line}عدد الأسئلة المسجلة: <b>{count}</b>"
         buttons = []
@@ -7086,6 +7544,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "mistakes_retake":
+        await _quizzy_late_night_popup(query)
         await start_mistakes_retake(context, user_id, message=query.message)
         return
 
@@ -7159,12 +7618,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # reporter can send follow-ups back into the same thread.
 #
 # Flow:
-#   1. /report_issue -> AWAITING_REPORT_ISSUE[user_id] = True, bot asks for the text.
-#   2. Next text message from that user (caught in handle()) is the report.
-#      Posted to REPORT_ISSUE_GROUP_ID with a "↩️ Reply" button, and
-#      recorded in REPORT_THREADS keyed by that group message's id — this
-#      id is also shown on the card itself as the "Reply ID".
-#   3. Admin replies one of two ways:
+#   1. /report_issue -> AWAITING_REPORT_ISSUE[user_id] = time.time(), bot
+#      asks for the text (optionally with a photo). Expires after
+#      REPORT_ISSUE_AWAIT_TIMEOUT, and /cancel clears it early — either
+#      way, a message sent after the wait lapsed is handled normally
+#      instead of being swallowed as a report.
+#   2. The user's next text (handle()) or photo (handle_image()) is
+#      staged as a DRAFT (_stage_report_draft), not sent yet — they get a
+#      preview back with "✅ ابعت" / "❌ إلغاء" buttons.
+#   3. Tapping "✅ ابعت" (report_draft_send, in button_handler) calls
+#      _submit_report, which does what step 2 used to do directly: posts
+#      the card to REPORT_ISSUE_GROUP_ID with a "↩️ Reply" button, and
+#      records it in REPORT_THREADS keyed by that group message's id —
+#      this id is also shown on the card itself as the "Reply ID". A
+#      photo, if any, goes out as its own message right after, threaded
+#      under the card via reply_to_message_id (see _submit_report's
+#      docstring for why it's not just the card's caption). Rejected if
+#      more than REPORT_DRAFT_CONFIRM_TIMEOUT has passed since the draft
+#      was staged. "❌ إلغاء" (report_draft_cancel) just discards it.
+#   4. Admin replies one of two ways:
 #        a) Type "-Reply <id> <text>" directly in the group. Preferred —
 #           parsed straight out of the message text with no per-user
 #           state, so it works even if the group has "remain anonymous"
@@ -7176,23 +7648,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #           next message there is picked up in handle(). Kept as a
 #           convenience alongside (a), with a same-chat fallback lookup
 #           for the anonymous-admin case — see the comment at that check.
-#      Either way: appended to the thread via _append_report_message, DM'd
-#      to the user with their own "↩️ Reply" button, and the group message
-#      is edited to show the full thread so far plus fresh Reply/Close
-#      buttons.
-#   4. Reporter taps their own "↩️ Reply" -> AWAITING_USER_FOLLOWUP[user_id]
+#      Either way: appended to the thread via _append_report_message, then
+#      _refresh_report_thread posts the FULL thread as a fresh message to
+#      BOTH sides (admin group card + reporter's DM, each with its own
+#      Reply/Close or Reply button) and collapses whichever full-thread
+#      message each side had before — see that function's docstring for
+#      why a plain edit isn't enough (no push notification) and why the
+#      old message is collapsed rather than left in place (no duplicate
+#      thread dumps piling up).
+#   5. Reporter taps their own "↩️ Reply" -> AWAITING_USER_FOLLOWUP[user_id]
 #      = {...}; their next DM text is appended to the same thread (shown
-#      to the admin under their name) and the group message is refreshed.
-#      Blocked once the thread is closed.
-#   5. Close just strips the buttons and marks the thread closed — no
-#      further replies possible from that message (a re-tapped Reply, from
-#      either side, is rejected with a toast/message).
+#      to the admin under their name) and _refresh_report_thread runs
+#      again, same as step 4. Blocked once the thread is closed.
+#   6. Close just strips the buttons and marks the thread closed in place
+#      (no new message on either side — it's not a reply) — no further
+#      replies possible from that message (a re-tapped Reply, from either
+#      side, is rejected with a toast/message).
 #
 # REPORT_THREADS is persisted the same way as MISTAKES_BANK: a local JSON
 # file plus a pinned backup in REPORT_ISSUE_GROUP_ID, restored on startup
 # (see restore_report_threads_from_channel). A restart mid-thread no
 # longer loses the ability to keep replying to an old report — the thread
-# reloads from the channel backup before polling starts.
+# reloads from the channel backup before polling starts. REPORT_DRAFTS
+# (an unconfirmed draft between steps 2 and 3) is NOT persisted this way
+# — it's short-lived, in-memory only, and a restart mid-draft just means
+# the user re-does /report_issue, same as if the bot had been down when
+# they first tried.
 # ═══════════════════════════════════════════════════════════════
 def _report_reply_keyboard(group_message_id: int, closed: bool) -> InlineKeyboardMarkup:
     if closed:
@@ -7248,23 +7729,210 @@ def _append_report_message(thread: dict, sender: str, text: str) -> None:
         thread["messages"] = [{"from": "admin", "text": r} for r in thread.get("replies", [])]
     thread["messages"].append({"from": sender, "text": text})
 
+def _report_thread_text_for_user(thread: dict) -> str:
+    """User-facing rendering of the same timeline _report_thread_text
+    builds for the admin side — same messages, same order, but without
+    the Reporter ID / Reply ID / "-Reply <id>" lines that only make
+    sense in the admin group."""
+    lines = ["📩 <b>مشكلتك:</b>", "", html.escape(thread["user_text"])]
+    messages = thread.get("messages")
+    if messages is None:
+        messages = [{"from": "admin", "text": r} for r in thread.get("replies", [])]
+    for msg in messages:
+        lines.append("")
+        lines.append("➖➖➖➖➖➖➖➖")
+        if msg["from"] == "admin":
+            lines.append(f"👨‍💼 <b>الأدمن:</b>\n{html.escape(msg['text'])}")
+        else:
+            lines.append(f"👤 <b>انت:</b>\n{html.escape(msg['text'])}")
+    return "\n".join(lines)
+
+async def _collapse_old_report_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int | None) -> None:
+    """Shrinks a superseded report message once a fresh full-thread
+    message has replaced it — deletion is tried first (cleanest), and
+    only falls back to editing it down to a single '•' (buttons
+    stripped, so a stale Reply/Close can't sit alongside the new
+    message's own) if deletion isn't possible for any reason (message
+    already gone, too old, permissions, etc.). message_id=None (nothing
+    to collapse yet — the very first message on that side) is a no-op."""
+    if message_id is None:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return
+    except Exception:
+        pass
+    try:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="•", reply_markup=None)
+    except Exception:
+        pass   # already gone, too old to edit, etc. — fine either way, the new message is what matters now
+
+async def _refresh_report_thread(context: ContextTypes.DEFAULT_TYPE, group_message_id: int, thread: dict) -> bool:
+    """Called right after _append_report_message, on every new reply or
+    follow-up in either direction. Posts the FULL thread as a brand-new
+    message to BOTH sides — admin group and reporter's DM — rather than
+    editing the existing one in place: an edit doesn't trigger a push
+    notification on Telegram, so a reply sitting in an already-read,
+    silently-edited message is easy to miss entirely. Whichever
+    full-thread message each side had before (if any) is then collapsed
+    via _collapse_old_report_message, so old chat history doesn't turn
+    into a wall of duplicate thread dumps — only the latest copy on each
+    side is ever left full-length.
+
+    group_message_id is the thread's STABLE key: REPORT_THREADS is keyed
+    by the id of the very first card ever sent, and every "-Reply <id>",
+    Reply button, and Close button always references that same stable id
+    (via _report_reply_keyboard) — never whichever physical message
+    happens to be showing it right now. So this is safe to call
+    regardless of how many times the thread has already been refreshed.
+
+    Returns whether the reporter's DM send succeeded — callers use this
+    to warn the admin in-group when it didn't (e.g. the user blocked the
+    bot); the thread itself is still updated and saved either way."""
+    closed = thread.get("closed", False)
+
+    # ── Admin-facing card, in REPORT_ISSUE_GROUP_ID ──
+    try:
+        sent = await context.bot.send_message(
+            chat_id=REPORT_ISSUE_GROUP_ID,
+            text=_report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
+            reply_markup=_report_reply_keyboard(group_message_id, closed=closed),
+        )
+        await _collapse_old_report_message(context, REPORT_ISSUE_GROUP_ID, thread.get("latest_group_message_id"))
+        thread["latest_group_message_id"] = sent.message_id
+    except Exception as e:
+        print("REPORT THREAD GROUP REFRESH FAILED:", e)
+
+    # ── User-facing DM, to the reporter ──
+    user_dm_ok = True
+    try:
+        sent = await context.bot.send_message(
+            chat_id=thread["user_id"],
+            text=_report_thread_text_for_user(thread), parse_mode=ParseMode.HTML,
+            reply_markup=(
+                None if closed else
+                InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Reply", callback_data=f"report_user_reply:{group_message_id}")]])
+            ),
+        )
+        await _collapse_old_report_message(context, thread["user_id"], thread.get("latest_user_message_id"))
+        thread["latest_user_message_id"] = sent.message_id
+    except Exception as e:
+        print("REPORT THREAD USER DM FAILED:", e)   # e.g. the user blocked the bot
+        user_dm_ok = False
+
+    await save_report_threads()
+    await backup_report_threads_to_channel(context)
+    return user_dm_ok
+
+def _report_draft_preview_text(text: str, has_photo: bool) -> str:
+    photo_note = "\n📎 هيتبعت مع الصورة اللي بعتها." if has_photo else ""
+    body = html.escape(text) if text else "<i>(من غير نص — صورة بس)</i>"
+    return f"👀 <b>ده اللي هيتبعت للأدمن:</b>\n\n{body}{photo_note}\n\nتمام كده؟"
+
+async def _stage_report_draft(update: Update, context: ContextTypes.DEFAULT_TYPE, real_uid: int, text: str, photo_file_id: str | None) -> None:
+    """Parks the user's message as an unconfirmed draft instead of
+    posting it straight to REPORT_ISSUE_GROUP_ID, and shows them a
+    preview with Send/Cancel buttons (report_draft_send /
+    report_draft_cancel in button_handler). Overwrites any earlier
+    unconfirmed draft from the same user — only the latest one they
+    typed can ever be sent."""
+    REPORT_DRAFTS[real_uid] = {
+        "text": (text or "").strip(),
+        "photo_file_id": photo_file_id,
+        "created_at": time.time(),
+    }
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ ابعت", callback_data="report_draft_send"),
+        InlineKeyboardButton("❌ إلغاء", callback_data="report_draft_cancel"),
+    ]])
+    await update.message.reply_text(
+        _report_draft_preview_text(text, has_photo=bool(photo_file_id)),
+        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+    )
+
+async def _submit_report(context: ContextTypes.DEFAULT_TYPE, real_uid: int, tg_user, text: str, photo_file_id: str | None) -> bool:
+    """Actually posts a confirmed draft to REPORT_ISSUE_GROUP_ID and
+    records the thread — the part that used to run directly off the
+    user's first message (see the AWAITING_REPORT_ISSUE block in
+    handle()), now run only once they've tapped "✅ ابعت" on the
+    preview. Returns whether it succeeded.
+
+    The card itself is always a plain text message, even when a photo
+    is attached — a photo goes out as its own message right after,
+    threaded under the card via reply_to_message_id. Using the photo's
+    caption for the growing thread text instead (admin replies, user
+    follow-ups) would run into Telegram's 1024-char caption cap on any
+    thread that gets a few exchanges long; a plain text card has no
+    such limit. This first card is also the thread's first "latest"
+    message on the group side — every reply after this one refreshes it
+    via _refresh_report_thread instead of editing it in place."""
+    name     = " ".join(p for p in (tg_user.first_name, tg_user.last_name) if p).strip() if tg_user else "?"
+    username = tg_user.username if tg_user else None
+    thread = {
+        "user_id": real_uid, "name": name or "?", "username": username,
+        "user_text": text, "photo_file_id": photo_file_id, "replies": [], "closed": False,
+    }
+    try:
+        sent = await context.bot.send_message(
+            chat_id=REPORT_ISSUE_GROUP_ID,
+            text="📩 New issue report — loading…",   # placeholder; fixed up right below once we have the real id
+            reply_markup=_report_reply_keyboard(0, closed=False),   # placeholder id, fixed up right below too
+        )
+    except Exception as e:
+        print("REPORT ISSUE SEND FAILED:", e)
+        return False
+    # Both the displayed Reply ID and the keyboard's callback_data need
+    # this message's own id, which we only get back after sending —
+    # one edit to fix up both text and keyboard together.
+    try:
+        await context.bot.edit_message_text(
+            chat_id=REPORT_ISSUE_GROUP_ID, message_id=sent.message_id,
+            text=_report_thread_text(thread, sent.message_id), parse_mode=ParseMode.HTML,
+            reply_markup=_report_reply_keyboard(sent.message_id, closed=False),
+        )
+    except Exception as e:
+        print("REPORT ISSUE ID FIXUP FAILED:", e)
+    if photo_file_id:
+        try:
+            await context.bot.send_photo(
+                chat_id=REPORT_ISSUE_GROUP_ID, photo=photo_file_id,
+                caption="📎 Attached to the report above.",
+                reply_to_message_id=sent.message_id,
+            )
+        except Exception as e:
+            print("REPORT ISSUE PHOTO FORWARD FAILED:", e)
+    thread["latest_group_message_id"] = sent.message_id
+    REPORT_THREADS[sent.message_id] = thread
+    await save_report_threads()
+    await backup_report_threads_to_channel(context)
+    return True
+
 async def report_issue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not REPORT_ISSUE_GROUP_ID:
         await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
         return
     real_uid = update.effective_user.id if update.effective_user else update.effective_chat.id
-    AWAITING_REPORT_ISSUE[real_uid] = True
+    AWAITING_REPORT_ISSUE[real_uid] = time.time()
     await update.message.reply_text(
-        "✏️ اكتب مشكلتك أو ملاحظتك في رسالة واحدة، وهتوصل للأدمن على طول.",
+        "✏️ اكتب مشكلتك أو ملاحظتك في رسالة واحدة (تقدر تبعت صورة معاها كمان لو حابب)، "
+        "وهعرضهالك الأول قبل ما تتبعت للأدمن.\n\n"
+        "غيرت رأيك؟ ابعت /cancel."
     )
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Bails out of a pending image that's waiting for its question, or
-    (admin only) a /broadcast composer waiting on the message text."""
+    (admin only) a /broadcast composer waiting on the message text, or a
+    /report_issue that hasn't been sent/confirmed yet."""
     user_id = update.effective_chat.id
     was_doing_something = bool(PENDING_IMAGE.get(user_id))
     _clear_pending_image(user_id)
     if AWAITING_BROADCAST_MESSAGE.pop(user_id, None):
+        was_doing_something = True
+    if AWAITING_REPORT_ISSUE.pop(user_id, None) is not None:
+        was_doing_something = True
+    if REPORT_DRAFTS.pop(user_id, None) is not None:
+        was_doing_something = True
+    if AWAITING_SEARCH_QUERY.pop(user_id, None) is not None:
         was_doing_something = True
     if was_doing_something:
         await update.message.reply_text(MSG_CANCEL_DONE)
@@ -7330,7 +7998,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("👤 <b>For everyone</b>")
     lines.append("/start — main menu")
     lines.append("/sleep — pauses the bot temporarily in this chat")
-    lines.append("/mystats — your stats (questions created, day streak, lecture quiz results)")
+    lines.append("/mystats — your stats (day streak, accuracy, current module's subjects strongest → weakest, achievements)")
     lines.append("⚙️ Settings — from the /start menu: set your nickname")
     lines.append("/cancel — cancels whatever's currently in progress (pending image, etc.)")
     lines.append("/report_issue — send a message straight to the admin")
@@ -7859,7 +8527,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
     entry = ANALYTICS.get(str(user_id))
     if not entry or not entry.get("last_active_date"):
         send = reply_target.edit_text if edit else reply_target.reply_text
-        await send("📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!")
+        await send("bro you didn't even start anything yet 😂, go take a quiz first 💥")
         return
 
     streak      = entry.get("streak", 0)
@@ -7889,6 +8557,27 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
     )
 
     mistake_count = _user_mistake_count(user_id)
+
+    # Current module's subjects, strongest -> weakest. "Current module" is
+    # the admin-set /daily_module scope when there is one, else the module
+    # of the user's own latest answer — see _current_module_for_stats.
+    # Omitted entirely (no empty header) until they've answered something
+    # in that module.
+    stats_module = _current_module_for_stats(entry)
+    ranking      = _subject_ranking(entry, stats_module)
+    if ranking:
+        subj_lines = []
+        for i, (subject, pct, correct, answered) in enumerate(ranking):
+            marker = "💪" if i == 0 and len(ranking) > 1 else ("⚠️" if i == len(ranking) - 1 and len(ranking) > 1 else "▫️")
+            subj_lines.append(
+                f"  {marker} {html.escape(subject_label(subject))}: <b>{pct:.0f}%</b> ({correct}/{answered})"
+            )
+        subjects_block = (
+            f"📈 <b>{html.escape(stats_module)}</b> — strongest → weakest\n"
+            + "\n".join(subj_lines) + "\n\n"
+        )
+    else:
+        subjects_block = ""
 
     # achievements summary
     ach        = entry.get("achievements", {})
@@ -7940,6 +8629,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         f"   Answered: {lec_answered:,}\n"
         f"   Correct: {lec_correct:,}\n"
         f"   Accuracy: {accuracy:.1f}%\n\n"
+        f"{subjects_block}"
         f"🧠 Mistakes Bank\n"
         f"  current: {mistake_count} questions\n\n"
         f"Your medals\n"
@@ -8536,7 +9226,8 @@ async def _onboarding_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Explicitly let through: /start itself (so onboarding is always
     reachable), the nickname reply while AWAITING_NICKNAME is set (so
     the text handler can actually save it), and the onboarding
-    year/class taps (onboard_yc:*, onboard_how, onboard_go) — every
+    year/class taps and the steps after (onboard_yc:*, onboard_bully:*,
+    onboard_how, onboard_where, onboard_go) — every
     other update gets a nudge back to /start instead of its real
     handler. Channel posts (no effective_user) are never gated, same as
     _ban_gate."""
@@ -8551,7 +9242,7 @@ async def _onboarding_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if update.callback_query:
         data = update.callback_query.data or ""
-        if data.startswith("onboard_yc:") or data in ("onboard_how", "onboard_go"):
+        if data.startswith(("onboard_yc:", "onboard_bully:")) or data in ("onboard_how", "onboard_where", "onboard_go"):
             return
 
     if get_nickname(real_uid) is not None and get_year_class(real_uid) in YEAR_CLASS_NUMBER:
@@ -8618,6 +9309,11 @@ STORAGE_MEDIA_FILTER = (
 )
 app.add_handler(MessageHandler(
     filters.Chat(STORAGE_GROUP_ID) & STORAGE_MEDIA_FILTER, handle_storage_message
+))
+# Plain-text vault posts — only the reserved onboarding key is filed (see
+# handle_storage_text_message); everything else in that group is ignored.
+app.add_handler(MessageHandler(
+    filters.Chat(STORAGE_GROUP_ID) & filters.TEXT & ~filters.COMMAND, handle_storage_text_message
 ))
 
 # Image handler (photos) — excludes the storage group
