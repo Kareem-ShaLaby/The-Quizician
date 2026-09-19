@@ -126,7 +126,11 @@ from zoneinfo import ZoneInfo
 #          channel to insert new poll(s) right after it via
 #          QUIZ_INSERT_AFTER, closed the same way as authoring: -END)
 # 5437   START (also wakes bot from sleep; asks for a nickname on first use)
-# 5505   ADMIN HELPERS
+# 5505   ADMIN HELPERS — is_admin, /dev_panel (Creator-only control panel:
+#          stats snapshot + Set year/Users/Backups/Daily module shortcuts,
+#          replaces the old /admincheck), /set_year (nickname/ID -> year
+#          picker, also reachable from the panel — see
+#          AWAITING_DEVPANEL_SETYEAR/_MYSTATS and _resolve_user_ref)
 # 5526   BROADCAST COMMAND (admin only)
 # 5603   MAIN — ApplicationBuilder here sets .concurrent_updates(256), so
 #          updates from different users are handled in parallel instead of
@@ -191,6 +195,18 @@ IMG_BASE_DIR  = os.path.join(tempfile.gettempdir(), "quizician_imgs")
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
 ADMIN_ID = 940770584
+
+# ── Secondary admins — full admin access EXCEPT /dev_panel ───────
+# Replace the placeholders below with real Telegram numeric user IDs
+# (same @userinfobot lookup as ADMIN_ID above). They pass is_admin() —
+# every admin command/callback that gates on is_admin() — but fail
+# is_creator(), which is the one check /dev_panel (and its own
+# callbacks/flows) uses instead. Shows up in /mystats as "Admin" (vs.
+# "The Creator" for ADMIN_ID itself).
+SECONDARY_ADMIN_IDS = {
+    111111111,  # placeholder — replace with a real secondary admin's Telegram ID
+    222222222,  # placeholder — replace with a real secondary admin's Telegram ID
+}
 
 # ── Replace with your private GROUP's chat ID ────────────────────
 # 1. Create the group, add this bot to it as a member (admin not required
@@ -1616,6 +1632,61 @@ def _contains_vulgar_word(text: str) -> bool:
     if any(word in normalized for word in _VULGAR_WORDS_EN):
         return True
     return any(word in normalized for word in _VULGAR_WORDS_AR_NORM)
+
+def _resolve_user_ref(ref: str) -> int | None:
+    """Resolves an admin-supplied '<Nickname or ID>' reference (as typed
+    to /set_year, /mystats, or the Dev Panel's text-prompt flows) to a
+    real Telegram user_id.
+
+    Tries a numeric Telegram ID first (only if it's a KNOWN user — a
+    random-looking number that isn't actually anyone is treated as "not
+    found" rather than silently addressing a stranger). Otherwise falls
+    back to a nickname match, using the same normalization as the
+    nickname vulgarity filter (_normalize_for_filter — case/diacritics/
+    spacing-insensitive): an exact normalized match wins outright, else
+    the first user whose normalized nickname contains the reference as a
+    substring. Returns None if nothing matches."""
+    ref = ref.strip()
+    if not ref:
+        return None
+    if ref.lstrip("-").isdigit():
+        uid = int(ref)
+        if uid in USERS or str(uid) in SETTINGS or str(uid) in ANALYTICS:
+            return uid
+        return None
+    target = _normalize_for_filter(ref)
+    if not target:
+        return None
+    substring_match = None
+    for uid_str, entry in SETTINGS.items():
+        nickname = entry.get("nickname")
+        if not nickname:
+            continue
+        normalized = _normalize_for_filter(nickname)
+        if normalized == target:
+            return int(uid_str)
+        if substring_match is None and target in normalized:
+            substring_match = int(uid_str)
+    return substring_match
+
+async def _prompt_set_year(reply_target, ref: str) -> None:
+    """Resolves `ref` (a nickname or ID, as typed) and replies on
+    reply_target (an update.message — this is only ever reached from a
+    typed command or a typed follow-up, never a button tap) with the
+    year/class picker for that person. Shared by /set_year and the Dev
+    Panel's 🔢 Set year flow (see AWAITING_DEVPANEL_SETYEAR). The actual
+    edit happens in button_handler's devpanel_setyear_pick: branch once
+    the admin taps a year."""
+    target_id = _resolve_user_ref(ref)
+    if target_id is None:
+        await reply_target.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(ref)}")
+        return
+    label = get_nickname(target_id) or str(target_id)
+    await reply_target.reply_text(
+        f"🔢 اختار السنة الجديدة لـ {html.escape(label)}:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=year_class_keyboard(f"devpanel_setyear_pick:{target_id}"),
+    )
 
 def _get_bool_setting(user_id: int, key: str) -> bool:
     # Defaults to True for anyone not yet in SETTINGS (or missing the key) —
@@ -3596,6 +3667,18 @@ AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is wai
 PENDING_QUIZ_DELETE    = {}    # admin_id -> (year, lecture_key), set by /quiz_delete while waiting on
                                 # the confirm/cancel tap (see quizdel_yes/quizdel_no in button_handler)
 
+# ── Dev Panel support (/dev_panel — Creator-only control panel) ─────
+# The panel's "🔢 Set year" and "👥 Users" buttons need a free-text
+# nickname/ID that a button tap can't supply, so tapping either one
+# just arms one of these (admin_id -> True) and prompts for that text;
+# the next text message from that admin is consumed by the matching
+# AWAITING check near the top of handle() instead of anything else it
+# would normally do. Same RAM-only, restart-is-harmless convention as
+# every other AWAITING_*/PENDING_* dict here. See _resolve_user_ref for
+# how the typed nickname/ID gets turned into a user_id.
+AWAITING_DEVPANEL_SETYEAR = {}    # admin_id -> True
+AWAITING_DEVPANEL_MYSTATS = {}    # admin_id -> True
+
 # ── 🔎 Search Content support ────────────────────────────────────
 # Set by the search_mod: callback (see button_handler) once the user has
 # picked a year (always their locked year_class in practice) and a
@@ -5550,12 +5633,13 @@ async def handle_storage_message(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode=ParseMode.HTML,
     )
 
-async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: force-create/refresh both pinned backups right now, instead of
-    waiting for the next real change."""
-    if not is_admin(update):
-        await update.message.reply_text(MSG_ADMIN_ONLY)
-        return
+async def _run_backup_now(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Force-creates/refreshes both pinned backups right now, instead of
+    waiting for the next real change. Shared by /backup_now and the Dev
+    Panel's 💾 Backup Now button — returns the status text to show,
+    rather than sending it itself, since the two callers reply
+    differently (update.message.reply_text vs a fresh send_message after
+    editing a button message)."""
     await backup_storage_to_channel(context)
     for y in configured_years():
         await backup_quiz_to_channel(context, y)
@@ -5569,7 +5653,15 @@ async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         ok = bool(QUIZ_BACKUP_STATE[y].get("backup_msg_id"))
         lines.append(f"📌 {year_label(y)}: {'تم' if ok else 'فشل'}")
-    await update.message.reply_text("\n".join(lines))
+    return "\n".join(lines)
+
+async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: force-create/refresh both pinned backups right now, instead of
+    waiting for the next real change."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    await update.message.reply_text(await _run_backup_now(context))
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZ CHANNEL — AUTO-INDEXING
@@ -5827,6 +5919,23 @@ async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
 
+def _daily_module_view() -> tuple[str | None, InlineKeyboardMarkup | None]:
+    """Builds the /daily_module picker screen. Shared by daily_module_cmd
+    and the Dev Panel's 📆 Daily Module button. Returns (None, None) if
+    there are no configured years to pick from — callers show their own
+    'nothing configured' message in that case, since one replies fresh
+    and the other edits a button message."""
+    years = configured_years()
+    if not years:
+        return None, None
+    scope = get_daily_quiz_scope()
+    current = f"\n\nدلوقتي محدد: {year_label(scope['year'])} — {scope['module']}" if scope else "\n\nدلوقتي: كل المنهج (مفيش تحديد)"
+    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"dqy:{y}")] for y in years]
+    if scope:
+        buttons.append([InlineKeyboardButton("🔓 شيل التحديد (رجّع كل المنهج)", callback_data="dq_scope_off")])
+    text = f"📚 <b>Daily Quiz — اختار الموديول اللي هيتحدد عليه:</b>{current}"
+    return text, InlineKeyboardMarkup(buttons)
+
 async def daily_module_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: pick a year, then a module, to temporarily override that
     year's DAILY_QUIZ_ACTIVE_MODULE default (e.g. to switch early, before
@@ -5837,20 +5946,11 @@ async def daily_module_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
-    years = configured_years()
-    if not years:
+    text, markup = _daily_module_view()
+    if text is None:
         await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
         return
-    scope = get_daily_quiz_scope()
-    current = f"\n\nدلوقتي محدد: {year_label(scope['year'])} — {scope['module']}" if scope else "\n\nدلوقتي: كل المنهج (مفيش تحديد)"
-    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"dqy:{y}")] for y in years]
-    if scope:
-        buttons.append([InlineKeyboardButton("🔓 شيل التحديد (رجّع كل المنهج)", callback_data="dq_scope_off")])
-    await update.message.reply_text(
-        f"📚 <b>Daily Quiz — اختار الموديول اللي هيتحدد عليه:</b>{current}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 def _quiz_year_arg(context) -> tuple[str | None, str | None]:
     """Shared arg-parsing for /quiz_list and /quiz_delete: expects the
@@ -6027,6 +6127,26 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         draft["text"] = text
         body, markup = _broadcast_composer_view(real_uid)
         await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── AWAITING DEV PANEL — 🔢 Set year (typed nickname/ID) ───────
+    # Set only via the creator-gated devpanel_setyear callback — the
+    # is_creator check here is defense in depth, not the real gate.
+    if AWAITING_DEVPANEL_SETYEAR.pop(real_uid, None):
+        if not is_creator(update):
+            return
+        await _prompt_set_year(update.message, text)
+        return
+
+    # ── AWAITING DEV PANEL — 👥 Users (typed nickname/ID) ───────────
+    if AWAITING_DEVPANEL_MYSTATS.pop(real_uid, None):
+        if not is_creator(update):
+            return
+        target_id = _resolve_user_ref(text)
+        if target_id is None:
+            await update.message.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(text)}")
+            return
+        await _send_mystats(context, target_id, update.message)
         return
 
     # ── AWAITING SEARCH QUERY (🔎 Search Content) ─────────────────
@@ -6497,6 +6617,100 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
+    # ── /dev_panel — Creator-only control panel ───────────────────────
+    if query.data == "devpanel_back":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        AWAITING_DEVPANEL_SETYEAR.pop(user_id, None)
+        AWAITING_DEVPANEL_MYSTATS.pop(user_id, None)
+        text, markup = _dev_panel_view()
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    if query.data == "devpanel_setyear":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        AWAITING_DEVPANEL_SETYEAR[user_id] = True
+        await query.edit_message_text(
+            "🔢 ابعت الـ Nickname أو الـ ID بتاع الشخص اللي عايز تعدل سنته:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="devpanel_back")]]),
+        )
+        return
+
+    if query.data == "devpanel_mystats":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        AWAITING_DEVPANEL_MYSTATS[user_id] = True
+        await query.edit_message_text(
+            "👥 ابعت الـ Nickname أو الـ ID بتاع الشخص اللي عايز تشوف إحصائياته:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="devpanel_back")]]),
+        )
+        return
+
+    if query.data == "devpanel_backups":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        text, markup = _dev_panel_backups_view()
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    if query.data == "devpanel_backup_now":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        await query.edit_message_text("💾 بيعمل باك أب دلوقتي…")
+        await context.bot.send_message(chat_id=user_id, text=await _run_backup_now(context))
+        return
+
+    if query.data == "devpanel_restore":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        await query.edit_message_text(
+            "🔄 اختار الـ system اللي عايز تعمله restore من آخر نسخة مثبتة (pinned) في القناة بتاعته:",
+            reply_markup=_restore_picker_keyboard(),
+        )
+        return
+
+    if query.data == "devpanel_daily_module":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        text, markup = _daily_module_view()
+        if text is None:
+            await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
+            return
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── /dev_panel: 🔢 Set year — year/class picker tap on a target user
+    # (as opposed to onboard_yc:/dqyc:, which act on the tapping user
+    # themselves). Parsed separately since the target's user_id rides
+    # along in callback_data: "devpanel_setyear_pick:<target_id>:<yc>".
+    if query.data.startswith("devpanel_setyear_pick:"):
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        _, target_str, yc = query.data.split(":")
+        if yc not in YEAR_CLASS_NUMBER:
+            await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
+            return
+        target_id = int(target_str)
+        entry = _get_settings_entry(target_id)
+        entry["year_class"] = yc
+        await save_settings()
+        await backup_settings_to_channel(context)
+        label = get_nickname(target_id) or str(target_id)
+        await query.edit_message_text(
+            f"✅ اتعدلت سنة <b>{html.escape(label)}</b> لـ {year_class_label(yc)}.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     # ── /restore: run one system's restore-from-pin on demand ────────
     if query.data.startswith("restore_go:"):
         if not is_admin(update):
@@ -6593,6 +6807,159 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = query.data.split(":", 1)[1]
         label = _RESTORE_TARGETS.get(key, (key, None))[0]
         await query.edit_message_text(f"🗑 اتلغى — {label} زي ما هي، مفيش حاجة اتغيرت.")
+        return
+
+    # ── /restore: "🛑 Everything 🛑" — restore every system in one go ──
+    # Confirm-gated since it touches every system at once, unlike a
+    # single restore_go: tap. Runs each system's restore_fn sequentially
+    # (same functions restore_go: uses, one per _RESTORE_TARGETS entry)
+    # and reports a per-system status line at the end; any system that
+    # came back "no_backup" gets its own 🆕 Reset button attached to the
+    # summary, same as the single-system flow offers.
+    if query.data == "restore_all":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        systems_line = "، ".join(label for label, _ in _RESTORE_TARGETS.values())
+        await query.edit_message_text(
+            f"🛑 متأكد إنك عايز تعمل restore لكل الـ systems مرة واحدة؟\n\n"
+            f"({systems_line})\n\n"
+            "كل واحد هياخد آخر نسخة مثبتة (pinned) في قناته، ولو مفيش نسخة مثبتة لواحد منهم "
+            "هيتقال لك كده من غير ما يتلمس.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ أيوه، اعمل Restore للكل", callback_data="restore_all_confirm"),
+                InlineKeyboardButton("❌ لأ، إلغاء", callback_data="restore_all_cancel"),
+            ]]),
+        )
+        return
+
+    if query.data == "restore_all_cancel":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await query.edit_message_text("🗑 اتلغى — مفيش حاجة اتعملها restore.")
+        return
+
+    if query.data == "restore_all_confirm":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await query.edit_message_text("🛑 بيعمل restore لكل الـ systems… ده ممكن ياخد شوية وقت.")
+        lines = ["🛑 <b>نتيجة الـ Restore الشامل:</b>\n"]
+        no_backup_keys = []
+        for key, (label, restore_fn) in _RESTORE_TARGETS.items():
+            try:
+                status = await restore_fn(context.application)
+            except Exception as e:
+                print(f"{label.upper()} RESTORE-ALL ERROR:", e)
+                status = "error"
+            if status == "ok":
+                lines.append(f"✅ {label} — تم الـ restore.")
+            elif status == "no_backup":
+                lines.append(f"ℹ️ {label} — مفيش نسخة مثبتة، اتسابت زي ما هي.")
+                no_backup_keys.append(key)
+            elif status == "not_configured":
+                lines.append(f"⚠️ {label} — القناة/الجروب بتاعه مش متظبط.")
+            elif status == "invalid":
+                lines.append(f"❌ {label} — النسخة المثبتة شكلها/structure غلط أو تالف، اتسابت زي ما هي.")
+            else:  # "error"
+                lines.append(f"❌ {label} — فشل الـ restore.")
+        markup = None
+        if no_backup_keys:
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🆕 Reset {_RESTORE_TARGETS[k][0]}", callback_data=f"restore_reset:{k}")]
+                for k in no_backup_keys
+            ])
+        await context.bot.send_message(
+            chat_id=user_id, text="\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=markup,
+        )
+        return
+
+    # ── /restore: "🆕 🛑 RESET EVERYTHING 🛑" — wipe every system to a
+    # blank file in one go (same as tapping 🆕 Reset on each system's
+    # "no backup pinned" offer, just for all of them at once and without
+    # needing restore_go: to hit no_backup first). Confirm-gated and
+    # explicitly warned as irreversible, since unlike restore_all this
+    # discards local data outright rather than pulling from a pin.
+    if query.data == "reset_all":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        systems_line = "، ".join(label for label, _ in _RESTORE_TARGETS.values())
+        await query.edit_message_text(
+            f"🛑🆕 <b>متأكد إنك عايز تعمل RESET لكل الـ systems مرة واحدة؟</b>\n\n"
+            f"({systems_line})\n\n"
+            "⚠️ ده هيمسح الداتا المحلية بتاعت كل نظام من دول ويبدأه من ملف فاضي جديد "
+            "(زي ما بيحصل لو دُست 🆕 Reset على نظام لوحده)، والعملية دي <b>مش هترجع تاني</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 أيوه، اعمل Reset للكل", callback_data="reset_all_confirm"),
+                InlineKeyboardButton("❌ لأ، إلغاء", callback_data="reset_all_cancel"),
+            ]]),
+        )
+        return
+
+    if query.data == "reset_all_cancel":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await query.edit_message_text("🗑 اتلغى — مفيش حاجة اتعملها reset.")
+        return
+
+    if query.data == "reset_all_confirm":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await query.edit_message_text("🆕 بيعمل reset لكل الـ systems… ده ممكن ياخد شوية وقت.")
+        lines = ["🆕 <b>نتيجة الـ Reset الشامل:</b>\n"]
+        for key, (label, _) in _RESTORE_TARGETS.items():
+            reset_fn = _RESET_ACTIONS.get(key)
+            if not reset_fn:
+                continue
+            try:
+                await reset_fn(context)
+                lines.append(f"✅ {label} — اتعمله reset (ملف فاضي جديد متثبت في القناة بتاعته).")
+            except Exception as e:
+                print(f"{label.upper()} RESET-ALL ERROR:", e)
+                lines.append(f"❌ {label} — فشل الـ reset: {e}")
+        await context.bot.send_message(chat_id=user_id, text="\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    # ── /preview — onboarding walkthrough (admin-only, non-destructive;
+    # see preview_cmd for why the Year/Class buttons here are inert) ──
+    if query.data == "preview_step2":
+        if not is_admin(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        preview_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(year_class_label(yc), callback_data="preview_noop")] for yc in YEAR_ORDER]
+            + [[InlineKeyboardButton("▶️ Next (Welcome menu)", callback_data="preview_step3")]]
+        )
+        await query.edit_message_text(
+            "What Year/Class are you currently in?\n\n"
+            "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)\n\n"
+            "<i>🔍 Preview — the buttons above are just a mock-up here, they don't set anything.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=preview_kb,
+        )
+        return
+
+    if query.data == "preview_noop":
+        await query.answer("🔍 Preview — دي مجرد عينة، مش بتغير أي حاجة فعلياً.", show_alert=True)
+        return
+
+    if query.data == "preview_step3":
+        if not is_admin(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        nickname = get_nickname(user_id) or "يا بطل"
+        await query.edit_message_text(
+            f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+            f"يا {html.escape(nickname)}! تحب تعمل أي؟!:\n\n"
+            f"<i>🔍 Preview خلصت — من هنا لقدام دي القايمة الحقيقية، تقدر تدوس عادي.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=start_menu_keyboard(),
+        )
         return
 
     # ── REPORT ISSUE: draft confirmation (user's own Send/Cancel) ────
@@ -8137,6 +8504,42 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(MSG_CANCEL_NOTHING)
 
+async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/feedback <message> — sends the user's nickname, Telegram
+    username, and Telegram ID together with their feedback text straight
+    to STORAGE_GROUP_ID. Simple one-shot command (no draft/confirm step,
+    unlike /report_issue) — whatever follows /feedback on the same
+    message is sent as-is."""
+    if not STORAGE_GROUP_ID:
+        await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
+        return
+    if not context.args:
+        await update.message.reply_text("استخدام: /feedback <رسالتك>")
+        return
+
+    real_uid = update.effective_user.id if update.effective_user else update.effective_chat.id
+    _update_telegram_name(real_uid, update.effective_user)
+    nickname = get_nickname(real_uid) or "—"
+    username = update.effective_user.username if update.effective_user else None
+    username_label = f"@{username}" if username else "—"
+    feedback_text = " ".join(context.args)
+
+    message = (
+        f"📩 <b>Feedback جديد</b>\n"
+        f"👤 الاسم: {html.escape(nickname)}\n"
+        f"🔗 اليوزر: {html.escape(username_label)}\n"
+        f"🆔 ID: <code>{real_uid}</code>\n\n"
+        f"💬 {html.escape(feedback_text)}"
+    )
+    try:
+        await context.bot.send_message(chat_id=STORAGE_GROUP_ID, text=message, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print("FEEDBACK SEND FAILED:", e)
+        await update.message.reply_text("⚠️ حصل خطأ وأنا بحاول أبعت الفيدباك، جرب تاني كمان شوية.")
+        return
+
+    await update.message.reply_text("✅ تم إرسال الفيدباك بتاعك، شكراً ليك!")
+
 # ═══════════════════════════════════════════════════════════════
 # START  (also wakes bot from sleep)
 # ═══════════════════════════════════════════════════════════════
@@ -8190,6 +8593,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=start_menu_keyboard(),
     )
 
+async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/preview — admin-only walkthrough of exactly what a brand-new
+    user sees on their very first /start: the nickname prompt, then the
+    Year/Class picker, then the welcome menu (see start() above — this
+    mirrors its three screens 1:1, same text/art).
+
+    Purely a preview, never touches real state: it does NOT set
+    AWAITING_NICKNAME (so typing anything afterwards doesn't get read as
+    a nickname), and the Year/Class step's buttons are inert
+    (preview_noop) look-alikes of the real picker rather than the real
+    onboard_yc: ones — tapping them can't set (and, per that step's own
+    warning, permanently lock) a year/class on the admin's own account.
+    The final welcome screen switches to the real start_menu_keyboard(),
+    since from that point on it's just ordinary menu navigation and
+    perfectly safe to click through."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    await update.message.reply_text(
+        quizzy_block(
+            QUIZZY_AMAZED_ART,
+            "Hello there! My name is Quizzy! what's your name? "
+            "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Next (Year/Class step)", callback_data="preview_step2"),
+        ]]),
+    )
+
 async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/c — lists every command, admin-only ones only shown to the admin."""
     lines = ["📖 <b>Available commands:</b>\n"]
@@ -8200,13 +8633,18 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("⚙️ Settings — from the /start menu: set your nickname")
     lines.append("/cancel — cancels whatever's currently in progress (pending image, etc.)")
     lines.append("/report_issue — send a message straight to the admin")
+    lines.append("/feedback &lt;message&gt; — send feedback (nickname + username included) to the storage channel")
     lines.append("/quiz — browse lectures (year → module → subject → lecture) and pull their questions")
     lines.append("/time — current time, and when the next 💥Daily Quiz💥 push is")
     lines.append("/c — this list")
 
     if is_admin(update):
         lines.append("\n🔐 <b>Admin only</b>")
-        lines.append("/admincheck")
+        if is_creator(update):
+            lines.append("/dev_panel — stats snapshot + shortcuts (Set year, Users, Backups, Daily module) — Creator only")
+        lines.append("/set_year &lt;Nickname or ID&gt;")
+        lines.append("/tell &lt;ID or Nickname&gt; &lt;message&gt;")
+        lines.append("/preview — walk through the onboarding flow (nickname → year/class → welcome)")
         lines.append("/health")
         lines.append("/restore")
         lines.append("/broadcast &lt;message&gt;")
@@ -8226,22 +8664,156 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ADMIN HELPERS
 # ═══════════════════════════════════════════════════════════════
 def is_admin(update: Update) -> bool:
-    return update.effective_user and update.effective_user.id == ADMIN_ID
+    """True for the Creator (ADMIN_ID) or any secondary admin
+    (SECONDARY_ADMIN_IDS) — i.e. "any admin". This is the gate every
+    admin command/callback uses EXCEPT /dev_panel itself (and its own
+    callbacks/typed-reply flows), which uses is_creator() below instead
+    so secondary admins don't get the full panel."""
+    uid = update.effective_user.id if update.effective_user else None
+    return uid is not None and (uid == ADMIN_ID or uid in SECONDARY_ADMIN_IDS)
 
-async def admincheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id if update.effective_user else "?"
-    if is_admin(update):
+def is_creator(update: Update) -> bool:
+    """True only for the Creator (ADMIN_ID) — secondary admins pass
+    is_admin() but NOT this. Reserved for /dev_panel and its own
+    callbacks/flows; every other admin surface uses is_admin()."""
+    return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
+
+def admin_role_label(user_id: int) -> str:
+    """Role string shown on /mystats: 'The Creator' for ADMIN_ID, 'Admin'
+    for a secondary admin, 'Student' for everyone else."""
+    if user_id == ADMIN_ID:
+        return "The Creator"
+    if user_id in SECONDARY_ADMIN_IDS:
+        return "Admin"
+    return "Student"
+
+
+def _dev_panel_stats() -> tuple[int, int, int, int]:
+    """(total_users, total_lectures, total_questions, active_sessions) —
+    the four numbers shown at the top of the Dev Panel. Lectures/questions
+    are summed across every configured year's QUIZ_INDEX; a lecture's
+    question count is len(ids) (see the QUIZ_INDEX schema comment)."""
+    total_users     = len(USERS)
+    total_lectures  = sum(len(QUIZ_INDEX.get(y, {})) for y in YEAR_ORDER)
+    total_questions = sum(
+        len(entry.get("ids", []))
+        for y in YEAR_ORDER
+        for entry in QUIZ_INDEX.get(y, {}).values()
+    )
+    active_sessions = len(LECTURE_SESSIONS) + len(DAILY_QUIZ_SESSIONS) + len(MISTAKES_RETAKE_SESSIONS)
+    return total_users, total_lectures, total_questions, active_sessions
+
+def _dev_panel_view() -> tuple[str, InlineKeyboardMarkup]:
+    """The Dev Panel's home screen: stats header + one row of buttons per
+    tool. 🔢 Set year / 👥 Users need a free-text nickname-or-ID the admin
+    hasn't typed yet, so those buttons arm an AWAITING_DEVPANEL_* flag and
+    prompt for it (see AWAITING_DEVPANEL_SETYEAR / _MYSTATS in handle());
+    💾 Backups / 📆 Daily Module open a submenu directly."""
+    total_users, total_lectures, total_questions, active_sessions = _dev_panel_stats()
+    text = (
+        "🐾 <b>QUIZICIAN ADMIN PANEL</b>\n\n"
+        f"👥 Total {total_users:,} users\n"
+        f"📚 Total {total_lectures:,} lectures\n"
+        f"❓ Total {total_questions:,} questions\n"
+        f"🔥 {active_sessions} active sessions\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "🔢 <b>Set year</b> — يعدل سنة/كلاس حد (<code>/set_year &lt;Nickname or ID&gt;</code>)\n"
+        "👥 <b>Users</b> — يعرض إحصائيات حد (<code>/mystats &lt;Nickname or ID&gt;</code>)\n"
+        "💾 <b>Backups</b> — Backup Now / Restore\n"
+        "📆 <b>Daily module</b> — يحدد موديول الـ Daily Quiz لكل سنة"
+    )
+    buttons = [
+        [
+            InlineKeyboardButton("🔢 Set year", callback_data="devpanel_setyear"),
+            InlineKeyboardButton("👥 Users",     callback_data="devpanel_mystats"),
+        ],
+        [
+            InlineKeyboardButton("💾 Backups",      callback_data="devpanel_backups"),
+            InlineKeyboardButton("📆 Daily Module",  callback_data="devpanel_daily_module"),
+        ],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+def _dev_panel_backups_view() -> tuple[str, InlineKeyboardMarkup]:
+    text = "💾 <b>Backups</b>\n\nدوس على اللي عايز تعمله:"
+    buttons = [
+        [InlineKeyboardButton("💾 Backup Now", callback_data="devpanel_backup_now")],
+        [InlineKeyboardButton("🔄 Restore",    callback_data="devpanel_restore")],
+        [InlineKeyboardButton("🔙 رجوع",        callback_data="devpanel_back")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+async def dev_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/dev_panel — replaces the old /admincheck. Creator-only control
+    panel: a quick stats snapshot plus shortcuts into the admin tools
+    that need a free-text argument (Set year / Users) or open a submenu
+    (Backups / Daily module).
+
+    Gated on is_creator() specifically (exactly "== ADMIN_ID"), NOT
+    is_admin() — secondary admins (SECONDARY_ADMIN_IDS) pass is_admin()
+    and so get every other admin command/callback, but not this panel.
+    Every devpanel_* callback and AWAITING_DEVPANEL_* typed-reply flow
+    below uses the same is_creator() gate for consistency."""
+    if not is_creator(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    text, markup = _dev_panel_view()
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def set_year_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /set_year <Nickname or ID> — looks the person up, then shows
+    the same year/class picker used at onboarding so the admin can set or
+    correct their Year/Class. Normally a user's year_class is locked once
+    set during onboarding (no Settings edit path) — this command is the
+    deliberate admin override for fixing a wrong pick. Also reachable via
+    the Dev Panel's 🔢 Set year button (see AWAITING_DEVPANEL_SETYEAR)."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    if not context.args:
+        await update.message.reply_text("استخدام: /set_year <Nickname or ID>")
+        return
+    await _prompt_set_year(update.message, " ".join(context.args))
+
+async def tell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /tell <ID or Nickname> <message> — resolves the target via
+    _resolve_user_ref (same nickname/ID lookup used by /set_year — the
+    reference itself must be a single token, so a multi-word nickname
+    won't match here) and DMs them the rest of the text directly from
+    the bot."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+
+    args = context.args
+    if len(args) < 2:
         await update.message.reply_text(
-            f"✅ <b>أنت الأدمن!</b>\n"
-            f"🆔 Your ID: <code>{uid}</code>\n"
-            f"👥 Total users: <b>{len(USERS)}</b>",
+            "⚠️ استخدام:\n<code>/tell &lt;Nickname or ID&gt; &lt;رسالة&gt;</code>\n"
+            "مثال: <code>/tell 123456789 اهلا بيك!</code>",
             parse_mode=ParseMode.HTML,
         )
-    else:
-        await update.message.reply_text(
-            f"🚫 مش أدمن\n🆔 Your ID: <code>{uid}</code>",
+        return
+
+    ref = args[0]
+    message_text = " ".join(args[1:])
+    target_id = _resolve_user_ref(ref)
+    if target_id is None:
+        await update.message.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(ref)}")
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"📩 <b>رسالة من الأدمن:</b>\n{html.escape(message_text)}",
             parse_mode=ParseMode.HTML,
         )
+    except Exception as e:
+        print("TELL SEND FAILED:", e)
+        await update.message.reply_text("⚠️ مقدرتش أبعت الرسالة — ممكن يكون حاظر البوت أو ملهوش شات معاه.")
+        return
+
+    label = get_nickname(target_id) or str(target_id)
+    await update.message.reply_text(f"✅ اتبعتت الرسالة لـ {html.escape(label)}.")
 
 def _format_uptime(seconds: float) -> str:
     seconds = int(seconds)
@@ -8408,6 +8980,8 @@ def _restore_picker_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(label, callback_data=f"restore_go:{key}")]
         for key, (label, _) in _RESTORE_TARGETS.items()
     ]
+    rows.append([InlineKeyboardButton("🛑 Everything 🛑", callback_data="restore_all")])
+    rows.append([InlineKeyboardButton("🆕 🛑 RESET EVERYTHING 🛑", callback_data="reset_all")])
     return InlineKeyboardMarkup(rows)
 
 async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8879,7 +9453,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         f"     🌐     YOUR PROFILE      🌐\n"
         f"╚══════════════════╝\n"
         f"Nickname: {html.escape(nickname)}\n"
-        f"Role: Student\n"
+        f"Role: {admin_role_label(user_id)}\n"
         f"Year: {year_line}\n\n"
         f"🏅 Level: {level} — <i>{title}</i>\n"
         f"✨ XP: {xp:,}  [{bar}]  → {xp_end:,}"
@@ -8949,6 +9523,16 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # chat id — so this shows the same numbers whether /mystats is run in
     # a DM or inside a group/channel the bot is in.
     user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+    # Admin-only extra: /mystats <Nickname or ID> looks up someone ELSE's
+    # stats instead of the caller's own — see _resolve_user_ref. A
+    # non-admin's args are just ignored; they always get their own stats.
+    if context.args and is_admin(update):
+        ref = " ".join(context.args)
+        target_id = _resolve_user_ref(ref)
+        if target_id is None:
+            await update.message.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(ref)}")
+            return
+        user_id = target_id
     await _send_mystats(context, user_id, update.message)
 
 
@@ -8958,7 +9542,7 @@ async def reset_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     actual wipe happens in button_handler's reset_analytics_yes branch
     once the admin taps to confirm — this is irreversible, unlike most
     other admin actions here."""
-    if update.effective_chat.id != ADMIN_ID:
+    if not is_admin(update):
         return
     await update.message.reply_text(
         f"⚠️ <b>متأكد إنك عايز تمسح كل الـ Analytics؟</b>\n\n"
@@ -8975,7 +9559,7 @@ async def restore_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     in ANALYTICS_GROUP_ID — the same restore that runs automatically on
     startup. Use this if the local file ever gets wiped, corrupted, or
     out of sync with the backup, without needing to restart the bot."""
-    if not (update.effective_user and update.effective_user.id == ADMIN_ID):
+    if not is_admin(update):
         return
     before = len(ANALYTICS)
     await restore_analytics_from_channel(context)
@@ -8992,7 +9576,7 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     copy you saved elsewhere. Merges into (does not wipe) existing data,
     then re-saves and re-pins so the channel backup reflects the import."""
     global _analytics_dirty
-    if not (update.effective_user and update.effective_user.id == ADMIN_ID):
+    if not is_admin(update):
         return
     reply = update.message.reply_to_message
     doc   = reply.document if reply else None
@@ -9528,8 +10112,12 @@ app.add_handler(CommandHandler("start",          start))
 app.add_handler(CommandHandler("c",              commands_cmd))
 app.add_handler(CommandHandler("cancel",         cancel_cmd))
 app.add_handler(CommandHandler("report_issue",   report_issue_cmd))
+app.add_handler(CommandHandler("feedback",       feedback_cmd))
 app.add_handler(CommandHandler("sleep",          sleep_cmd))
-app.add_handler(CommandHandler("admincheck",     admincheck_cmd))
+app.add_handler(CommandHandler("dev_panel",      dev_panel_cmd))
+app.add_handler(CommandHandler("preview",        preview_cmd))
+app.add_handler(CommandHandler("set_year",       set_year_cmd))
+app.add_handler(CommandHandler("tell",           tell_cmd))
 app.add_handler(CommandHandler("health",         health_cmd))
 app.add_handler(CommandHandler("restore",        restore_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
