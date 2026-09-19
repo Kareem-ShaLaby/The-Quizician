@@ -1296,19 +1296,60 @@ RESTORE_RETRY_DELAY_BASE  = 4   # seconds; multiplied by attempt number (4s, the
 RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "lecture_results": True, "mistakes_bank": True, "report_threads": True, "sessions": True}
 RESTORE_OK.update({f"quiz_{y}": True for y in YEARS})  # one flag per year's quiz index
 
-async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_found_hint: str | None = None):
+class _RestoreNoBackup(Exception):
+    """Raised by a restore _do() when the channel has nothing pinned at
+    all, or what's pinned isn't this system's backup (no document, or
+    caption doesn't match the marker). Not a failure — local data is
+    left exactly as it was and is still trusted (RESTORE_OK stays
+    True). Distinguished from other exceptions so the retry loop
+    doesn't burn attempts on it, and so /restore's button flow can
+    offer a reset (create a fresh file) instead of showing an error."""
+    pass
+
+
+class _RestoreInvalidArchitecture(Exception):
+    """Raised by a restore _do() when a pinned backup WAS found and
+    downloaded, but its parsed JSON doesn't match the shape this
+    system expects (wrong top-level type, missing keys, entries that
+    don't look like real records, etc). Local data and the local file
+    are left untouched — we never partially apply a backup that might
+    be corrupted or from the wrong system."""
+    pass
+
+
+async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_found_hint: str | None = None) -> str:
     """Runs do_restore() (an async no-arg callable doing the actual
     get_chat/get_file/parse work for one system) up to
     RESTORE_MAX_ATTEMPTS times with a short backoff between attempts —
     these failures are almost always a transient Telegram API timeout,
     so a couple retries clear most of them without ever bothering the
     admin. Only if every attempt fails do we DM the admin and mark this
-    system unsynced for the session (see RESTORE_OK)."""
+    system unsynced for the session (see RESTORE_OK).
+
+    Returns a short status string so callers (like /restore's button
+    flow) can react differently depending on what happened:
+      "ok"        — restored successfully.
+      "no_backup" — nothing pinned to restore from; local data untouched.
+      "invalid"   — a pinned backup exists but failed the architecture
+                    check; local data untouched, admin notified.
+      "error"     — every attempt raised a real (unexpected) error;
+                    local data untouched, admin notified.
+    """
     for attempt in range(1, RESTORE_MAX_ATTEMPTS + 1):
         try:
             await do_restore()
             RESTORE_OK[key] = True
-            return
+            return "ok"
+        except _RestoreNoBackup:
+            return "no_backup"
+        except _RestoreInvalidArchitecture as e:
+            print(f"{label.upper()} RESTORE ERROR — pinned backup failed the architecture check, refusing to restore:", e)
+            RESTORE_OK[key] = False
+            await _notify_admin_sync_failure(
+                app, label,
+                f"a pinned backup was found but its structure looks wrong, so nothing was restored: {e}",
+            )
+            return "invalid"
         except Exception as e:
             hint = not_found_hint if (not_found_hint and "chat not found" in str(e).lower()) else None
             print(f"{label.upper()} RESTORE ERROR (attempt {attempt}/{RESTORE_MAX_ATTEMPTS}):", hint or e)
@@ -1317,6 +1358,8 @@ async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_f
             else:
                 RESTORE_OK[key] = False
                 await _notify_admin_sync_failure(app, label, hint or e)
+                return "error"
+    return "error"
 
 async def _notify_admin_sync_failure(app, what: str, error):
     """Best-effort DM to ADMIN_ID once every retry has been exhausted.
@@ -1376,28 +1419,28 @@ async def backup_analytics_to_channel(context):
     # just moves to the newest; nothing else needs to change here.
     _analytics_backup_msg_id = sent.message_id
 
-async def restore_analytics_from_channel(app):
+async def restore_analytics_from_channel(app) -> str:
     global _analytics_backup_msg_id
     if not ANALYTICS_GROUP_ID:
-        return
+        return "not_configured"
 
     async def _do():
         global _analytics_backup_msg_id
         chat   = await app.bot.get_chat(ANALYTICS_GROUP_ID)
         pinned = chat.pinned_message
-        if not pinned or not pinned.document:
-            return
-        if (pinned.caption or "") != ANALYTICS_BACKUP_MARKER:
-            return
+        if not pinned or not pinned.document or (pinned.caption or "") != ANALYTICS_BACKUP_MARKER:
+            raise _RestoreNoBackup()
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
         restored = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(restored, dict) or not all(isinstance(v, dict) for v in restored.values()):
+            raise _RestoreInvalidArchitecture('expected a JSON object mapping user_id -> stats dict')
         ANALYTICS.update(_clean_analytics_dict(restored))
         await save_analytics()
         _analytics_backup_msg_id = pinned.message_id
         print(f"Restored analytics: {len(ANALYTICS)} user(s).")
 
-    await _run_restore_with_retries(app, "analytics", "Analytics", _do)
+    return await _run_restore_with_retries(app, "analytics", "Analytics", _do)
 
 
 
@@ -1679,27 +1722,28 @@ async def backup_settings_to_channel(context):
     # function's comment for why.
     _settings_backup_msg_id = sent.message_id
 
-async def restore_settings_from_channel(app):
+async def restore_settings_from_channel(app) -> str:
     global _settings_backup_msg_id
     if not SETTINGS_GROUP_ID:
-        return
+        return "not_configured"
 
     async def _do():
         global _settings_backup_msg_id
         chat   = await app.bot.get_chat(SETTINGS_GROUP_ID)
         pinned = chat.pinned_message
-        if not pinned or not pinned.document:
-            return
-        if (pinned.caption or "") != SETTINGS_BACKUP_MARKER:
-            return
+        if not pinned or not pinned.document or (pinned.caption or "") != SETTINGS_BACKUP_MARKER:
+            raise _RestoreNoBackup()
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
-        SETTINGS.update(json.loads(bytes(raw).decode("utf-8")))
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(restored, dict) or not all(isinstance(v, dict) for v in restored.values()):
+            raise _RestoreInvalidArchitecture('expected a JSON object mapping user_id -> settings dict')
+        SETTINGS.update(restored)
         await save_settings()
         _settings_backup_msg_id = pinned.message_id
         print(f"Restored settings: {len(SETTINGS)} user(s).")
 
-    await _run_restore_with_retries(app, "settings", "Settings", _do)
+    return await _run_restore_with_retries(app, "settings", "Settings", _do)
 
 # ═══════════════════════════════════════════════════════════════
 # LECTURE RESULTS — per-lecture leaderboard, shown before a user
@@ -2053,23 +2097,25 @@ async def backup_mistakes_bank_to_channel(context):
     # function's comment for why.
     _mistakes_bank_backup_msg_id = sent.message_id
 
-async def restore_mistakes_bank_from_channel(app):
+async def restore_mistakes_bank_from_channel(app) -> str:
     global _mistakes_bank_backup_msg_id
     if not MISTAKES_BANK_GROUP_ID:
-        return
+        return "not_configured"
 
     async def _do():
         global _mistakes_bank_backup_msg_id
         chat   = await app.bot.get_chat(MISTAKES_BANK_GROUP_ID)
         pinned = chat.pinned_message
-        if not pinned or not pinned.document:
-            return
-        if (pinned.caption or "") != MISTAKES_BANK_BACKUP_MARKER:
-            return
+        if not pinned or not pinned.document or (pinned.caption or "") != MISTAKES_BANK_BACKUP_MARKER:
+            raise _RestoreNoBackup()
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
         restored = json.loads(bytes(raw).decode("utf-8"))
-        clean    = [m for m in restored if _is_valid_mistake_entry(m)]
+        if not isinstance(restored, list):
+            raise _RestoreInvalidArchitecture('expected a JSON array of mistake entries')
+        clean = [m for m in restored if _is_valid_mistake_entry(m)]
+        if restored and not clean:
+            raise _RestoreInvalidArchitecture('none of the entries matched the expected mistake-entry shape')
         if len(clean) != len(restored):
             print(f"MISTAKES BANK: dropped {len(restored) - len(clean)} malformed entr(y/ies) from the channel backup on restore.")
         MISTAKES_BANK[:] = clean
@@ -2078,7 +2124,7 @@ async def restore_mistakes_bank_from_channel(app):
         _mistakes_bank_backup_msg_id = pinned.message_id
         print(f"Restored mistakes bank: {len(MISTAKES_BANK)} question(s).")
 
-    await _run_restore_with_retries(app, "mistakes_bank", "Mistakes bank", _do)
+    return await _run_restore_with_retries(app, "mistakes_bank", "Mistakes bank", _do)
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY QUIZ — 💥Daily Quiz💥: each day, every configured year gets ONE
@@ -3208,26 +3254,33 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
     # Previous backups are no longer deleted — see the analytics backup
     # function's comment for why.
 
-async def restore_storage_from_channel(app):
+async def restore_storage_from_channel(app) -> str:
     """Runs once on startup — rebuilds USERS + STORAGE_INDEX from the
     storage group's pinned backup if the local cache is missing/stale."""
     if not STORAGE_GROUP_ID:
-        return
+        return "not_configured"
 
     async def _do():
         chat   = await app.bot.get_chat(STORAGE_GROUP_ID)
         pinned = chat.pinned_message
-        if pinned and pinned.document and (pinned.caption or "") == STORAGE_BACKUP_MARKER:
-            tg_file = await app.bot.get_file(pinned.document.file_id)
-            raw     = await tg_file.download_as_bytearray()
-            payload = json.loads(bytes(raw).decode("utf-8"))
-            USERS.update(payload.get("users", []))
-            STORAGE_INDEX.update(payload.get("storage_index", {}))
-            await save_users()
-            await save_storage_index()
-            STORAGE_BACKUP_STATE["backup_msg_id"] = pinned.message_id
-            await save_storage_backup_state()
-            print(f"Restored storage backup: {len(USERS)} user(s), {len(STORAGE_INDEX)} password(s).")
+        if not pinned or not pinned.document or (pinned.caption or "") != STORAGE_BACKUP_MARKER:
+            raise _RestoreNoBackup()
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        payload = json.loads(bytes(raw).decode("utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("users", []), list)
+            or not isinstance(payload.get("storage_index", {}), dict)
+        ):
+            raise _RestoreInvalidArchitecture('expected {"users": [...], "storage_index": {...}}')
+        USERS.update(payload.get("users", []))
+        STORAGE_INDEX.update(payload.get("storage_index", {}))
+        await save_users()
+        await save_storage_index()
+        STORAGE_BACKUP_STATE["backup_msg_id"] = pinned.message_id
+        await save_storage_backup_state()
+        print(f"Restored storage backup: {len(USERS)} user(s), {len(STORAGE_INDEX)} password(s).")
 
     not_found_hint = (
         f"Chat not found — STORAGE_GROUP_ID ({STORAGE_GROUP_ID}) isn't a real "
@@ -3235,7 +3288,7 @@ async def restore_storage_from_channel(app):
         "or the bot was never added to that group. See the setup comment above "
         "STORAGE_GROUP_ID."
     )
-    await _run_restore_with_retries(app, "storage", "Storage", _do, not_found_hint=not_found_hint)
+    return await _run_restore_with_retries(app, "storage", "Storage", _do, not_found_hint=not_found_hint)
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZ CHANNELS (interactive quiz storage, organized by year -> lecture)
@@ -3468,37 +3521,45 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE, year: str):
     # Previous backups are no longer deleted — see the analytics backup
     # function's comment for why.
 
-async def restore_quiz_from_channel(app, year: str):
+async def restore_quiz_from_channel(app, year: str) -> str:
     """Runs once on startup per year — rebuilds that year's lecture/quiz
     index from its quiz channel's pinned backup if the local cache is
     missing/stale."""
     channel_id = year_channel_id(year)
     if not channel_id:
-        return
+        return "not_configured"
 
     async def _do():
         chat   = await app.bot.get_chat(channel_id)
         pinned = chat.pinned_message
-        if pinned and pinned.document and (pinned.caption or "") == QUIZ_BACKUP_MARKER:
-            tg_file = await app.bot.get_file(pinned.document.file_id)
-            raw     = await tg_file.download_as_bytearray()
-            payload = json.loads(bytes(raw).decode("utf-8"))
-            QUIZ_INDEX[year].update(_clean_quiz_index_dict(year, payload.get("quiz_index", {})))
-            QUIZ_STATE[year].update(payload.get("quiz_state", {}))
-            QUIZ_POLL_STATUS[year].update(payload.get("quiz_poll_status", {}))
-            await save_quiz_index(year)
-            await save_quiz_state(year)
-            await save_quiz_poll_status(year)
-            QUIZ_BACKUP_STATE[year]["backup_msg_id"] = pinned.message_id
-            await save_quiz_backup_state(year)
-            print(f"Restored quiz backup ({year}): {len(QUIZ_INDEX[year])} lecture(s).")
+        if not pinned or not pinned.document or (pinned.caption or "") != QUIZ_BACKUP_MARKER:
+            raise _RestoreNoBackup()
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        payload = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(payload, dict) or not all(
+            isinstance(payload.get(k, {}), dict)
+            for k in ("quiz_index", "quiz_state", "quiz_poll_status")
+        ):
+            raise _RestoreInvalidArchitecture(
+                'expected {"quiz_index": {...}, "quiz_state": {...}, "quiz_poll_status": {...}}'
+            )
+        QUIZ_INDEX[year].update(_clean_quiz_index_dict(year, payload.get("quiz_index", {})))
+        QUIZ_STATE[year].update(payload.get("quiz_state", {}))
+        QUIZ_POLL_STATUS[year].update(payload.get("quiz_poll_status", {}))
+        await save_quiz_index(year)
+        await save_quiz_state(year)
+        await save_quiz_poll_status(year)
+        QUIZ_BACKUP_STATE[year]["backup_msg_id"] = pinned.message_id
+        await save_quiz_backup_state(year)
+        print(f"Restored quiz backup ({year}): {len(QUIZ_INDEX[year])} lecture(s).")
 
     not_found_hint = (
         f"Chat not found — {year}'s channel_id ({channel_id}) isn't a real "
         "channel this bot knows about. Wrong ID, or the bot was never added "
         "as an admin there. See the YEARS setup comment near the top of the file."
     )
-    await _run_restore_with_retries(app, f"quiz_{year}", f"Quiz index ({year})", _do, not_found_hint=not_found_hint)
+    return await _run_restore_with_retries(app, f"quiz_{year}", f"Quiz index ({year})", _do, not_found_hint=not_found_hint)
 
 # ═══════════════════════════════════════════════════════════════
 # STATE
@@ -3686,29 +3747,33 @@ async def backup_report_threads_to_channel(context):
     # function's comment for why.
     _report_threads_backup_msg_id = sent.message_id
 
-async def restore_report_threads_from_channel(app):
+async def restore_report_threads_from_channel(app) -> str:
     global _report_threads_backup_msg_id
     if not REPORT_ISSUE_GROUP_ID:
-        return
+        return "not_configured"
 
     async def _do():
         global _report_threads_backup_msg_id
         chat   = await app.bot.get_chat(REPORT_ISSUE_GROUP_ID)
         pinned = chat.pinned_message
-        if not pinned or not pinned.document:
-            return
-        if (pinned.caption or "") != REPORT_THREADS_BACKUP_MARKER:
-            return
+        if not pinned or not pinned.document or (pinned.caption or "") != REPORT_THREADS_BACKUP_MARKER:
+            raise _RestoreNoBackup()
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
         restored = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(restored, dict):
+            raise _RestoreInvalidArchitecture('expected a JSON object mapping thread_id -> thread data')
+        try:
+            cleaned = {int(k): v for k, v in restored.items()}
+        except (TypeError, ValueError):
+            raise _RestoreInvalidArchitecture('thread keys must be integer-like ids')
         REPORT_THREADS.clear()
-        REPORT_THREADS.update({int(k): v for k, v in restored.items()})
+        REPORT_THREADS.update(cleaned)
         await save_report_threads()
         _report_threads_backup_msg_id = pinned.message_id
         print(f"Restored report threads: {len(REPORT_THREADS)} thread(s).")
 
-    await _run_restore_with_retries(app, "report_threads", "Report threads", _do)
+    return await _run_restore_with_retries(app, "report_threads", "Report threads", _do)
 
 # ═══════════════════════════════════════════════════════════════
 # SESSION PERSISTENCE — LECTURE_SESSIONS / DAILY_QUIZ_SESSIONS /
@@ -6177,17 +6242,18 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY POPUP EASTER EGGS
 #
-# A handful of native Telegram alert popups (query.answer(text,
-# show_alert=True)) on top of specific button taps — Quizzy (the bot's
-# cat persona) getting a word in on top of whatever that button
-# normally does. None of these ever block or change the underlying
-# action; each fires (or doesn't) and the handler falls straight
-# through to its normal behavior right after.
+# A handful of toasts (query.answer(text), show_alert left False — a small
+# banner that fades by itself, no OK button) on top of specific button
+# taps — Quizzy (the bot's cat persona) getting a word in on top of
+# whatever that button normally does. None of these ever block or change
+# the underlying action. They're all decided in one place, _tap_toast,
+# and shown by the single answer() at the top of button_handler — a tap
+# can only be answered once, so a toast can't be raised from inside a
+# branch after that.
 #
 # Two of the five scenarios this was scoped for don't fit this
-# mechanism at all, because Telegram's popup alert only exists as a
-# response to a button tap (a callback query) — there's no equivalent
-# for a poll answer:
+# mechanism at all, because a toast only exists as a response to a
+# button tap (a callback query) — there's no equivalent for a poll answer:
 #   - "User gets 10/10" happens when the LAST question of a Daily
 #     Quiz is answered — that's a poll vote (handle_poll_answer),
 #     not a button tap, so there's no callback query to answer with
@@ -6207,6 +6273,12 @@ QUIZZY_ALREADY_DONE_MSG      = "🐱 didn't I already give you one..."
 QUIZZY_PERFECT_SCORE_LINE    = "🐱 I would say I'm proud of you, but I'm literally a cat."
 QUIZZY_MISTAKES_EMPTY_MSG    = "🐱 Does this make you bankrupt?"
 QUIZZY_MISTAKES_HIGH_MSG     = "🐱 they say mistakes make you stronger, how much can you bench-press?"
+# Toasts for the non-Quizzy taps that used to be OK-button alerts (see _tap_toast)
+TOAST_SR_NEEDS_AUTO_NEXT   = "⚠️ Spaced Repetition لازم يكون معاه Auto-Next شغال"
+TOAST_AUTO_NEXT_OFF_SR     = "⚠️ قفلت Auto-Next، فـ Spaced Repetition مش هيشتغل لحد ما ترجعه"
+TOAST_BANK_ALREADY_EMPTY   = "🎉 بنك الأخطاء بتاعك فاضي أصلاً!"
+TOAST_REPORT_CLOSED        = "⚠️ الـ report ده اتقفل، مينفعش ترد عليه تاني."
+TOAST_REPORT_NOT_YOURS     = "⚠️ مش قادر أعمل كده."
 QUIZZY_MISTAKES_HIGH_THRESHOLD = 10   # mistake count at/above which the bench-press jab fires
 
 def _quizzy_is_late_night() -> bool:
@@ -6216,15 +6288,6 @@ def _quizzy_is_late_night() -> bool:
     different things and don't need to agree on the exact cutoff."""
     hour = datetime.now(DAILY_QUIZ_TZ).hour
     return QUIZZY_LATE_NIGHT_START_HOUR <= hour < QUIZZY_LATE_NIGHT_END_HOUR
-
-async def _quizzy_late_night_popup(query) -> None:
-    """Best-effort — a failed/expired callback query here should never
-    stop the quiz it's attached to from starting."""
-    if _quizzy_is_late_night():
-        try:
-            await query.answer(QUIZZY_LATE_NIGHT_MSG, show_alert=True)
-        except Exception:
-            pass
 
 # ── Onboarding toasts ──────────────────────────────────────────────
 # Quizzy's onboarding quips are shown as a toast (query.answer(text) with
@@ -6241,15 +6304,83 @@ ONBOARDING_YEAR_QUIPS = {
     "y3": "Year 3? Wouldn't that be... Oh! You are becoming a Semi-Senior soon!!",
 }
 
-def _onboarding_toast(callback_data: str | None) -> str | None:
-    """Toast text for this tap, or None for no toast (the normal case —
-    None makes query.answer() behave exactly as a bare answer() did)."""
+def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
+    """Quizzy's toast for this button tap, or None for no toast (the normal
+    case — None makes query.answer() behave exactly as a bare answer() did).
+
+    Every Quizzy popup lives here, decided BEFORE the handler runs, because
+    Telegram takes one answer per tap and button_handler answers first
+    thing. Doing the lookup here (rather than answering again from inside
+    the branch) is what makes them show at all.
+
+    Never raises: a failure looking up the bank/date must not take down
+    the tap it's decorating, so any error just means no toast."""
     data = callback_data or ""
-    if data.startswith("onboard_yc:"):
-        quip = ONBOARDING_YEAR_QUIPS.get(data.split(":", 1)[1])
-        return f"🐱 {quip}" if quip else None
-    if data == "onboard_go":
-        return "🐱 " + random.choice(QUIZZY_WELCOME_LINES)
+    try:
+        # ── onboarding ──
+        if data.startswith("onboard_yc:"):
+            quip = ONBOARDING_YEAR_QUIPS.get(data.split(":", 1)[1])
+            return f"🐱 {quip}" if quip else None
+        if data == "onboard_go":
+            return "🐱 " + random.choice(QUIZZY_WELCOME_LINES)
+
+        # ── Daily Quiz: "already done today" outranks the late-night nudge —
+        # the one place that race surfaces is a stale Start button tapped
+        # after the quiz was completed some other way, and it's the more
+        # specific joke for that exact case.
+        if data == "daily_quiz_begin":
+            if get_daily_quiz_last_date(user_id) == _today():
+                return QUIZZY_ALREADY_DONE_MSG
+            return QUIZZY_LATE_NIGHT_MSG if _quizzy_is_late_night() else None
+
+        # ── Mistakes Bank menu: empty / very full ──
+        if data == "mistakes_bank_menu":
+            count = len(_scoped_mistakes_bank(user_id))
+            if count == 0:
+                return QUIZZY_MISTAKES_EMPTY_MSG
+            if count >= QUIZZY_MISTAKES_HIGH_THRESHOLD:
+                return QUIZZY_MISTAKES_HIGH_MSG
+            return None
+
+        # ── starting a lecture quiz / a Mistakes Bank retake at 3–5 AM ──
+        if data.startswith("lecturego:") or data == "mistakes_retake":
+            return QUIZZY_LATE_NIGHT_MSG if _quizzy_is_late_night() else None
+
+        # ── Settings: the Spaced Repetition / Auto-Next mismatch warnings.
+        # The handler flips the toggle AFTER this runs, so this predicts
+        # the outcome from the CURRENT state: turning SR on while auto-next
+        # is off, or turning auto-next off while SR is on. (Safe to read
+        # ahead of the handler: button_handler is serialized per user, so
+        # nothing can change the state in between.)
+        if data == "toggle_spaced_repetition":
+            turning_on = not get_spaced_repetition_enabled(user_id)
+            return TOAST_SR_NEEDS_AUTO_NEXT if (turning_on and not get_auto_next_enabled(user_id)) else None
+        if data == "toggle_auto_next":
+            turning_off = get_auto_next_enabled(user_id)
+            return TOAST_AUTO_NEXT_OFF_SR if (turning_off and get_spaced_repetition_enabled(user_id)) else None
+
+        # ── Settings: Clear Mistakes Bank ──
+        if data == "clear_mistakes_bank_ask":
+            # same scoped count the handler uses for its own empty check
+            return TOAST_BANK_ALREADY_EMPTY if not _scoped_mistakes_bank(user_id) else None
+        if data == "clear_mistakes_bank_yes":
+            # The handler deletes exactly _scoped_mistakes_bank(user_id)
+            # (this user's entries in the /daily_module scope, or all of
+            # theirs with no scope) — the same set the confirm screen
+            # counted — so count that same set.
+            cleared = len(_scoped_mistakes_bank(user_id))
+            return f"✅ اتمسح {cleared} سؤال من بنك الأخطاء بتاعك."
+
+        # ── Report follow-up: the reporter's own "↩️ Reply" button ──
+        if data.startswith("report_user_reply:"):
+            thread = REPORT_THREADS.get(int(data.split(":", 1)[1]))
+            if not thread or thread.get("closed"):
+                return TOAST_REPORT_CLOSED
+            if thread["user_id"] != user_id:
+                return TOAST_REPORT_NOT_YOURS
+            return None
+    except Exception as e:
+        print(f"TOAST: couldn't decide a toast for {data!r}: {e}")
     return None
 
 # ═══════════════════════════════════════════════════════════════
@@ -6263,8 +6394,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Quizzy toast (a small banner at the top of the screen that fades on
     # its own, i.e. answer(text) WITHOUT show_alert) has to be decided
     # right here rather than answered later inside the branch. See
-    # _onboarding_toast for which taps get one.
-    await query.answer(text=_onboarding_toast(query.data))
+    # _tap_toast for which taps get one.
+    await query.answer(text=_tap_toast(query.data, user_id))
 
     # ── QUESTION TIMEOUT — resume/abandon a paused session ────────────
     # Only shown after two consecutive timed-out questions in a row (see
@@ -6378,15 +6509,90 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         label, restore_fn = target
         await query.edit_message_text(f"🔄 بيعمل restore لـ {label}…")
-        await restore_fn(context.application)
-        ok = RESTORE_OK.get(key, True)
-        if ok:
+        status = await restore_fn(context.application)
+        if status == "ok":
             await context.bot.send_message(chat_id=user_id, text=f"✅ {label} — تم الـ restore من آخر نسخة مثبتة.")
-        else:
+        elif status == "no_backup":
+            reset_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"🆕 ابدأ {label} من جديد (Reset)", callback_data=f"restore_reset:{key}"),
+            ]])
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"ℹ️ {label} — مفيش نسخة احتياطية متثبتة (pinned) في القناة بتاعته دلوقتي، "
+                    "فمحصلش أي restore والداتا المحلية زي ما هي.\n\n"
+                    "لو عايز تبدأ الملف ده من جديد (reset لملف فاضي) بدل ما تدور على نسخة قديمة، دوس تحت:"
+                ),
+                reply_markup=reset_kb,
+            )
+        elif status == "not_configured":
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ {label} — القناة/الجروب بتاعه مش متظبط في الإعدادات، فمحصلش أي حاجة.",
+            )
+        elif status == "invalid":
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"❌ {label} — لقيت نسخة مثبتة بس شكلها/structure غلط أو تالف، "
+                    "فرفضت أعمل restore منها عشان محدش يتبعثر محلياً. اتبعتلك رسالة تانية بالتفاصيل."
+                ),
+            )
+        else:  # "error"
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"❌ {label} — الـ restore فشل. اتبعتلك رسالة تانية بالتفاصيل (نفس رسالة فشل الـ restore وقت التشغيل).",
             )
+        return
+
+    # ── /restore: "no backup pinned" -> offer to reset (blank file) ──
+    if query.data.startswith("restore_reset:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        key = query.data.split(":", 1)[1]
+        target = _RESTORE_TARGETS.get(key)
+        if not target or key not in _RESET_ACTIONS:
+            await query.edit_message_text("⚠️ مش لاقي الـ system ده.")
+            return
+        label, _ = target
+        await query.edit_message_text(
+            f"⚠️ متأكد إنك عايز تبدأ {label} من ملف جديد فاضي؟ الداتا المحلية الحالية لِـ {label} "
+            "(لو فيه حاجة) هتتمسح ويتبعت ملف فاضي كـ backup جديد.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ أيوه، اعمل Reset", callback_data=f"restore_reset_confirm:{key}"),
+                InlineKeyboardButton("❌ لأ، إلغاء", callback_data=f"restore_reset_cancel:{key}"),
+            ]]),
+        )
+        return
+
+    if query.data.startswith("restore_reset_confirm:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        key = query.data.split(":", 1)[1]
+        target = _RESTORE_TARGETS.get(key)
+        reset_fn = _RESET_ACTIONS.get(key)
+        if not target or not reset_fn:
+            await query.edit_message_text("⚠️ مش لاقي الـ system ده.")
+            return
+        label, _ = target
+        await query.edit_message_text(f"🆕 بيعمل reset لـ {label}…")
+        try:
+            await reset_fn(context)
+            await context.bot.send_message(chat_id=user_id, text=f"✅ {label} — اتعمله reset، وبقى فيه ملف فاضي جديد متثبت في القناة بتاعته.")
+        except Exception as e:
+            print(f"{label.upper()} RESET ERROR:", e)
+            await context.bot.send_message(chat_id=user_id, text=f"❌ {label} — الـ reset فشل: {e}")
+        return
+
+    if query.data.startswith("restore_reset_cancel:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        key = query.data.split(":", 1)[1]
+        label = _RESTORE_TARGETS.get(key, (key, None))[0]
+        await query.edit_message_text(f"🗑 اتلغى — {label} زي ما هي، مفيش حاجة اتغيرت.")
         return
 
     # ── REPORT ISSUE: draft confirmation (user's own Send/Cancel) ────
@@ -6422,13 +6628,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group_message_id = int(query.data.split(":", 1)[1])
         thread = REPORT_THREADS.get(group_message_id)
         if not thread or thread.get("closed"):
-            await query.answer("⚠️ الـ report ده اتقفل، مينفعش ترد عليه تاني.", show_alert=True)
-            return
+            return   # "report closed" toast was shown by _tap_toast
         if thread["user_id"] != user_id:
             # Shouldn't happen (this button only ever goes out to the
             # thread's own reporter), but don't let a forwarded/replayed
             # callback_data let someone follow up on someone else's thread.
-            await query.answer("⚠️ مش قادر أعمل كده.", show_alert=True)
+            # (its "can't do that" toast was shown by _tap_toast)
             return
         AWAITING_USER_FOLLOWUP[user_id] = {"group_message_id": group_message_id}
         await context.bot.send_message(
@@ -6733,8 +6938,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if get_randomize_enabled(user_id):
             ready_ids = list(ready_ids)
             random.shuffle(ready_ids)
-
-        await _quizzy_late_night_popup(query)
 
         auto_next = get_auto_next_enabled(user_id)
         lr_key = _lr_key(year, lecture_key)
@@ -7277,7 +7480,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_settings_to_channel(context)
         if is_onboarding:
             # Quizzy's year quip is no longer a chat message — it went out
-            # as a toast on this very tap (see _onboarding_toast /
+            # as a toast on this very tap (see _tap_toast /
             # ONBOARDING_YEAR_QUIPS), so only the confirmation and the
             # bully question remain in the chat. The bully question's two
             # buttons lead to the "just kidding" step — see onboard_bully below.
@@ -7333,7 +7536,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "onboard_go":
         # The random Quizzy welcome line already showed as a toast on this
-        # tap (see _onboarding_toast), so the menu message itself is just
+        # tap (see _tap_toast), so the menu message itself is just
         # the greeting — no ASCII cat block repeated underneath it.
         nickname = get_nickname(user_id)
         greeting = f"يا {html.escape(nickname)}! " if nickname else ""
@@ -7359,12 +7562,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_settings_to_channel(context)
         # Spaced Repetition only ever fires in auto-next mode (see
         # _maybe_deliver_spaced_repetition) — warn right away if this
-        # toggle just created that mismatch, on top of the persistent
-        # warning line _send_settings shows while it's in effect.
-        if key == "spaced_repetition" and entry["spaced_repetition"] and not entry.get("auto_next", True):
-            await query.answer("⚠️ Spaced Repetition لازم يكون معاه Auto-Next شغال", show_alert=True)
-        elif key == "auto_next" and not entry["auto_next"] and entry.get("spaced_repetition", True):
-            await query.answer("⚠️ قفلت Auto-Next، فـ Spaced Repetition مش هيشتغل لحد ما ترجعه", show_alert=True)
+        # toggle just created that mismatch — shown as a toast (_tap_toast),
+        # on top of the persistent warning line _send_settings shows while
+        # it's in effect.
+        # (the mismatch toast for this tap was already shown by _tap_toast)
         await _send_settings(context, user_id, query.message, edit=True, page=page)
         await _maybe_award_curious(context, user_id)
         return
@@ -7383,16 +7584,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Settings: Clear Mistake Bank (with confirmation) ──
     # MISTAKES_BANK holds every user's entries in one file, but each entry
     # is tagged with its owner (see MISTAKES BANK schema note), so this
-    # action only ever touches the tapping user's own entries — and
-    # asks for an explicit tap-to-confirm before wiping them, since it's
-    # destructive.
+    # action only ever touches the tapping user's own entries — and, when
+    # an admin has set a /daily_module scope, only the ones in that
+    # module (other modules' mistakes are left alone). With no scope set
+    # it clears all of the user's mistakes, as before. Asks for an
+    # explicit tap-to-confirm before wiping them, since it's destructive.
+    # The confirm screen, the toast and the deletion all use
+    # _scoped_mistakes_bank, so the number the user was shown is the
+    # number that gets removed.
     if query.data == "clear_mistakes_bank_ask":
         count = len(_scoped_mistakes_bank(user_id))
         if not count:
-            await query.answer("🎉 بنك الأخطاء بتاعك فاضي أصلاً!", show_alert=True)
-            return
+            return   # "already empty" toast was shown by _tap_toast
+        scope = get_daily_quiz_scope()
+        scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
         await query.edit_message_text(
             f"⚠️ <b>متأكد إنك عايز تمسح بنك الأخطاء بتاعك؟</b>\n\n"
+            f"{scope_line}"
             f"هيتمسح <b>{count}</b> سؤال، والعملية دي مش هترجع تاني.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -7403,16 +7611,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "clear_mistakes_bank_yes":
-        # Remove only this user's entries (identity, not just count, so the
-        # removal is exact even if the bank changed between the confirm
-        # screen and this tap).
-        before  = len(MISTAKES_BANK)
-        MISTAKES_BANK[:] = [m for m in MISTAKES_BANK if not (_is_valid_mistake_entry(m) and m["user_id"] == user_id)]
-        cleared = before - len(MISTAKES_BANK)
-        _MISTAKES_BY_USER.pop(user_id, None)   # O(1) — we know exactly whose bucket emptied
+        # Remove only this user's entries in the current /daily_module
+        # scope (all of theirs if no scope is set) — the same set the
+        # confirm screen counted. Matched by object identity, not just by
+        # count, so the removal is exact even if the bank changed between
+        # the confirm screen and this tap.
+        doomed = {id(m) for m in _scoped_mistakes_bank(user_id)}
+        MISTAKES_BANK[:] = [m for m in MISTAKES_BANK if id(m) not in doomed]
+        # Patch this user's bucket in the per-user index to match. Other
+        # modules' entries stay in it, so it can't just be popped anymore.
+        remaining = [m for m in _MISTAKES_BY_USER.get(user_id, []) if id(m) not in doomed]
+        if remaining:
+            _MISTAKES_BY_USER[user_id] = remaining
+        else:
+            _MISTAKES_BY_USER.pop(user_id, None)
         await save_mistakes_bank()
         await backup_mistakes_bank_to_channel(context)
-        await query.answer(f"✅ اتمسح {cleared} سؤال من بنك الأخطاء بتاعك.", show_alert=True)
+        # ("✅ N cleared" toast was shown by _tap_toast, which counts this
+        # same set of entries before they're removed here.)
         await _send_settings(context, user_id, query.message, edit=True)
         return
 
@@ -7506,17 +7722,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "daily_quiz_begin":
-        # "Already done today" takes priority over the late-night nudge —
-        # this is the one place that race can actually surface (a stale
-        # Start button tapped after the quiz was already completed some
-        # other way), and it's the more specific joke for that exact case.
-        if get_daily_quiz_last_date(user_id) == _today():
-            try:
-                await query.answer(QUIZZY_ALREADY_DONE_MSG, show_alert=True)
-            except Exception:
-                pass
-        else:
-            await _quizzy_late_night_popup(query)
+        # The Quizzy toast for this tap ("already done today" / late night)
+        # was already shown by _tap_toast at the top of button_handler.
         await start_daily_quiz(context, user_id, message=query.message)
         return
 
@@ -7524,16 +7731,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "mistakes_bank_menu":
         scope = get_daily_quiz_scope()
         count = len(_scoped_mistakes_bank(user_id))
-        if count == 0:
-            try:
-                await query.answer(QUIZZY_MISTAKES_EMPTY_MSG, show_alert=True)
-            except Exception:
-                pass
-        elif count >= QUIZZY_MISTAKES_HIGH_THRESHOLD:
-            try:
-                await query.answer(QUIZZY_MISTAKES_HIGH_MSG, show_alert=True)
-            except Exception:
-                pass
+        # The Quizzy toast for an empty / very full bank was already shown
+        # by _tap_toast at the top of button_handler.
         scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
         text = f"🧠 <b>بنك الأخطاء</b>\n\n{scope_line}عدد الأسئلة المسجلة: <b>{count}</b>"
         buttons = []
@@ -7544,7 +7743,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "mistakes_retake":
-        await _quizzy_late_night_popup(query)
         await start_mistakes_retake(context, user_id, message=query.message)
         return
 
@@ -8140,6 +8338,69 @@ _RESTORE_TARGETS = {
     "quiz_y3":         ("Quiz Index — Y3",  lambda app: restore_quiz_from_channel(app, "y3")),
     "mistakes_bank":   ("Mistakes Bank",    lambda app: restore_mistakes_bank_from_channel(app)),
     "report_threads":  ("Report Threads",   lambda app: restore_report_threads_from_channel(app)),
+}
+
+# ── RESET actions — "create a new/blank file" for one system ─────────
+# Offered only from the /restore flow, only when restore_go finds
+# nothing pinned to restore from (status "no_backup"). Each action
+# wipes the system's in-memory state to blank, saves that blank state
+# locally, then pushes it as a brand-new pinned backup — so afterwards
+# there IS something pinned, exactly as if the system had started
+# fresh. context here is the update's ContextTypes.DEFAULT_TYPE (has
+# .bot), same as what the backup_*_to_channel functions expect —
+# not the `app` that the restore functions above take.
+async def _reset_analytics_system(context):
+    ANALYTICS.clear()
+    await save_analytics()
+    RESTORE_OK["analytics"] = True
+    await backup_analytics_to_channel(context)
+
+async def _reset_settings_system(context):
+    SETTINGS.clear()
+    await save_settings()
+    RESTORE_OK["settings"] = True
+    await backup_settings_to_channel(context)
+
+async def _reset_storage_system(context):
+    USERS.clear()
+    STORAGE_INDEX.clear()
+    await save_users()
+    await save_storage_index()
+    RESTORE_OK["storage"] = True
+    await backup_storage_to_channel(context)
+
+async def _reset_quiz_system(context, year: str):
+    QUIZ_INDEX[year].clear()
+    QUIZ_STATE[year].clear()
+    QUIZ_POLL_STATUS[year].clear()
+    await save_quiz_index(year)
+    await save_quiz_state(year)
+    await save_quiz_poll_status(year)
+    RESTORE_OK[f"quiz_{year}"] = True
+    await backup_quiz_to_channel(context, year)
+
+async def _reset_mistakes_bank_system(context):
+    MISTAKES_BANK.clear()
+    _reindex_mistakes_bank()
+    await save_mistakes_bank()
+    RESTORE_OK["mistakes_bank"] = True
+    await backup_mistakes_bank_to_channel(context)
+
+async def _reset_report_threads_system(context):
+    REPORT_THREADS.clear()
+    await save_report_threads()
+    RESTORE_OK["report_threads"] = True
+    await backup_report_threads_to_channel(context)
+
+_RESET_ACTIONS = {
+    "analytics":       lambda context: _reset_analytics_system(context),
+    "settings":        lambda context: _reset_settings_system(context),
+    "storage":         lambda context: _reset_storage_system(context),
+    "quiz_y1":         lambda context: _reset_quiz_system(context, "y1"),
+    "quiz_y2":         lambda context: _reset_quiz_system(context, "y2"),
+    "quiz_y3":         lambda context: _reset_quiz_system(context, "y3"),
+    "mistakes_bank":   lambda context: _reset_mistakes_bank_system(context),
+    "report_threads":  lambda context: _reset_report_threads_system(context),
 }
 
 def _restore_picker_keyboard() -> InlineKeyboardMarkup:
