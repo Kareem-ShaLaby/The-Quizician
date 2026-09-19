@@ -1505,6 +1505,10 @@ def _blank_settings_entry() -> dict:
         "reactions": True,
         "auto_next": True,
         "randomize": True,
+        "mix_written": False,   # False (default): written entries always trail at the
+                                 # end of the lecture, even with randomize on. True:
+                                 # written entries are shuffled in among the poll
+                                 # questions instead — see get_mix_written_enabled.
         "achievement_notifs": True,
         "spaced_repetition": True,   # see get_spaced_repetition_enabled below
         "question_timer": 0,   # seconds a live quiz poll stays open before
@@ -1701,6 +1705,9 @@ def get_auto_next_enabled(user_id: int) -> bool:
 
 def get_randomize_enabled(user_id: int) -> bool:
     return _get_bool_setting(user_id, "randomize")
+
+def get_mix_written_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "mix_written")
 
 def get_achievement_notifs_enabled(user_id: int) -> bool:
     return _get_bool_setting(user_id, "achievement_notifs")
@@ -2334,9 +2341,9 @@ _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS = 120
 # admin can also temporarily override a given year via /daily_module
 # (see get_daily_quiz_scope), which takes priority over this default.
 DAILY_QUIZ_ACTIVE_MODULE = {
-    "y1": "Foundation (1)",
-    "y2": "Respiratory",
-    "y3": "Endocrine",
+    "y1": "Foundation (2)",
+    "y2": "Blood",
+    "y3": "Genitourinary",
 }
 
 # Rebuilding this pool means: for every (module, subject) pair, scanning
@@ -3716,6 +3723,23 @@ AWAITING_BROADCAST_MESSAGE  = {}    # admin_id -> True, while waiting for the ne
 # but supported by the splice logic below for completeness).
 QUIZ_INSERT_AFTER: dict = {y: {} for y in YEARS}
 
+# ── Pre-question images for quiz-channel authoring ─────────────────
+# QUIZ_PENDING_POLL_IMAGE[year][lecture_key] = {"file_id", "file_unique_id"}
+# A photo posted in the quiz channel with NO "w:" written-question marker
+# is held here until the very next poll question is posted for that same
+# lecture — at that point it's consumed and filed onto that poll's entry
+# in QUIZ_INDEX[year][lecture]["poll_images"] (see handle_quiz_channel_message),
+# so a sequence like "Q1, Q2, <image>, Q3" attaches the image to Q3 as
+# that poll's native media once it's delivered to students (see
+# _deliver_next_lecture_question). file_unique_id is the immutable part —
+# stable for this exact photo regardless of how many times its file_id
+# gets reissued — kept alongside file_id (needed to actually resend it)
+# mostly as a stable reference/debugging aid, since QUIZ_INDEX itself is
+# what's durably saved/backed up (this dict is just the RAM-only "waiting
+# for its question" staging area, cleared on -END/-FIN same as
+# QUIZ_INSERT_AFTER above).
+QUIZ_PENDING_POLL_IMAGE: dict = {y: {} for y in YEARS}
+
 # ── /report_issue support ────────────────────────────────────────
 # REPORT_THREADS mirrors the MISTAKES_BANK persistence pattern exactly:
 # local JSON file, plus a pinned backup in REPORT_ISSUE_GROUP_ID that gets
@@ -4357,6 +4381,27 @@ def parse_written_strict(block: str):
         return title, content[1:-1].strip()
     return None
 
+def parse_written_channel_block(text: str):
+    """Quiz-CHANNEL written-question marker: a message (or photo caption)
+    whose first line starts with 'w:' (case-insensitive). Everything after
+    the marker on that first line is the title; every following line is
+    the (unscored) content shown to students behind a spoiler. A photo
+    with only a title ("w: some diagram") is valid — content is just "".
+    Returns (title, content) or None if the text doesn't start with the
+    marker or has no title text after it. This is deliberately separate
+    from parse_written_strict (the '.'-wrapped DM personal-quiz-builder
+    format) — different authoring surface, different grammar."""
+    m = re.match(r"^w\s*:\s*(.*)", text.strip(), re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    rest  = m.group(1)
+    lines = rest.split("\n", 1)
+    title = lines[0].strip()
+    if not title:
+        return None
+    content = lines[1].strip() if len(lines) > 1 else ""
+    return title, content
+
 def split_question_for_telegram(question: str):
     """
     Returns (main_q, description_overflow) where:
@@ -4571,8 +4616,9 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
         ]
         return InlineKeyboardMarkup(rows)
 
-    auto_next  = get_auto_next_enabled(user_id)
-    randomize  = get_randomize_enabled(user_id)
+    auto_next    = get_auto_next_enabled(user_id)
+    randomize    = get_randomize_enabled(user_id)
+    mix_written  = get_mix_written_enabled(user_id)
     spaced_rep = get_spaced_repetition_enabled(user_id)
     timer      = get_question_timer_seconds(user_id)
     timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
@@ -4580,6 +4626,7 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
         [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
         [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
+        [InlineKeyboardButton(f"🔀 Mix Written: {_tag(mix_written)}", callback_data="toggle_mix_written")],
         [InlineKeyboardButton(f"🔁 Spaced Repetition: {_tag(spaced_rep)}", callback_data="toggle_spaced_repetition")],
         [InlineKeyboardButton(f"⏱️ Question Timer: {timer_tag}", callback_data="toggle_question_timer")],
         [InlineKeyboardButton("🗑 Clear Mistake Bank", callback_data="clear_mistakes_bank_ask")],
@@ -4808,6 +4855,30 @@ XP_LECTURE_CORRECT        = 15   # per question answered correctly
 XP_LECTURE_INCORRECT      = 5    # per question answered incorrectly
 XP_LECTURE_COMPLETE_BONUS = 25   # extra, on top of the above, for the lecture's last question
 
+async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int, w: dict):
+    """Sends one written-question entry (see parse_written_channel_block /
+    QUIZ_INDEX[year][lecture]['written']): a title with its content hidden
+    behind a Telegram spoiler, same '||text||' MarkdownV2 convention as the
+    DM personal-quiz-builder's written blocks. Unscored — not a poll, never
+    touches session['answered']/['correct'], XP, or the mistakes bank."""
+    title   = w.get("title", "")
+    content = w.get("content", "")
+    caption = f"*{title}*" + (f"\n||{content}||" if content else "")
+    image = w.get("image")
+    try:
+        if image and image.get("file_id"):
+            await context.bot.send_photo(
+                chat_id=user_id, photo=image["file_id"],
+                caption=caption, parse_mode=ParseMode.MARKDOWN_V2,
+                has_spoiler=bool(image.get("spoiler")),
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=user_id, text=caption, parse_mode=ParseMode.MARKDOWN_V2,
+            )
+    except Exception as e:
+        print(f"Couldn't send written question '{title}': {e}")
+
 async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
     """Pops message ids off session['queue'] and sends them to the user one
     at a time as the bot's own non-anonymous quiz polls (built from content
@@ -4844,6 +4915,15 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         }
         session["poll_status_by_mid"] = poll_status_by_mid
 
+    # mid -> {"file_id", "file_unique_id", "spoiler"} for any poll that had
+    # an image posted right before it in the channel (see
+    # QUIZ_PENDING_POLL_IMAGE / handle_quiz_channel_message). Rebuilt from
+    # entry each call (cheap, and always reflects live edits/deletions)
+    # rather than cached on the session like poll_status_by_mid is.
+    poll_images_by_mid = {
+        pi["mid"]: pi for pi in ((entry.get("poll_images") or []) if entry else [])
+    }
+
     async def _drop_dead(mid: int):
         if entry and mid in entry.get("ids", []):
             entry["ids"].remove(mid)
@@ -4864,7 +4944,16 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         await save_quiz_poll_status(year)
 
     while session["queue"]:
-        mid = session["queue"].pop(0)
+        item = session["queue"].pop(0)
+
+        # A written (unscored) entry — no poll, nothing to answer, so just
+        # send it and move straight on to the next real item in the same
+        # pass instead of returning (there's no answer to wait for).
+        if isinstance(item, dict) and item.get("type") == "written":
+            await _deliver_written_item(context, user_id, item["data"])
+            continue
+
+        mid = item
         status = poll_status_by_mid.get(mid)
 
         question    = status.get("question")    if status else None
@@ -4928,13 +5017,29 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
 
         timer_seconds = get_question_timer_seconds(user_id)
         session["delivered_count"] = session.get("delivered_count", 0) + 1
+        poll_kwargs = dict(
+            chat_id=user_id, question=_numbered_question(question, session["delivered_count"]), options=options,
+            type="quiz", correct_option_id=correct_id, is_anonymous=False,
+            explanation=(explanation or None),
+            open_period=(timer_seconds or None),
+        )
+        pending_img = poll_images_by_mid.get(mid)
         try:
-            msg = await context.bot.send_poll(
-                chat_id=user_id, question=_numbered_question(question, session["delivered_count"]), options=options,
-                type="quiz", correct_option_id=correct_id, is_anonymous=False,
-                explanation=(explanation or None),
-                open_period=(timer_seconds or None),
-            )
+            if pending_img:
+                # Reuse the file_id captured straight off the channel photo —
+                # no download needed, it's already a valid Telegram file.
+                try:
+                    msg = await context.bot.send_poll(**poll_kwargs, media=InputMediaPhoto(pending_img["file_id"]))
+                except Exception as e:
+                    # Same defensive fallback as _send_quiz_poll: if native
+                    # poll media is ever rejected, still deliver the
+                    # question rather than silently dropping it — just as
+                    # a separate photo message right before the poll.
+                    print(f"POLL MEDIA ERROR for lecture question {mid} (falling back to separate image message):", e)
+                    await context.bot.send_photo(chat_id=user_id, photo=pending_img["file_id"])
+                    msg = await context.bot.send_poll(**poll_kwargs)
+            else:
+                msg = await context.bot.send_poll(**poll_kwargs)
         except Exception as e:
             print(f"Couldn't send lecture question {mid}: {e}")
             session["delivered_count"] -= 1   # this send never went out — don't burn a number on it
@@ -5677,6 +5782,38 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         return  # not one of the configured quiz channels
     channel_id = year_channel_id(year)
 
+    # ── A photo — either a written-question ("w:") post, or a plain
+    # illustration meant for the NEXT poll question ────────────────
+    if msg.photo:
+        current = QUIZ_STATE[year].get("current_lecture")
+        if not current or current not in QUIZ_INDEX[year]:
+            await context.bot.send_message(
+                channel_id,
+                "⚠️ محتاج تبعت اسم المحاضرة الأول (أي رسالة نصية) قبل ما تبعت صور."
+            )
+            return
+        photo   = msg.photo[-1]   # highest resolution
+        caption = (msg.caption or "").strip()
+        written = parse_written_channel_block(caption) if caption else None
+        image_info = {
+            "file_id":        photo.file_id,
+            "file_unique_id": photo.file_unique_id,   # the immutable part — see QUIZ_PENDING_POLL_IMAGE
+            "spoiler":        bool(getattr(msg, "has_media_spoiler", False)),
+        }
+        if written:
+            title, content = written
+            QUIZ_INDEX[year][current].setdefault("written", []).append({
+                "id": msg.message_id, "title": title, "content": content, "image": image_info,
+            })
+            await save_quiz_index(year)
+            return
+        # Not a written question — hold it for whichever poll comes next.
+        # A second image before that poll simply overwrites this one
+        # (last image before the question wins), same as re-sending a
+        # lecture name overwrites QUIZ_STATE's current_lecture.
+        QUIZ_PENDING_POLL_IMAGE[year][current] = image_info
+        return
+
     # ── A quiz poll — file it under the currently-open lecture ──
     if msg.poll:
         current = QUIZ_STATE[year].get("current_lecture")
@@ -5700,6 +5837,15 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             pos = (ids.index(insert_after) + 1) if insert_after is not None and insert_after in ids else 0
             ids.insert(pos, msg.message_id)
             QUIZ_INSERT_AFTER[year][current] = msg.message_id
+        # An image posted right before THIS poll (and after any earlier
+        # poll) is now claimed by it — see QUIZ_PENDING_POLL_IMAGE's
+        # comment and _deliver_next_lecture_question, which attaches it
+        # as the poll's native media at delivery time.
+        pending_img = QUIZ_PENDING_POLL_IMAGE[year].pop(current, None)
+        if pending_img:
+            QUIZ_INDEX[year][current].setdefault("poll_images", []).append({
+                "mid": msg.message_id, **pending_img,
+            })
         await save_quiz_index(year)
         # Track this poll so we know once it's stopped (only then is the
         # correct answer known — needed before it can be delivered as a
@@ -5772,6 +5918,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         QUIZ_STATE[year]["current_lecture"] = None
         await save_quiz_state(year)
         QUIZ_INSERT_AFTER[year].pop(current, None)   # done editing (if this was an /edit_quiz re-open)
+        QUIZ_PENDING_POLL_IMAGE[year].pop(current, None)   # any unclaimed image dies with the lecture
 
         # Batched now, once, instead of one reaction call per question:
         # mark every still-open (forgot to Stop Poll) question in this
@@ -5803,6 +5950,25 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             f"✅ {verb} محاضرة <b>{current}</b> — {count} سؤال.{note}",
             parse_mode=ParseMode.HTML,
         )
+        return
+
+    # ── Written question ("w: ...") — unscored reference content, not a
+    # poll. Checked before lecture-title parsing so it's never mistaken
+    # for (and rejected as) a malformed lecture name. ──────────────────
+    written = parse_written_channel_block(text)
+    if written:
+        current = QUIZ_STATE[year].get("current_lecture")
+        if not current or current not in QUIZ_INDEX[year]:
+            await context.bot.send_message(
+                channel_id,
+                "⚠️ محتاج تبعت اسم المحاضرة الأول (أي رسالة نصية) قبل ما تبعت أسئلة مكتوبة."
+            )
+            return
+        title, content = written
+        QUIZ_INDEX[year][current].setdefault("written", []).append({
+            "id": msg.message_id, "title": title, "content": content, "image": None,
+        })
+        await save_quiz_index(year)
         return
 
     # New lecture name (or resuming one that already exists).
@@ -7320,9 +7486,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if get_randomize_enabled(user_id):
+        randomize = get_randomize_enabled(user_id)
+        if randomize:
             ready_ids = list(ready_ids)
             random.shuffle(ready_ids)
+
+        # Written (unscored) entries for this lecture — never counted in
+        # "total"/"answered"/"correct" (see _deliver_written_item), just
+        # extra content mixed into delivery. Governed by its OWN setting
+        # (Mix Written), independent of Randomize (which only controls the
+        # order of the real poll questions): Mix Written ON scatters written
+        # entries at random positions among the polls WITHOUT reshuffling
+        # the polls' own order a second time (that order was already
+        # decided by Randomize just above); OFF (the default) always trails
+        # them at the end, in authoring order, even while Randomize is on —
+        # see parse_written_channel_block / handle_quiz_channel_message.
+        written_items = [{"type": "written", "data": w} for w in (entry.get("written") or [])]
+        queue = list(ready_ids)
+        if get_mix_written_enabled(user_id):
+            for w in written_items:
+                queue.insert(random.randint(0, len(queue)), w)
+        else:
+            queue += written_items
 
         auto_next = get_auto_next_enabled(user_id)
         lr_key = _lr_key(year, lecture_key)
@@ -7340,7 +7525,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         session = {
             "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
-            "queue": list(ready_ids), "current_poll_id": None, "current_correct_id": None,
+            "queue": queue, "current_poll_id": None, "current_correct_id": None,
             "total": len(ready_ids), "answered": 0, "correct": 0,
             "mode": "auto" if auto_next else "batch",
             "pending_polls": {},
@@ -7932,11 +8117,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize", "toggle_achievement_notifs", "toggle_spaced_repetition"):
+    if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize", "toggle_mix_written", "toggle_achievement_notifs", "toggle_spaced_repetition"):
         key = {
             "toggle_reactions": "reactions",
             "toggle_auto_next": "auto_next",
             "toggle_randomize": "randomize",
+            "toggle_mix_written": "mix_written",
             "toggle_achievement_notifs": "achievement_notifs",
             "toggle_spaced_repetition": "spaced_repetition",
         }[query.data]
