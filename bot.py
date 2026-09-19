@@ -6926,14 +6926,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── /preview — onboarding walkthrough (admin-only, non-destructive;
-    # see preview_cmd for why the Year/Class buttons here are inert) ──
+    # see preview_cmd for why the Year/Class buttons here are inert).
+    # From here on (bully joke -> "just kidding" -> how/where -> the
+    # admin's special vault message -> onboard_go) the preview hands off
+    # to the REAL onboard_bully:/onboard_how/onboard_where/onboard_go
+    # handlers further below, unmodified — none of those steps write any
+    # state (the joke's answer isn't stored, and the vault message is
+    # just re-sent), so they're already safe to trigger outside of real
+    # onboarding, and reusing them keeps the preview honest if that joke
+    # or the vault message ever changes. ──────────────────────────────
     if query.data == "preview_step2":
         if not is_admin(update):
             await query.answer(MSG_ADMIN_ONLY, show_alert=True)
             return
         preview_kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton(year_class_label(yc), callback_data="preview_noop")] for yc in YEAR_ORDER]
-            + [[InlineKeyboardButton("▶️ Next (Welcome menu)", callback_data="preview_step3")]]
+            + [[InlineKeyboardButton("▶️ Next (bully joke)", callback_data="preview_yc_done")]]
         )
         await query.edit_message_text(
             "What Year/Class are you currently in?\n\n"
@@ -6948,19 +6956,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("🔍 Preview — دي مجرد عينة، مش بتغير أي حاجة فعلياً.", show_alert=True)
         return
 
-    if query.data == "preview_step3":
+    if query.data == "preview_yc_done":
         if not is_admin(update):
             await query.answer(MSG_ADMIN_ONLY, show_alert=True)
             return
-        nickname = get_nickname(user_id) or "يا بطل"
+        sample_label = year_class_label(YEAR_ORDER[0]) if YEAR_ORDER else "—"
         await query.edit_message_text(
-            f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
-            f"يا {html.escape(nickname)}! تحب تعمل أي؟!:\n\n"
-            f"<i>🔍 Preview خلصت — من هنا لقدام دي القايمة الحقيقية، تقدر تدوس عادي.</i>",
+            f"✅ تمام، {sample_label}.\n\n"
+            "<i>🔍 Preview — دي عينة بس، مفيش سنة/كلاس اتسجلت فعلياً.</i>",
             parse_mode=ParseMode.HTML,
-            reply_markup=start_menu_keyboard(),
+        )
+        # Same message/buttons as the real onboard_yc: onboarding branch —
+        # tapping either just leads to the (also state-free) "just
+        # kidding" step via the real onboard_bully: handler below.
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="Do you want me to bully you when you get questions wrong?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("What???", callback_data="onboard_bully:what"),
+                InlineKeyboardButton("No 😭",   callback_data="onboard_bully:no"),
+            ]]),
         )
         return
+
 
     # ── REPORT ISSUE: draft confirmation (user's own Send/Cancel) ────
     if query.data == "report_draft_send":
@@ -8595,19 +8613,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/preview — admin-only walkthrough of exactly what a brand-new
-    user sees on their very first /start: the nickname prompt, then the
-    Year/Class picker, then the welcome menu (see start() above — this
-    mirrors its three screens 1:1, same text/art).
+    user sees on their very first /start: nickname prompt -> Year/Class
+    picker -> "✅ تمام" + the bully joke -> "just kidding" (how/where) ->
+    the admin's special vault message -> 🗣️🗣️🔥 يلا بينا -> welcome menu
+    (see start() and the onboard_yc:/onboard_bully:/onboard_how/
+    onboard_where/onboard_go callback branches — this mirrors that exact
+    sequence, same text/art/buttons throughout).
 
-    Purely a preview, never touches real state: it does NOT set
-    AWAITING_NICKNAME (so typing anything afterwards doesn't get read as
-    a nickname), and the Year/Class step's buttons are inert
-    (preview_noop) look-alikes of the real picker rather than the real
-    onboard_yc: ones — tapping them can't set (and, per that step's own
-    warning, permanently lock) a year/class on the admin's own account.
-    The final welcome screen switches to the real start_menu_keyboard(),
-    since from that point on it's just ordinary menu navigation and
-    perfectly safe to click through."""
+    Purely a preview, never touches real state for the two steps that
+    normally DO write something: it does NOT set AWAITING_NICKNAME (so
+    typing anything afterwards isn't read as a nickname), and the
+    Year/Class step's buttons are inert (preview_noop) look-alikes of
+    the real picker rather than the real onboard_yc: ones — tapping them
+    can't set (and, per that step's own warning, permanently lock) a
+    year/class on the admin's own account. Everything from the bully
+    joke onward (onboard_bully:/onboard_how/onboard_where/onboard_go)
+    hands off to the REAL production callbacks — none of those write any
+    state (the joke's answer isn't stored, the vault message is just
+    re-sent, the final screen is just start_menu_keyboard()), so it's
+    already safe to trigger here and stays accurate if that joke or the
+    vault message ever changes."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
@@ -8644,7 +8669,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("/dev_panel — stats snapshot + shortcuts (Set year, Users, Backups, Daily module) — Creator only")
         lines.append("/set_year &lt;Nickname or ID&gt;")
         lines.append("/tell &lt;ID or Nickname&gt; &lt;message&gt;")
-        lines.append("/preview — walk through the onboarding flow (nickname → year/class → welcome)")
+        lines.append("/preview — walk through the onboarding flow (nickname → year/class → bully joke → welcome)")
         lines.append("/health")
         lines.append("/restore")
         lines.append("/broadcast &lt;message&gt;")
