@@ -10382,7 +10382,7 @@ app.add_handler(MessageHandler(filters.POLL & ~filters.Chat(QUIZ_CHANNEL_IDS), h
 # own quiz-building activity. Must be registered before the generic
 # text/poll handlers below.
 app.add_handler(MessageHandler(
-    filters.Chat(QUIZ_CHANNEL_IDS) & (filters.POLL | filters.TEXT), handle_quiz_channel_message
+    filters.Chat(QUIZ_CHANNEL_IDS) & (filters.POLL | filters.TEXT | filters.PHOTO), handle_quiz_channel_message
 ))
 
 # Storage group indexing — anything posted in the vault group gets filed by
@@ -10401,9 +10401,11 @@ app.add_handler(MessageHandler(
     filters.Chat(STORAGE_GROUP_ID) & filters.TEXT & ~filters.COMMAND, handle_storage_text_message
 ))
 
-# Image handler (photos) — excludes the storage group
+# Image handler (photos) — excludes the storage group and the quiz
+# channel (quiz-channel photos are claimed by handle_quiz_channel_message
+# above; this is a belt-and-suspenders exclusion, not just handler order)
 app.add_handler(MessageHandler(
-    filters.PHOTO & ~filters.Chat(STORAGE_GROUP_ID), handle_image
+    filters.PHOTO & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_IDS), handle_image
 ))
 
 # PDF handler — captioned PDFs in a private DM are parsed as manual MCQs;
