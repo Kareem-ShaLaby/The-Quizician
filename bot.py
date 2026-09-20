@@ -426,6 +426,14 @@ QUIZZY_AMAZED_ART = (
     "( ✦.✦ )\n"
     "  > ^ <  "
 )
+# Same pose as QUIZZY_WELCOME_ART, but winking — used only for the "Haha i
+# am just kidding" beat mid-onboarding. Every other onboarding/intro message
+# uses QUIZZY_WELCOME_ART (the plain happy face).
+QUIZZY_WINK_ART = (
+    " /\\_/\\ \n"
+    "( ⌒-⌒ )\n"
+    "  > ^ <  "
+)
 
 QUIZZY_WELCOME_LINES = [
     "صباح (أو مساء) الورد 🌹",
@@ -3672,6 +3680,31 @@ RETAKE_STAGING         = {}    # user_id -> {"year","module","subject","lecture_
                                 # — wrong-question mids from a just-finished lecture, offered via the
                                 # "🔁 Retake incorrect questions!" button; consumed (popped) once tapped
 AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is waiting on a nickname reply
+ONBOARDING_PROMPT_MSG  = {}    # real_uid -> (chat_id, message_id) of the first-ever /start's "what's
+                                # your name?" prompt, so the nickname reply can edit it in place into
+                                # the Year/Class step instead of sending a new message. Onboarding-only
+                                # (Settings' nickname re-ask isn't tracked here, nothing to flow into).
+
+async def _flow_onboarding_message(update, context, real_uid: int, text: str, **kwargs):
+    """Edits the tracked onboarding prompt (ONBOARDING_PROMPT_MSG) in place
+    with `text`/`kwargs` (parse_mode, reply_markup, ...) instead of sending a
+    new message, so the whole first-ever /start walkthrough reads as one
+    message updating step to step rather than a pile of separate ones.
+    Falls back to a fresh reply_text (and starts tracking THAT message
+    instead) if there's nothing tracked yet or the edit fails (message too
+    old/deleted) — onboarding must never dead-end over this."""
+    prompt = ONBOARDING_PROMPT_MSG.get(real_uid)
+    if prompt:
+        prompt_chat_id, prompt_msg_id = prompt
+        try:
+            await context.bot.edit_message_text(
+                chat_id=prompt_chat_id, message_id=prompt_msg_id, text=text, **kwargs
+            )
+            return
+        except Exception:
+            pass  # fall through to a fresh send below
+    sent = await update.message.reply_text(text, **kwargs)
+    ONBOARDING_PROMPT_MSG[real_uid] = (sent.chat_id, sent.message_id)
 PENDING_QUIZ_DELETE    = {}    # admin_id -> (year, lecture_key), set by /quiz_delete while waiting on
                                 # the confirm/cancel tap (see quizdel_yes/quizdel_no in button_handler)
 
@@ -6364,7 +6397,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # through to the settings menu, since there isn't a main
                 # menu to fall back to yet.
                 AWAITING_NICKNAME[real_uid] = "onboarding"
-                await update.message.reply_text(
+                await _flow_onboarding_message(
+                    update, context, real_uid,
                     "⚠️ الاسم فاضي — اكتب اسم تحب أتنادي بيه عليك.",
                 )
             else:
@@ -6378,7 +6412,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Same re-ask pattern as the empty-name case above — no
                 # main menu to fall back to yet during onboarding.
                 AWAITING_NICKNAME[real_uid] = "onboarding"
-                await update.message.reply_text(
+                await _flow_onboarding_message(
+                    update, context, real_uid,
                     "⚠️ الاسم ده مش مناسب — اكتب اسم تاني.",
                 )
             else:
@@ -6395,7 +6430,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_analytics()
         await backup_analytics_to_channel(context)
         if onboarding:
-            await update.message.reply_text(
+            # After this step, further onboarding edits happen through the
+            # callback-query buttons themselves (query.edit_message_text),
+            # not this dict, so it's fine to leave the stale entry — the
+            # next first-ever-/start for this user overwrites it anyway.
+            await _flow_onboarding_message(
+                update, context, real_uid,
                 f"What a lovely name Dr.{html.escape(nickname)} 🥰\n\n"
                 "What Year/Class are you currently in?\n\n"
                 "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)",
@@ -7152,17 +7192,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(MSG_ADMIN_ONLY, show_alert=True)
             return
         sample_label = year_class_label(YEAR_ORDER[0]) if YEAR_ORDER else "—"
+        # Same single edited message as the real onboard_yc: onboarding
+        # branch (confirmation + bully question together, not two sends) —
+        # tapping either button leads to the (also state-free) "just
+        # kidding" step via the real onboard_bully: handler below.
         await query.edit_message_text(
             f"✅ تمام، {sample_label}.\n\n"
+            "Do you want me to bully you when you get questions wrong?\n\n"
             "<i>🔍 Preview — دي عينة بس، مفيش سنة/كلاس اتسجلت فعلياً.</i>",
             parse_mode=ParseMode.HTML,
-        )
-        # Same message/buttons as the real onboard_yc: onboarding branch —
-        # tapping either just leads to the (also state-free) "just
-        # kidding" step via the real onboard_bully: handler below.
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="Do you want me to bully you when you get questions wrong?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("What???", callback_data="onboard_bully:what"),
                 InlineKeyboardButton("No 😭",   callback_data="onboard_bully:no"),
@@ -8076,15 +8114,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_onboarding:
             # Quizzy's year quip is no longer a chat message — it went out
             # as a toast on this very tap (see _tap_toast /
-            # ONBOARDING_YEAR_QUIPS), so only the confirmation and the
-            # bully question remain in the chat. The bully question's two
-            # buttons lead to the "just kidding" step — see onboard_bully below.
+            # ONBOARDING_YEAR_QUIPS), so the confirmation and the bully
+            # question are one edited message, not two separate ones — the
+            # whole walkthrough flows through a single message via its
+            # buttons rather than piling up new sends. The bully question's
+            # two buttons lead to the "just kidding" step — see
+            # onboard_bully below.
             await query.edit_message_text(
-                f"✅ تمام، {year_class_label(year_class)}.",
-            )
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="Do you want me to bully you when you get questions wrong?",
+                f"✅ تمام، {year_class_label(year_class)}.\n\n"
+                "Do you want me to bully you when you get questions wrong?",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("What???", callback_data="onboard_bully:what"),
                     InlineKeyboardButton("No 😭",   callback_data="onboard_bully:no"),
@@ -8105,7 +8143,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # joke's setup. Edited in place so the question doesn't linger.
     if query.data.startswith("onboard_bully:"):
         await query.edit_message_text(
-            "Haha i am just kidding (maybe)",
+            quizzy_block(QUIZZY_WINK_ART, "Haha i am just kidding (maybe)"),
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("what is this place?! 🙂", callback_data="onboard_how"),
                 InlineKeyboardButton("Where are we?! 🙃",       callback_data="onboard_where"),
@@ -8792,14 +8831,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # the text handler knows to continue into the welcome menu
         # afterwards instead of bouncing back to the Settings screen.
         AWAITING_NICKNAME[real_uid] = "onboarding"
-        await update.message.reply_text(
+        prompt_msg = await update.message.reply_text(
             quizzy_block(
-                QUIZZY_AMAZED_ART,
+                QUIZZY_WELCOME_ART,
                 "Hello there! My name is Quizzy! what's your name? "
                 "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
             ),
             parse_mode=ParseMode.HTML,
         )
+        ONBOARDING_PROMPT_MSG[real_uid] = (prompt_msg.chat_id, prompt_msg.message_id)
         return
 
     if get_year_class(real_uid) not in YEAR_CLASS_NUMBER:
@@ -8849,7 +8889,7 @@ async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         quizzy_block(
-            QUIZZY_AMAZED_ART,
+            QUIZZY_WELCOME_ART,
             "Hello there! My name is Quizzy! what's your name? "
             "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
         ),
