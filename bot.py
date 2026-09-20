@@ -5714,7 +5714,55 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # what a user types and matches it against STORAGE_INDEX, and the text
 # handler treats this as a normal password too — so a real word here would
 # let anyone who typed it read the message early. Guarded there too.
-ONBOARDING_STORAGE_KEY = "_onboarding"
+ONBOARDING_STORAGE_KEY = "_onboarding"   # no longer wired to onboarding delivery
+                                          # (see ONBOARDING_SPECIAL_TEXT / _send_onboarding_special
+                                          # below, now a fixed message) — kept reserved here only
+                                          # so handle_storage_text_message/_index_item don't need
+                                          # touching, in case the vault path is ever reused.
+
+# ── Fixed "welcome tour" message, shown right after the bully joke ─────
+# Used to be pulled live from whatever the admin had stored in the vault
+# under ONBOARDING_STORAGE_KEY (copy_messages from STORAGE_GROUP_ID) — now
+# just a fixed message, same idea as HOW_TO_USE_TEXT but only ever shown
+# once, mid-onboarding.
+ONBOARDING_SPECIAL_ART = (
+    "./\\___/\\ \n"
+    "(=^ ◡ ^=)ﾉ"
+)
+ONBOARDING_SPECIAL_TEXT = (
+    quizzy_block(ONBOARDING_SPECIAL_ART, "Now you are asking the RIGHT questions!")
+    + "\n\n"
+    "Welcome to The Quizician!\n"
+    "This is the place where all the magic happens 🪄✨\n\n\n"
+    "خليني أعرفك أزاي تستخدم منصة... \n"
+    "<b>The Quizician</b>\n\n\n"
+    "<b>Quizzes ⁉️</b>\n"
+    "بعدين الموديول، بعدين المادة، وبعدين المحاضرة — وأبدأ تجاوب. كل سؤال بيتصحح على طول، "
+    "وبتاخد XP على كل إجابة صح، وفالآخر نتيجتك بتظهر وتقدر تعيد أسئلتك اللي غلط فيها، وبتتحفظ "
+    "فالMistakes bank (نظفه علطول علشان ميكونس شكلك وحش 🌚)\n\n"
+    "<b>💥 Daily Quiz</b>\n"
+    "15 سؤال عشوائي من كل المحاضرات المتاحه، بتتجدد كل يوم الساعة 2 الضهر، لكن ركز! عندك "
+    "محاولة واحدة بس في اليوم علشان تبقا المركز الأول!!\n"
+    "(أول تلات مراكز بياخدو ماديليات🥇، المركز بيعتمد على سرعتك + صحة إجاباتك... يعني بلاش "
+    "بصمجة يا دولي 😂)\n\n"
+    "<b>🧠 Mistakes Bank</b>\n"
+    "أي سؤال تغلط فيه بيتسجل هنا تلقائي، عشان ترجعله وتراجعه تاني وقت ما تحب. وتقدر تنظفه من "
+    "الإعدادات (أخيراً بقا في زرار يمسح آخطائ الماضي ❤️‍🩹)\n\n"
+    "<b>📊 My Stats</b>\n"
+    "شوف الـ XP والـ Level بتاعك، عدد الأسئلة الصح والغلط، والـ achievements اللي فتحتها وحاجات "
+    "تانيه كتير (جدا) 🔥🔥\n\n"
+    "<b>🏆 Leaderboard (العام)</b>\n"
+    "ترتيبك بين زمايلك في نفس السنة/الفرقة، حسب عدد الإجابات الصح ونسبة الدقة، عايزينك تبقا فخر "
+    "بلدنا بقا 🤩\n\n"
+    "<b>⚙️ Settings</b>\n"
+    "أديها بصة قبل ما تبدأ أي حاجة 👀\n\n"
+    "❤️ لو في إي إضافة أو أي فيدباك تحب تقوله: \n"
+    "/feedback &lt;message&gt;\n\n"
+    "/report_issue —\n"
+    "لو فيه مشكلة أو سؤال غلط، ابعتلنا بلاغ وأدمن هيرد عليك فأقرب وقت (بنستخدمه لما يكون في "
+    "مشكلة مش لما سؤال أنت مش فاهمه علشان نعتق الأدمنز 🙏🌹)\n\n"
+    "وأخيرا وليس آخرا...."
+)
 
 async def _index_item(caption: str, message_ids: list):
     password = caption.strip().split(maxsplit=1)[0].lower()
@@ -5723,24 +5771,13 @@ async def _index_item(caption: str, message_ids: list):
     return password
 
 async def _send_onboarding_special(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Sends the admin's stored onboarding message (every item filed under
-    ONBOARDING_STORAGE_KEY, in the order they were posted), then a final
-    🗣️🗣️🔥 يلا بينا button.
-
-    Telegram's copyMessages can't attach a keyboard, so the button always
-    goes on its own small follow-up message. If nothing has been stored
-    yet (or a copy fails) the user still gets that button — onboarding
-    must never dead-end on a missing/broken vault item."""
-    for message_ids in STORAGE_INDEX.get(ONBOARDING_STORAGE_KEY, []):
-        try:
-            await context.bot.copy_messages(
-                chat_id=user_id, from_chat_id=STORAGE_GROUP_ID, message_ids=message_ids,
-            )
-        except Exception as e:
-            print(f"ONBOARDING: couldn't copy vault item {message_ids}: {e}")
+    """Sends the fixed onboarding "welcome tour" message (ONBOARDING_SPECIAL_TEXT),
+    then the final 🗣️🗣️🔥 يلا بينا button — as one message, since it no longer
+    needs to be a copy_messages() call that can't carry its own keyboard."""
     await context.bot.send_message(
         chat_id=user_id,
-        text="👇",
+        text=ONBOARDING_SPECIAL_TEXT,
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🗣️🗣️🔥 يلا بينا", callback_data="onboard_go"),
         ]]),
@@ -6465,7 +6502,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # next first-ever-/start for this user overwrites it anyway.
             await _flow_onboarding_message(
                 update, context, real_uid,
-                f"What a lovely name Dr.{html.escape(nickname)} 🥰\n\n"
+                f"{quizzy_block(QUIZZY_HAPPY_ART, f'What a lovely name Dr.{nickname} 🥰')}\n\n"
                 "What Year/Class are you currently in?\n\n"
                 "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)",
                 parse_mode=ParseMode.HTML,
@@ -7187,14 +7224,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── /preview — onboarding walkthrough (admin-only, non-destructive;
     # see preview_cmd for why the Year/Class buttons here are inert).
-    # From here on (bully joke -> "just kidding" -> how/where -> the
-    # admin's special vault message -> onboard_go) the preview hands off
-    # to the REAL onboard_bully:/onboard_how/onboard_where/onboard_go
-    # handlers further below, unmodified — none of those steps write any
-    # state (the joke's answer isn't stored, and the vault message is
-    # just re-sent), so they're already safe to trigger outside of real
-    # onboarding, and reusing them keeps the preview honest if that joke
-    # or the vault message ever changes. ──────────────────────────────
+    # From here on (bully joke -> "just kidding" -> how/where -> the fixed
+    # welcome-tour message -> onboard_go) the preview hands off to the REAL
+    # onboard_bully:/onboard_how/onboard_where/onboard_go handlers further
+    # below, unmodified — none of those steps write any state (the joke's
+    # answer isn't stored), so they're already safe to trigger outside of
+    # real onboarding. ──────────────────────────────────────────────────
     if query.data == "preview_step2":
         if not is_admin(update):
             await query.answer(MSG_ADMIN_ONLY, show_alert=True)
@@ -7204,6 +7239,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + [[InlineKeyboardButton("▶️ Next (bully joke)", callback_data="preview_yc_done")]]
         )
         await query.edit_message_text(
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'What a lovely name Dr.<nickname> 🥰')}\n\n"
             "What Year/Class are you currently in?\n\n"
             "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)\n\n"
             "<i>🔍 Preview — the buttons above are just a mock-up here, they don't set anything.</i>",
@@ -8154,8 +8190,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # two buttons lead to the "just kidding" step — see
             # onboard_bully below.
             await query.edit_message_text(
-                f"{quizzy_block(QUIZZY_HAPPY_ART, f'✅ تمام، {year_class_label(year_class)}.')}\n\n"
-                "Do you want me to bully you when you get questions wrong?",
+                f"{quizzy_block(QUIZZY_HAPPY_ART, 'Do you want me to bully you when you get questions wrong?')}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("What???", callback_data="onboard_bully:what"),
@@ -8187,13 +8222,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # BOTH "what is this place?! 🙂" (onboard_how) and "Where are we?! 🙃"
-    # (onboard_where) deliver the same thing: the admin's special welcome
-    # message, filed in the storage vault under ONBOARDING_STORAGE_KEY (see
-    # _send_onboarding_special). They're two differently-worded doors into
-    # the same room. The 🗣️🗣️🔥 يلا بينا button goes on the LAST message
-    # sent, since a copied vault item can't carry its own buttons — see
-    # _send_onboarding_special. (The How To Use text is no longer part of
-    # onboarding; it's still on the main menu's 🦦 How To Use button.)
+    # (onboard_where) deliver the same thing: the fixed welcome-tour message
+    # (ONBOARDING_SPECIAL_TEXT, see _send_onboarding_special). They're two
+    # differently-worded doors into the same room.
     if query.data in ("onboard_how", "onboard_where"):
         try:
             await query.edit_message_reply_markup(reply_markup=None)   # buttons are one-shot
@@ -8884,8 +8915,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # (or got interrupted mid-onboarding) — send them back to this
         # step instead of the main menu. Also mandatory, also permanent.
         await update.message.reply_text(
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'What a lovely name Dr.' + nickname + ' 🥰')}\n\n"
             "What Year/Class are you currently in?\n\n"
             "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)",
+            parse_mode=ParseMode.HTML,
             reply_markup=year_class_keyboard("onboard_yc"),
         )
         return
@@ -8902,9 +8935,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/preview — admin-only walkthrough of exactly what a brand-new
     user sees on their very first /start: nickname prompt -> Year/Class
-    picker -> "✅ تمام" + the bully joke -> "just kidding" (how/where) ->
-    the admin's special vault message -> 🗣️🗣️🔥 يلا بينا -> welcome menu
-    (see start() and the onboard_yc:/onboard_bully:/onboard_how/
+    picker -> the bully joke -> "just kidding" (how/where) -> the fixed
+    welcome-tour message (ONBOARDING_SPECIAL_TEXT) -> 🗣️🗣️🔥 يلا بينا ->
+    welcome menu (see start() and the onboard_yc:/onboard_bully:/onboard_how/
     onboard_where/onboard_go callback branches — this mirrors that exact
     sequence, same text/art/buttons throughout).
 
@@ -8917,10 +8950,8 @@ async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     year/class on the admin's own account. Everything from the bully
     joke onward (onboard_bully:/onboard_how/onboard_where/onboard_go)
     hands off to the REAL production callbacks — none of those write any
-    state (the joke's answer isn't stored, the vault message is just
-    re-sent, the final screen is just start_menu_keyboard()), so it's
-    already safe to trigger here and stays accurate if that joke or the
-    vault message ever changes."""
+    state (the joke's answer isn't stored, the final screen is just
+    start_menu_keyboard()), so it's already safe to trigger here."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
@@ -8958,10 +8989,10 @@ def _build_previewtxt_sections() -> list[str]:
     """Dumps every static, hardcoded piece of copy a normal (non-admin)
     user can see anywhere in the bot — one continuous text, not a live
     walkthrough like /preview. Doesn't include: content that's actually
-    data (admin-posted vault message, live leaderboard rows, a user's own
-    stats/XP numbers, per-exception error text) since that isn't "text
-    the bot wrote" so much as data it's displaying — those are noted
-    below instead of reproduced."""
+    data (live leaderboard rows, a user's own stats/XP numbers,
+    per-exception error text) since that isn't "text the bot wrote" so
+    much as data it's displaying — those are noted below instead of
+    reproduced."""
     out: list[str] = []
 
     out.append(
@@ -8982,19 +9013,18 @@ def _build_previewtxt_sections() -> list[str]:
         "[vulgar nickname during onboarding]\n"
         "⚠️ الاسم ده مش مناسب — اكتب اسم تاني.\n\n"
         "[Year/Class prompt]\n"
-        "What Year/Class are you currently in?\n\n"
+        + quizzy_block(QUIZZY_HAPPY_ART, "What a lovely name Dr.<nickname> 🥰")
+        + "\n\nWhat Year/Class are you currently in?\n\n"
         "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)\n\n"
         "[Year/Class confirmed → bully joke]\n"
-        + quizzy_block(QUIZZY_HAPPY_ART, "✅ تمام، <Year/Class>.")
-        + "\nDo you want me to bully you when you get questions wrong?\n"
-        "  buttons: What??? / No 😭\n\n"
+        + quizzy_block(QUIZZY_HAPPY_ART, "Do you want me to bully you when you get questions wrong?")
+        + "\n  buttons: What??? / No 😭\n\n"
         "[bully joke punchline]\n"
         + quizzy_block(QUIZZY_WINK_ART, "Haha i am just kidding (maybe)")
         + "\n  buttons: what is this place?! 🙂 / Where are we?! 🙃\n\n"
         "[after tapping either button]\n"
-        "→ sends whatever the admin has stored under the '_onboarding' vault "
-        "key (dynamic, admin-set — not reproduced here), then:\n"
-        "  button: 🗣️🗣️🔥 يلا بينا\n\n"
+        + ONBOARDING_SPECIAL_TEXT
+        + "\n  button: 🗣️🗣️🔥 يلا بينا\n\n"
         "[onboarding finished → main menu]\n"
         + quizzy_block(QUIZZY_HAPPY_ART, "<one of the welcome lines below> يا <nickname>! تحب تعمل أي؟!:")
     )
@@ -9056,7 +9086,6 @@ def _build_previewtxt_sections() -> list[str]:
 
     out.append(
         "── NOT INCLUDED (it's data, not fixed copy) ──\n\n"
-        "• the admin's own '_onboarding' vault message\n"
         "• live leaderboard rows (names/scores/medals)\n"
         "• a user's own /mystats numbers\n"
         "• per-exception error report text\n"
