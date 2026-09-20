@@ -5983,8 +5983,15 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             )
             return
         title, content = written
+        # If an image was posted just before this "w:" text (same pattern
+        # as an image posted before a poll question — see the msg.photo
+        # branch above and _deliver_next_lecture_question), claim it for
+        # this written entry instead of leaving it stranded in
+        # QUIZ_PENDING_POLL_IMAGE, where it would either get wrongly
+        # attached to whatever poll comes next or die unclaimed at -END.
+        pending_img = QUIZ_PENDING_POLL_IMAGE[year].pop(current, None)
         QUIZ_INDEX[year][current].setdefault("written", []).append({
-            "id": msg.message_id, "title": title, "content": content, "image": None,
+            "id": msg.message_id, "title": title, "content": content, "image": pending_img,
         })
         await save_quiz_index(year)
         return
