@@ -404,35 +404,48 @@ SESSIONS_GROUP_ID = -1004499530524
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — The Quizician's cat friend 🐾
 # ═══════════════════════════════════════════════════════════════
-QUIZZY_WELCOME_ART = (
-    " /\\_/\\ \n"
-    "( ⌒.⌒ )\n"
-    "  > ^ <  "
+# Nine moods, each (art, when it's used). Swap the whole block here if the
+# art is redrawn again rather than editing poses one by one.
+QUIZZY_HAPPY_ART = (   # normal greetings, Year/Class setting, the bully joke
+    "./\\___/\\ \n"
+    "(=^ ◡ ^=)つ"
+)
+QUIZZY_WINK_ART = (   # "haha i am just kidding"
+    " /\\___/\\ \n"
+    "( ^ ◡ < )つ"
+)
+QUIZZY_SAD_ART = (   # errors
+    "./\\___/\\ \n"
+    "(ಥ ﹏ ಥ)つ"
+)
+QUIZZY_ANGRY_ART = (   # writing a vulgar word / getting banned
+    " ./\\___/\\ \n"
+    "( ◣ _ ◢ )つ"
+)
+QUIZZY_ANNOYED_ART = (   # /mystats without starting any lecture
+    " ./\\___/\\ \n"
+    "( ¬ _ ¬ )つ"
+)
+QUIZZY_READY_ART = (   # daily quiz and lectures
+    " ./\\___/\\ \n"
+    "( ง •̀ _ •́ )ง"
+)
+QUIZZY_VICTORY_ART = (   # finishing a lecture
+    ". /\\___/\\ \n"
+    "ᕙ( ^ ◡ ^ )ᕗ"
+)
+QUIZZY_EXCITED_ART = (   # first time greeting, getting an achievement, getting in the leaderboard
+    ". /\\___/\\ \n"
+    "\\( ✧ ∇ ✧ )/"
+)
+QUIZZY_ADORE_ART = (   # top 3 of the leaderboard, leaving feedback
+    ". /\\___/\\ \n"
+    "( ♡ ∇ ♡ )つ"
 )
 QUIZZY_SLEEPING_ART = (
     " /\\_/\\ \n"
     "(  -.- ) zzz\n"
     " > ^ <  "
-)
-# No "oops" expression was provided yet — this one's improvised to match
-# the same style. Swap QUIZZY_OOPS_ART for a real one whenever you draw it.
-QUIZZY_OOPS_ART = (
-    " /\\_/\\ \n"
-    "( ×_× )\n"
-    " > ~ <  "
-)
-QUIZZY_AMAZED_ART = (
-    " /\\_/\\ \n"
-    "( ✦.✦ )\n"
-    "  > ^ <  "
-)
-# Same pose as QUIZZY_WELCOME_ART, but winking — used only for the "Haha i
-# am just kidding" beat mid-onboarding. Every other onboarding/intro message
-# uses QUIZZY_WELCOME_ART (the plain happy face).
-QUIZZY_WINK_ART = (
-    " /\\_/\\ \n"
-    "( ⌒-⌒ )\n"
-    "  > ^ <  "
 )
 
 QUIZZY_WELCOME_LINES = [
@@ -1396,7 +1409,7 @@ async def _notify_admin_sync_failure(app, what: str, error):
         await app.bot.send_message(
             chat_id=ADMIN_ID,
             text=(
-                f"<pre>{html.escape(QUIZZY_OOPS_ART)}</pre>"
+                f"<pre>{html.escape(QUIZZY_SAD_ART)}</pre>"
                 f"⚠️ <b>Error: failed to fetch {html.escape(what)} — try again later.</b>\n"
                 f"<code>{html.escape(str(error))}</code>\n\n"
                 f"Gave up after {RESTORE_MAX_ATTEMPTS} attempts. Local data was left as-is — "
@@ -2925,6 +2938,8 @@ async def show_daily_quiz_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int,
                 f"{r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}"
             )
         board_text = "\n".join(lines)
+
+    board_text = f"{quizzy_block(QUIZZY_READY_ART, 'CHALLENGE YOURSELF!')}\n\n{board_text}"
 
     already_done = get_daily_quiz_last_date(user_id) == _today()
     status_line = (
@@ -5392,6 +5407,8 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
         f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
         f"✨ XP: <b>+{session['xp_earned']}</b>"
     )
+    if not is_retake:
+        summary = f"{quizzy_block(QUIZZY_VICTORY_ART, 'Nice one! 🎉')}\n\n{summary}"
     result_buttons = [[
         InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
         InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_years"),
@@ -6510,7 +6527,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     print(f"Storage delivery failed for password lookup: {e}")
                     await update.message.reply_text(
-                        quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES)),
+                        quizzy_block(QUIZZY_SAD_ART, random.choice(QUIZZY_ERROR_LINES)),
                         parse_mode=ParseMode.HTML,
                     )
             return
@@ -7478,7 +7495,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lr_key = _lr_key(year, lecture_key)
 
         board = _lecture_leaderboard(lr_key)
-        lines = [f"🎓 <b>{year_label(year)} — {module} - {subject}: {entry['name']}</b>\n"]
+        lines = [
+            quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!"),
+            "",
+            f"🎓 <b>{year_label(year)} — {module} - {subject}: {entry['name']}</b>\n",
+        ]
         if board:
             medals = ["🥇", "🥈", "🥉"]
             lines.append("🏆 <b>أفضل النتائج:</b>")
@@ -8003,7 +8024,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── START MENU BUTTONS ──────────────────────────────────────
     if query.data == "back_home":
         await query.edit_message_text(
-            f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+            f"{quizzy_block(QUIZZY_HAPPY_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
             "تحب تعمل أي؟!:",
             parse_mode=ParseMode.HTML,
             reply_markup=start_menu_keyboard(),
@@ -8121,8 +8142,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # two buttons lead to the "just kidding" step — see
             # onboard_bully below.
             await query.edit_message_text(
-                f"✅ تمام، {year_class_label(year_class)}.\n\n"
+                f"{quizzy_block(QUIZZY_HAPPY_ART, f'✅ تمام، {year_class_label(year_class)}.')}\n\n"
                 "Do you want me to bully you when you get questions wrong?",
+                parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("What???", callback_data="onboard_bully:what"),
                     InlineKeyboardButton("No 😭",   callback_data="onboard_bully:no"),
@@ -8806,7 +8828,10 @@ async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ حصل خطأ وأنا بحاول أبعت الفيدباك، جرب تاني كمان شوية.")
         return
 
-    await update.message.reply_text("✅ تم إرسال الفيدباك بتاعك، شكراً ليك!")
+    await update.message.reply_text(
+        quizzy_block(QUIZZY_ADORE_ART, "✅ تم إرسال الفيدباك بتاعك، شكراً ليك!"),
+        parse_mode=ParseMode.HTML,
+    )
 
 # ═══════════════════════════════════════════════════════════════
 # START  (also wakes bot from sleep)
@@ -8833,7 +8858,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         AWAITING_NICKNAME[real_uid] = "onboarding"
         prompt_msg = await update.message.reply_text(
             quizzy_block(
-                QUIZZY_WELCOME_ART,
+                QUIZZY_EXCITED_ART,
                 "Hello there! My name is Quizzy! what's your name? "
                 "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
             ),
@@ -8856,7 +8881,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     greeting = f"يا {html.escape(nickname)}! "
 
     await update.message.reply_text(
-        f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+        f"{quizzy_block(QUIZZY_HAPPY_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
         f"{greeting}تحب تعمل أي؟!:",
         parse_mode=ParseMode.HTML,
         reply_markup=start_menu_keyboard(),
@@ -8889,7 +8914,7 @@ async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         quizzy_block(
-            QUIZZY_WELCOME_ART,
+            QUIZZY_EXCITED_ART,
             "Hello there! My name is Quizzy! what's your name? "
             "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
         ),
@@ -8898,6 +8923,149 @@ async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("▶️ Next (Year/Class step)", callback_data="preview_step2"),
         ]]),
     )
+
+def _chunk_text(text: str, limit: int = 3500) -> list[str]:
+    """Splits text into <= limit-char chunks, cutting on blank lines where
+    possible so a section never gets torn in half mid-paragraph. Telegram
+    caps messages at 4096 chars — stay well under that."""
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut == -1:
+            cut = remaining.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+def _build_previewtxt_sections() -> list[str]:
+    """Dumps every static, hardcoded piece of copy a normal (non-admin)
+    user can see anywhere in the bot — one continuous text, not a live
+    walkthrough like /preview. Doesn't include: content that's actually
+    data (admin-posted vault message, live leaderboard rows, a user's own
+    stats/XP numbers, per-exception error text) since that isn't "text
+    the bot wrote" so much as data it's displaying — those are noted
+    below instead of reproduced."""
+    out: list[str] = []
+
+    out.append(
+        "📋 <b>/previewtxt — every static piece of copy a normal user can see</b>\n"
+        "(admin-only; not a live walkthrough — see /preview for that)"
+    )
+
+    out.append(
+        "── ONBOARDING ──\n\n"
+        "[nickname prompt, first /start]\n"
+        + quizzy_block(
+            QUIZZY_EXCITED_ART,
+            "Hello there! My name is Quizzy! what's your name? "
+            "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
+        )
+        + "\n\n[empty nickname during onboarding]\n"
+        "⚠️ الاسم فاضي — اكتب اسم تحب أتنادي بيه عليك.\n\n"
+        "[vulgar nickname during onboarding]\n"
+        "⚠️ الاسم ده مش مناسب — اكتب اسم تاني.\n\n"
+        "[Year/Class prompt]\n"
+        "What Year/Class are you currently in?\n\n"
+        "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)\n\n"
+        "[Year/Class confirmed → bully joke]\n"
+        + quizzy_block(QUIZZY_HAPPY_ART, "✅ تمام، <Year/Class>.")
+        + "\nDo you want me to bully you when you get questions wrong?\n"
+        "  buttons: What??? / No 😭\n\n"
+        "[bully joke punchline]\n"
+        + quizzy_block(QUIZZY_WINK_ART, "Haha i am just kidding (maybe)")
+        + "\n  buttons: what is this place?! 🙂 / Where are we?! 🙃\n\n"
+        "[after tapping either button]\n"
+        "→ sends whatever the admin has stored under the '_onboarding' vault "
+        "key (dynamic, admin-set — not reproduced here), then:\n"
+        "  button: 🗣️🗣️🔥 يلا بينا\n\n"
+        "[onboarding finished → main menu]\n"
+        + quizzy_block(QUIZZY_HAPPY_ART, "<one of the welcome lines below> يا <nickname>! تحب تعمل أي؟!:")
+    )
+
+    out.append(
+        "── RETURNING-USER GREETINGS ──\n\n"
+        "[/start with nickname+year already set, and the 🏠 Back to Home button]\n"
+        + quizzy_block(QUIZZY_HAPPY_ART, "<one of the welcome lines below>")
+        + "\n\n<b>Welcome lines (random pick):</b>\n"
+        + "\n".join(f"• {l}" for l in QUIZZY_WELCOME_LINES)
+        + "\n\n<b>Success lines (random pick, shown after correct-answer streak beats):</b>\n"
+        + "\n".join(f"• {l}" for l in QUIZZY_SUCCESS_LINES)
+        + "\n\n<b>Error lines (random pick, shown alongside the sad-cat error block):</b>\n"
+        + "\n".join(f"• {l}" for l in QUIZZY_ERROR_LINES)
+    )
+
+    out.append(
+        "── MAIN MENU / SETTINGS BUTTON LABELS ──\n\n"
+        "Main menu: 🦦 How To Use · Quizzes ⁉️ · 📊 My Stats · ⚙️ Settings · "
+        "💥Daily Quiz💥 · 🧠 Mistakes Bank · 🏆 Leaderboard\n\n"
+        "Settings (page 1): ✏️ Edit Nickname · ⏭️ Auto-Next · 🔀 Randomize · "
+        "🔀 Mix Written · 🔁 Spaced Repetition · ⏱️ Question Timer · "
+        "🗑 Clear Mistake Bank · ➡️ More Settings · 🏠 Back to Home\n\n"
+        "Settings (page 2): 🎭 Reactions · 🏆 Achievement Alerts · "
+        "🔔 Daily Notification · 📿 Hourly Zikr · ⬅️ Back · 🏠 Back to Home\n\n"
+        "── HOW TO USE ──\n\n" + HOW_TO_USE_TEXT
+    )
+
+    ach_lines = ["── ACHIEVEMENTS (name — quip, per tier) ──\n"]
+    for category, tiers in ACHIEVEMENTS.items():
+        ach_lines.append(f"\n<b>{category}</b>")
+        for threshold, name, xp_bonus, emoji, quip in tiers:
+            ach_lines.append(f"  {emoji} {name} ({threshold}) — {quip}")
+    ach_lines.append("\n<b>Extras (one-off)</b>")
+    for key, (name, emoji, xp_bonus, desc, quip) in EXTRA_ACHIEVEMENTS.items():
+        ach_lines.append(f"  {emoji} {name} — {desc} — {quip}")
+    out.append("\n".join(ach_lines))
+
+    out.append(
+        "── MISC MESSAGES SEEN AROUND THE BOT ──\n\n"
+        "[error, anywhere in the bot]\n" + quizzy_block(QUIZZY_SAD_ART, "<random error line above>")
+        + "\n\n[currently banned]\n"
+        + quizzy_block(QUIZZY_ANGRY_ART, "مبروك، اتبنيت 🚫")
+        + "\n🚫 انت متبنن من البوت لسه.\n⏰ هيترفع البان بعد <hours> ساعة.\n📝 السبب: <reason>\n\n"
+        "[not onboarded yet, tried something else]\n"
+        "⚠️ لازم تعمل /start الأول وتسجل اسمك وسنتك/فرقتك قبل أي حاجة تانية.\n\n"
+        "[/mystats with no activity yet]\n"
+        + quizzy_block(QUIZZY_ANNOYED_ART, "bro you didn't even start anything yet 😂, go take a quiz first 💥")
+        + "\n\n[/feedback sent]\n"
+        + quizzy_block(QUIZZY_ADORE_ART, "✅ تم إرسال الفيدباك بتاعك، شكراً ليك!")
+        + "\n\n[Daily Quiz hub / a lecture's leaderboard preview, on top]\n"
+        + quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!")
+        + "\n\n[finishing a lecture (not a mistakes-retake), on top of the results summary]\n"
+        + quizzy_block(QUIZZY_VICTORY_ART, "Nice one! 🎉")
+        + f"\n\n[non-admin, admin-only command/button]\n{MSG_ADMIN_ONLY}\n\n"
+        f"[/cancel with something to cancel]\n{MSG_CANCEL_DONE}\n\n"
+        f"[/cancel with nothing to cancel]\n{MSG_CANCEL_NOTHING}"
+    )
+
+    out.append(
+        "── NOT INCLUDED (it's data, not fixed copy) ──\n\n"
+        "• the admin's own '_onboarding' vault message\n"
+        "• live leaderboard rows (names/scores/medals)\n"
+        "• a user's own /mystats numbers\n"
+        "• per-exception error report text\n"
+        "• achievement UNLOCK announcements (name and quip are above; the "
+        "surrounding congratulations wrapper isn't reproduced here)"
+    )
+
+    return out
+
+async def previewtxt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/previewtxt — admin-only. Sends the admin every static piece of
+    copy a normal user can encounter, as a straight text dump (as opposed
+    to /preview, which walks the real onboarding flow interactively).
+    Chunked across several messages since the whole dump is well past
+    Telegram's 4096-char single-message cap."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    for section in _build_previewtxt_sections():
+        for chunk in _chunk_text(section):
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/c — lists every command, admin-only ones only shown to the admin."""
@@ -8921,6 +9089,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("/set_year &lt;Nickname or ID&gt;")
         lines.append("/tell &lt;ID or Nickname&gt; &lt;message&gt;")
         lines.append("/preview — walk through the onboarding flow (nickname → year/class → bully joke → welcome)")
+        lines.append("/previewtxt — text dump of every static message a normal user can see")
         lines.append("/health")
         lines.append("/restore")
         lines.append("/broadcast &lt;message&gt;")
@@ -9638,7 +9807,10 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
     entry = ANALYTICS.get(str(user_id))
     if not entry or not entry.get("last_active_date"):
         send = reply_target.edit_text if edit else reply_target.reply_text
-        await send("bro you didn't even start anything yet 😂, go take a quiz first 💥")
+        await send(
+            quizzy_block(QUIZZY_ANNOYED_ART, "bro you didn't even start anything yet 😂, go take a quiz first 💥"),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     streak      = entry.get("streak", 0)
@@ -10334,7 +10506,10 @@ async def _ban_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer(text, show_alert=True)
     elif update.effective_message:
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(
+            f"{quizzy_block(QUIZZY_ANGRY_ART, 'مبروك، اتبنيت 🚫')}\n\n{text}",
+            parse_mode=ParseMode.HTML,
+        )
     raise ApplicationHandlerStop
 
 app.add_handler(MessageHandler(filters.ALL, _ban_gate), group=-1)
@@ -10392,6 +10567,7 @@ app.add_handler(CommandHandler("feedback",       feedback_cmd))
 app.add_handler(CommandHandler("sleep",          sleep_cmd))
 app.add_handler(CommandHandler("dev_panel",      dev_panel_cmd))
 app.add_handler(CommandHandler("preview",        preview_cmd))
+app.add_handler(CommandHandler("previewtxt",     previewtxt_cmd))
 app.add_handler(CommandHandler("set_year",       set_year_cmd))
 app.add_handler(CommandHandler("tell",           tell_cmd))
 app.add_handler(CommandHandler("health",         health_cmd))
