@@ -181,6 +181,7 @@ from telegram.ext import (
     AIORateLimiter,
 )
 from telegram.constants import ParseMode
+from telegram.helpers import escape_markdown
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — never hardcode it
 # NOTE: AIORateLimiter (used below when building `app`) needs the extra:
@@ -4863,7 +4864,14 @@ async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int
     touches session['answered']/['correct'], XP, or the mistakes bank."""
     title   = w.get("title", "")
     content = w.get("content", "")
-    caption = f"*{title}*" + (f"\n||{content}||" if content else "")
+    # title/content are raw lecturer-authored text and almost always contain
+    # MarkdownV2 special chars (. - ( ) : etc.) — must be escaped or Telegram
+    # rejects the whole send with "can't parse entities", silently dropping
+    # both the question AND its image (same send_photo call).
+    safe_title = escape_markdown(title, version=2)
+    caption = f"*{safe_title}*"
+    if content:
+        caption += f"\n||{escape_markdown(content, version=2)}||"
     image = w.get("image")
     try:
         if image and image.get("file_id"):
@@ -4877,7 +4885,17 @@ async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int
                 chat_id=user_id, text=caption, parse_mode=ParseMode.MARKDOWN_V2,
             )
     except Exception as e:
-        print(f"Couldn't send written question '{title}': {e}")
+        print(f"Couldn't send written question '{title}' (markdown parse failed, retrying plain): {e}")
+        # Never let a formatting error silently eat the question — resend
+        # as plain text (no spoiler, no bold) rather than dropping it.
+        plain = title + (f"\n{content}" if content else "")
+        try:
+            if image and image.get("file_id"):
+                await context.bot.send_photo(chat_id=user_id, photo=image["file_id"], caption=plain)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=plain)
+        except Exception as e2:
+            print(f"Fallback plain-text send also failed for written question '{title}': {e2}")
 
 async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
     """Pops message ids off session['queue'] and sends them to the user one
