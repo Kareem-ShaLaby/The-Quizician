@@ -1,4 +1,4 @@
-bimport re
+import re
 import string
 import random
 import json
