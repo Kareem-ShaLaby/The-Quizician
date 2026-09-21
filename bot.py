@@ -528,6 +528,73 @@ def _atomic_write_json(path: str, data, **dump_kwargs):
             pass
         raise
 
+def _load_json_safe(path: str, expected_type, default_factory, label: str, *, encoding: str = "utf-8"):
+    """Reads JSON from `path` and guarantees the result is an instance of
+    `expected_type` (a type or tuple of types), or returns default_factory()
+    instead. Never raises. Covers the four ways a data file can be bad:
+      - unreadable / permission error / encoding error   (OSError, UnicodeDecodeError)
+      - truncated or syntactically invalid JSON          (JSONDecodeError)
+      - empty file                                       (JSONDecodeError)
+      - VALID JSON of the wrong top-level type — e.g. a bare string where
+        a dict is expected. json.load happily returns that, so a loader
+        that only catches parse errors hands a str to code that then
+        calls .items() / iterates it and blows up somewhere far away.
+    The loaders run at module level, so any raise here would take the whole
+    bot down at import time. A missing file is not an error: it returns the
+    default silently, same as a fresh install."""
+    if not os.path.exists(path):
+        return default_factory()
+    try:
+        with open(path, "r", encoding=encoding) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        print(f"{label}: couldn't load {path} ({type(e).__name__}: {e}) — using empty default.")
+        return default_factory()
+    if not isinstance(data, expected_type):
+        want = expected_type.__name__ if isinstance(expected_type, type) else "/".join(t.__name__ for t in expected_type)
+        print(f"{label}: {path} held a {type(data).__name__}, expected {want} — using empty default.")
+        return default_factory()
+    return data
+
+# ── Serialized concurrent writers ───────────────────────────────────
+# _atomic_write_json makes ONE write crash-safe, but it does nothing about
+# TWO writes to the same file overlapping. Every save_*() hands its write to
+# asyncio.to_thread, so two saves of the same file (e.g. two different users
+# changing a setting at the same moment — they hold different per-user locks,
+# so _serialize_per_user can't help) run in parallel OS threads. Each one
+# takes its snapshot at a slightly different time, and whichever thread's
+# os.replace() happens to land LAST wins — which can be the OLDER snapshot,
+# silently overwriting the newer one (a lost update).
+#
+# Fix: one asyncio.Lock per destination path. All writers of a given file
+# queue up behind it and run strictly one at a time, in arrival order.
+# Crucially the snapshot is taken INSIDE the lock (via `get_data`), not by
+# the caller beforehand: a caller that snapshotted first and then waited for
+# the lock would write a stale copy AFTER a fresher one had already landed.
+# Taking it under the lock guarantees each write captures everything every
+# earlier writer's mutation left behind, so the last write is always the
+# newest state. Different files never block each other (separate locks).
+_FILE_WRITE_LOCKS: dict[str, asyncio.Lock] = {}
+
+def _get_file_write_lock(path: str) -> asyncio.Lock:
+    key  = os.path.abspath(path)
+    lock = _FILE_WRITE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _FILE_WRITE_LOCKS[key] = lock
+    return lock
+
+async def _write_json_serialized(path: str, get_data, **dump_kwargs) -> None:
+    """Serializes concurrent writes to `path`. `get_data` is a zero-arg
+    callable returning the object to persist; it is called while holding
+    the file's lock, and its result must be a frozen snapshot (deepcopy)
+    because the actual dump runs on a worker thread while the event loop
+    keeps mutating the live state. Use this instead of calling
+    asyncio.to_thread(_atomic_write_json, ...) directly."""
+    async with _get_file_write_lock(path):
+        snapshot = get_data()
+        await asyncio.to_thread(_atomic_write_json, path, snapshot, **dump_kwargs)
+
 def _backup_filename(base: str) -> str:
     """base.json -> base_20260910T143201Z.json. Every backup upload now
     gets a distinct, sortable filename instead of reusing the same name —
@@ -547,13 +614,14 @@ def _backup_filename(base: str) -> str:
 USERS_FILE = "users.json"
 
 def load_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
+    raw = _load_json_safe(USERS_FILE, list, list, "USERS")
+    # ids are ints; anything else in the list is junk from a bad edit. set()
+    # of an unhashable element (a nested list/dict) would itself raise, so
+    # filter to scalars first.
+    return {u for u in raw if isinstance(u, (int, str)) and not isinstance(u, bool)}
 
 async def save_users():
-    await asyncio.to_thread(_atomic_write_json, USERS_FILE, list(USERS), ensure_ascii=False)
+    await _write_json_serialized(USERS_FILE, lambda: list(USERS), ensure_ascii=False)
 
 USERS = load_users()
 
@@ -883,8 +951,12 @@ def _clean_analytics_dict(raw: dict) -> dict:
 
 def load_analytics() -> dict:
     if os.path.exists(ANALYTICS_FILE):
-        with open(ANALYTICS_FILE) as f:
-            raw = json.load(f)
+        try:
+            with open(ANALYTICS_FILE, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            print(f"ANALYTICS: couldn't load {ANALYTICS_FILE} ({type(e).__name__}: {e}) — using empty default.")
+            return {}
         return _clean_analytics_dict(raw)
     return {}
 
@@ -897,8 +969,8 @@ async def save_analytics():
     # moment) races json.dump and can throw "dictionary changed size
     # during iteration" or worse, write corrupt/partial JSON. A snapshot
     # copy freezes what gets written; the live dict stays free to mutate.
-    snapshot = copy.deepcopy(ANALYTICS)
-    await asyncio.to_thread(_atomic_write_json, ANALYTICS_FILE, snapshot, indent=2, ensure_ascii=False)
+    await _write_json_serialized(
+        ANALYTICS_FILE, lambda: copy.deepcopy(ANALYTICS), indent=2, ensure_ascii=False)
 
 ANALYTICS: dict = load_analytics()
 
@@ -1564,16 +1636,13 @@ def _blank_settings_entry() -> dict:
     }
 
 def load_settings() -> dict:
-    if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE) as f:
-            return json.load(f)
-    return {}
+    return _load_json_safe(SETTINGS_FILE, dict, dict, "SETTINGS")
 
 async def save_settings():
     # See save_analytics for why this snapshot copy is required, not
     # just defensive style — same to_thread-races-live-mutation risk.
-    snapshot = copy.deepcopy(SETTINGS)
-    await asyncio.to_thread(_atomic_write_json, SETTINGS_FILE, snapshot, indent=2, ensure_ascii=False)
+    await _write_json_serialized(
+        SETTINGS_FILE, lambda: copy.deepcopy(SETTINGS), indent=2, ensure_ascii=False)
 
 SETTINGS: dict = load_settings()
 
@@ -1888,15 +1957,12 @@ LECTURE_RESULTS_FILE          = "lecture_results.json"
 LECTURE_RESULTS_BACKUP_MARKER = "🏆 QUIZICIAN_LECTURE_RESULTS_BACKUP"
 
 def load_lecture_results() -> dict:
-    if os.path.exists(LECTURE_RESULTS_FILE):
-        with open(LECTURE_RESULTS_FILE) as f:
-            return json.load(f)
-    return {}
+    return _load_json_safe(LECTURE_RESULTS_FILE, dict, dict, "LECTURE RESULTS")
 
 async def save_lecture_results():
     # See save_analytics for why this snapshot copy is required.
-    snapshot = copy.deepcopy(LECTURE_RESULTS)
-    await asyncio.to_thread(_atomic_write_json, LECTURE_RESULTS_FILE, snapshot, indent=2, ensure_ascii=False)
+    await _write_json_serialized(
+        LECTURE_RESULTS_FILE, lambda: copy.deepcopy(LECTURE_RESULTS), indent=2, ensure_ascii=False)
 
 LECTURE_RESULTS: dict = load_lecture_results()
 
@@ -2061,10 +2127,7 @@ def load_mistakes_bank() -> list:
     Filtering here means every reader (record_mistake's dedup check,
     _scoped_mistakes_bank, _resolve_mistake) can keep assuming a
     well-formed entry without each needing its own defensive check."""
-    if not os.path.exists(MISTAKES_BANK_FILE):
-        return []
-    with open(MISTAKES_BANK_FILE, encoding="utf-8") as f:
-        raw = json.load(f)
+    raw = _load_json_safe(MISTAKES_BANK_FILE, list, list, "MISTAKES BANK")
     required = ("user_id", "mid", "year", "module", "subject")
     clean  = [m for m in raw if isinstance(m, dict) and all(k in m for k in required)]
     if len(clean) != len(raw):
@@ -2081,8 +2144,8 @@ async def save_mistakes_bank():
     # appends to MISTAKES_BANK from many concurrent _advance_lecture_session
     # calls while a background thread could simultaneously be mid-iteration
     # serializing the same live list to JSON.
-    snapshot = copy.deepcopy(MISTAKES_BANK)
-    await asyncio.to_thread(_atomic_write_json, MISTAKES_BANK_FILE, snapshot, indent=2, ensure_ascii=False)
+    await _write_json_serialized(
+        MISTAKES_BANK_FILE, lambda: copy.deepcopy(MISTAKES_BANK), indent=2, ensure_ascii=False)
 
 MISTAKES_BANK: list = load_mistakes_bank()
 
@@ -2747,6 +2810,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     if not session["queue"]:
         session["current_poll_id"] = None
         session["current_correct_id"] = None
+        session["current_option_count"] = None
         session["current_message_id"] = None
         session["current_delivered_at"] = None
         return False
@@ -2766,6 +2830,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
         return await _deliver_next_daily_question(context, user_id, session)   # try the next one
     session["current_poll_id"]    = msg.poll.id
     session["current_correct_id"] = q["correct_option_id"]
+    session["current_option_count"] = len(q.get("options") or [])
     session["current_message_id"] = msg.message_id
     session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
     # q was popped off the queue above, so stash its module/subject on the
@@ -3294,15 +3359,12 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
 STORAGE_INDEX_FILE = "storage_index.json"
 
 def load_storage_index():
-    if os.path.exists(STORAGE_INDEX_FILE):
-        with open(STORAGE_INDEX_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return _load_json_safe(STORAGE_INDEX_FILE, dict, dict, "STORAGE INDEX")
 
 async def save_storage_index():
     # See save_analytics for why this snapshot copy is required.
-    snapshot = copy.deepcopy(STORAGE_INDEX)
-    await asyncio.to_thread(_atomic_write_json, STORAGE_INDEX_FILE, snapshot, ensure_ascii=False)
+    await _write_json_serialized(
+        STORAGE_INDEX_FILE, lambda: copy.deepcopy(STORAGE_INDEX), ensure_ascii=False)
 
 # password (lowercased) -> list of items; each item is a list of message_ids
 # (a single-message item is [id], an album is [id1, id2, ...]). Reusing the
@@ -3324,16 +3386,13 @@ STORAGE_BACKUP_MARKER     = "🗄 QUIZICIAN_STORAGE_BACKUP"
 STORAGE_BACKUP_STATE_FILE = "storage_backup_state.json"
 
 def load_storage_backup_state():
-    if os.path.exists(STORAGE_BACKUP_STATE_FILE):
-        with open(STORAGE_BACKUP_STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return _load_json_safe(STORAGE_BACKUP_STATE_FILE, dict, dict, "STORAGE BACKUP STATE")
 
 async def save_storage_backup_state():
     # Tiny dict, but kept consistent with every other save_* here — see
     # save_analytics for why the snapshot copy matters.
-    snapshot = copy.deepcopy(STORAGE_BACKUP_STATE)
-    await asyncio.to_thread(_atomic_write_json, STORAGE_BACKUP_STATE_FILE, snapshot, ensure_ascii=False)
+    await _write_json_serialized(
+        STORAGE_BACKUP_STATE_FILE, lambda: copy.deepcopy(STORAGE_BACKUP_STATE), ensure_ascii=False)
 
 STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
 
@@ -3460,11 +3519,8 @@ def _clean_quiz_index_dict(year: str, raw: dict) -> dict:
 
 def load_quiz_index(year: str) -> dict:
     path = QUIZ_INDEX_FILE_TMPL.format(year=year)
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        return _clean_quiz_index_dict(year, raw)
-    return {}
+    raw = _load_json_safe(path, dict, dict, f"QUIZ INDEX ({year})")
+    return _clean_quiz_index_dict(year, raw)
 
 async def save_quiz_index(year: str):
     # See save_analytics for why this snapshot copy is required — this is
@@ -3472,8 +3528,8 @@ async def save_quiz_index(year: str):
     # dead-poll cleanup during lecture delivery), so it's one of the most
     # likely places the load test's races actually came from.
     path = QUIZ_INDEX_FILE_TMPL.format(year=year)
-    snapshot = copy.deepcopy(QUIZ_INDEX[year])
-    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
+    await _write_json_serialized(
+        path, lambda: copy.deepcopy(QUIZ_INDEX[year]), ensure_ascii=False)
 
 # year -> {lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}}
 QUIZ_INDEX: dict = {y: load_quiz_index(y) for y in YEARS}
@@ -3539,16 +3595,13 @@ QUIZ_STATE_FILE_TMPL = "quiz_state_{year}.json"
 
 def load_quiz_state(year: str) -> dict:
     path = QUIZ_STATE_FILE_TMPL.format(year=year)
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"current_lecture": None}
+    return _load_json_safe(path, dict, lambda: {"current_lecture": None}, f"QUIZ STATE ({year})")
 
 async def save_quiz_state(year: str):
     # See save_analytics for why this snapshot copy is required.
     path = QUIZ_STATE_FILE_TMPL.format(year=year)
-    snapshot = copy.deepcopy(QUIZ_STATE[year])
-    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
+    await _write_json_serialized(
+        path, lambda: copy.deepcopy(QUIZ_STATE[year]), ensure_ascii=False)
 
 QUIZ_STATE: dict = {y: load_quiz_state(y) for y in YEARS}  # survives restarts mid-lecture, per year
 
@@ -3556,10 +3609,7 @@ QUIZ_POLL_STATUS_FILE_TMPL = "quiz_poll_status_{year}.json"
 
 def load_quiz_poll_status(year: str) -> dict:
     path = QUIZ_POLL_STATUS_FILE_TMPL.format(year=year)
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return _load_json_safe(path, dict, dict, f"QUIZ POLL STATUS ({year})")
 
 async def save_quiz_poll_status(year: str):
     # See save_analytics for why this snapshot copy is required — also
@@ -3567,8 +3617,8 @@ async def save_quiz_poll_status(year: str):
     # structure is what poll_status_by_mid is built from, read
     # concurrently by every student's lecture session.
     path = QUIZ_POLL_STATUS_FILE_TMPL.format(year=year)
-    snapshot = copy.deepcopy(QUIZ_POLL_STATUS[year])
-    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
+    await _write_json_serialized(
+        path, lambda: copy.deepcopy(QUIZ_POLL_STATUS[year]), ensure_ascii=False)
 
 # year -> {poll_id -> {"lecture": str, "message_id": int, "closed": bool, ...}}
 # Tracks whether each quiz-channel poll has been stopped yet — Telegram
@@ -3585,16 +3635,13 @@ QUIZ_BACKUP_STATE_FILE_TMPL = "quiz_backup_state_{year}.json"
 
 def load_quiz_backup_state(year: str) -> dict:
     path = QUIZ_BACKUP_STATE_FILE_TMPL.format(year=year)
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return _load_json_safe(path, dict, dict, f"QUIZ BACKUP STATE ({year})")
 
 async def save_quiz_backup_state(year: str):
     # Tiny dict, but kept consistent — see save_analytics for why.
     path = QUIZ_BACKUP_STATE_FILE_TMPL.format(year=year)
-    snapshot = copy.deepcopy(QUIZ_BACKUP_STATE[year])
-    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
+    await _write_json_serialized(
+        path, lambda: copy.deepcopy(QUIZ_BACKUP_STATE[year]), ensure_ascii=False)
 
 QUIZ_BACKUP_STATE: dict = {y: load_quiz_backup_state(y) for y in YEARS}  # year -> {"backup_msg_id": int}
 
@@ -3845,11 +3892,14 @@ REPORT_THREADS_FILE          = "report_threads.json"
 REPORT_THREADS_BACKUP_MARKER = "📩 QUIZICIAN_REPORT_THREADS_BACKUP"
 
 def load_report_threads() -> dict:
-    if os.path.exists(REPORT_THREADS_FILE):
-        with open(REPORT_THREADS_FILE, encoding="utf-8") as f:
-            raw = json.load(f)
-        return {int(k): v for k, v in raw.items()}   # JSON keys are always strings — back to int here
-    return {}
+    raw = _load_json_safe(REPORT_THREADS_FILE, dict, dict, "REPORT THREADS")
+    out = {}
+    for k, v in raw.items():   # JSON keys are always strings — back to int here
+        try:
+            out[int(k)] = v
+        except (TypeError, ValueError):
+            print(f"REPORT THREADS: dropped entry with non-integer key {k!r}.")
+    return out
 
 async def save_report_threads():
     # JSON object keys must be strings, so REPORT_THREADS (keyed by an
@@ -3862,10 +3912,10 @@ async def save_report_threads():
     # loop can keep mutating (e.g. a reply landing) while a background
     # thread is mid-serializing it. See save_analytics for the general
     # explanation of why to_thread needs a frozen snapshot.
-    snapshot = {str(k): v for k, v in copy.deepcopy(REPORT_THREADS).items()}
-    await asyncio.to_thread(
-        _atomic_write_json, REPORT_THREADS_FILE,
-        snapshot, indent=2, ensure_ascii=False,
+    await _write_json_serialized(
+        REPORT_THREADS_FILE,
+        lambda: {str(k): v for k, v in copy.deepcopy(REPORT_THREADS).items()},
+        indent=2, ensure_ascii=False,
     )
 
 REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id","name","username","user_text","messages","closed"}
@@ -4053,12 +4103,20 @@ async def _flush_sessions_if_changed() -> None:
     since the last tick. Called every SESSIONS_BACKUP_MIN_INTERVAL seconds
     by _sessions_backup_job, and once more on a clean shutdown."""
     global _last_sessions_snapshot_json
-    snapshot = _sessions_snapshot()
-    as_json  = json.dumps(snapshot, sort_keys=True)
-    if as_json == _last_sessions_snapshot_json:
-        return
-    _last_sessions_snapshot_json = as_json
-    await asyncio.to_thread(_atomic_write_json, SESSIONS_FILE, snapshot, indent=2, ensure_ascii=False)
+    # The change-detection check AND the write both live inside the file's
+    # lock: two overlapping flushes (the periodic tick racing the clean-
+    # shutdown flush) must not both pass the "changed?" check against the
+    # same stale _last_sessions_snapshot_json and then land out of order.
+    # _last_sessions_snapshot_json also only advances AFTER a successful
+    # write now — previously it advanced first, so a write that raised
+    # left it claiming the data was saved and the next tick would skip it.
+    async with _get_file_write_lock(SESSIONS_FILE):
+        snapshot = _sessions_snapshot()
+        as_json  = json.dumps(snapshot, sort_keys=True)
+        if as_json == _last_sessions_snapshot_json:
+            return
+        await asyncio.to_thread(_atomic_write_json, SESSIONS_FILE, snapshot, indent=2, ensure_ascii=False)
+        _last_sessions_snapshot_json = as_json
 
 def _restore_sessions_dict(raw: dict) -> None:
     """Populates LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS
@@ -4094,10 +4152,11 @@ def _restore_sessions_dict(raw: dict) -> None:
           f"daily quiz questions for {len(_DAILY_QUIZ_QUESTIONS)} year(s) dated {_DAILY_QUIZ_QUESTIONS_DATE}.")
 
 def load_sessions() -> dict | None:
-    if os.path.exists(SESSIONS_FILE):
-        with open(SESSIONS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return None
+    # None (not {}) for a missing file is load-bearing: callers use it to tell
+    # "never persisted anything" apart from "persisted an empty snapshot".
+    if not os.path.exists(SESSIONS_FILE):
+        return None
+    return _load_json_safe(SESSIONS_FILE, dict, dict, "SESSIONS")
 
 _sessions_backup_msg_id: int | None = None
 _last_sessions_backup_at: float = 0.0
@@ -5131,6 +5190,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
 
         session["current_poll_id"]    = msg.poll.id
         session["current_correct_id"] = correct_id
+        session["current_option_count"] = len(options)
         session["current_message_id"] = msg.message_id
         session["current_mid"]        = mid
         session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
@@ -5139,6 +5199,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
 
     session["current_poll_id"]    = None
     session["current_correct_id"] = None
+    session["current_option_count"] = None
     session["current_message_id"] = None
     session["current_mid"]        = None
     session["current_delivered_at"] = None
@@ -5170,6 +5231,25 @@ async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, use
     session["current_mid"]        = None
     return sent_count
 
+def _validated_option_id(answer, option_count: int | None = None) -> int | None:
+    """Return the single valid option index from a Telegram PollAnswer.
+
+    Telegram sends an empty option_ids list when a user retracts an answer.
+    Treat that, negative indices, non-integer values, multiple selections, and
+    indices outside the actual poll's option range as non-answers so they cannot
+    advance a session or increment analytics.
+    """
+    option_ids = getattr(answer, "option_ids", None)
+    if not isinstance(option_ids, (list, tuple)) or len(option_ids) != 1:
+        return None
+    chosen = option_ids[0]
+    if isinstance(chosen, bool) or not isinstance(chosen, int) or chosen < 0:
+        return None
+    if option_count is not None and chosen >= option_count:
+        return None
+    return chosen
+
+
 @_serialize_per_user
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fires when a user answers a poll the bot sent (our lecture-delivery
@@ -5185,9 +5265,11 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     daily_session = DAILY_QUIZ_SESSIONS.get(user_id)
     if daily_session and daily_session.get("current_poll_id") == poll_id:
+        chosen = _validated_option_id(answer, daily_session.get("current_option_count"))
+        if chosen is None:
+            return
         daily_session["timeout_streak"] = 0
-        chosen     = answer.option_ids[0] if answer.option_ids else None
-        is_correct = chosen is not None and chosen == daily_session.get("current_correct_id")
+        is_correct = chosen == daily_session.get("current_correct_id")
         await _advance_daily_quiz_session(
             context, user_id, daily_session, is_correct, daily_session.get("current_message_id"),
             daily_session.get("current_delivered_at"),
@@ -5196,9 +5278,11 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     retake_session = MISTAKES_RETAKE_SESSIONS.get(user_id)
     if retake_session and retake_session.get("current_poll_id") == poll_id:
+        chosen = _validated_option_id(answer, retake_session.get("current_option_count"))
+        if chosen is None:
+            return
         retake_session["timeout_streak"] = 0
-        chosen     = answer.option_ids[0] if answer.option_ids else None
-        is_correct = chosen is not None and chosen == retake_session.get("current_correct_id")
+        is_correct = chosen == retake_session.get("current_correct_id")
         await _advance_mistakes_retake_session(
             context, user_id, retake_session, is_correct, retake_session.get("current_message_id"),
             retake_session.get("current_delivered_at"),
@@ -5229,11 +5313,17 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if session.get("mode") == "batch":
         pending = session.get("pending_polls", {})
-        if poll_id not in pending:
+        pending_item = pending.get(poll_id)
+        if pending_item is None:
             return   # not one of this lecture's questions (or already answered)
-        correct_id, message_id, mid, delivered_at = pending.pop(poll_id)
-        chosen     = answer.option_ids[0] if answer.option_ids else None
-        is_correct = chosen is not None and chosen == correct_id
+        correct_id, message_id, mid, delivered_at = pending_item
+        status = session.get("poll_status_by_mid", {}).get(mid)
+        option_count = len(status.get("options") or []) if status else None
+        chosen = _validated_option_id(answer, option_count)
+        if chosen is None:
+            return
+        pending.pop(poll_id, None)
+        is_correct = chosen == correct_id
         await _advance_lecture_session(context, user_id, session, is_correct, message_id, mid, delivered_at)
         return
 
@@ -5245,8 +5335,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # bank — just the 🤩/😢 reaction — then falls through to delivering
     # the actual next lecture question, same as a normal answer would.
     if session.get("sr_pending_poll_id") == poll_id:
-        chosen     = answer.option_ids[0] if answer.option_ids else None
-        is_correct = chosen is not None and chosen == session.get("sr_pending_correct_id")
+        chosen = _validated_option_id(answer)
+        if chosen is None:
+            return
+        is_correct = chosen == session.get("sr_pending_correct_id")
         sr_message_id = session.get("sr_pending_message_id")
         session.pop("sr_pending", None)
         session.pop("sr_pending_poll_id", None)
@@ -5275,9 +5367,11 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if session.get("current_poll_id") != poll_id:
         return   # not the question we're tracking for this user right now
 
+    chosen = _validated_option_id(answer, session.get("current_option_count"))
+    if chosen is None:
+        return
     session["timeout_streak"] = 0
-    chosen     = answer.option_ids[0] if answer.option_ids else None
-    is_correct = chosen is not None and chosen == session.get("current_correct_id")
+    is_correct = chosen == session.get("current_correct_id")
     await _advance_lecture_session(
         context, user_id, session, is_correct,
         session.get("current_message_id"), session.get("current_mid"),
@@ -5746,10 +5840,10 @@ ONBOARDING_SPECIAL_TEXT = (
     + "\n\n"
     "Welcome to The Quizician!\n"
     "This is the place where all the magic happens 🪄✨\n\n\n"
-    "خليني أعرفك أزاي تستخدم منصة... \n"
-    "<b>The Quizician</b>\n\n\n"
+    "ودلوقتي خليني أرجع أتكلم عربي بقا علشان أعرفك أزاي تستخدم منصة... \n"
+    "<b>«The Quizician»</b>\n\n\n"
     "<b>Quizzes ⁉️</b>\n"
-    "بعدين الموديول، بعدين المادة، وبعدين المحاضرة — وأبدأ تجاوب. كل سؤال بيتصحح على طول، "
+    "بتختار الموديول، بعدين المادة، وبعدين المحاضرة — وتبدأ تجاوب. كل سؤال بيتصحح على طول، "
     "وبتاخد XP على كل إجابة صح، وفالآخر نتيجتك بتظهر وتقدر تعيد أسئلتك اللي غلط فيها، وبتتحفظ "
     "فالMistakes bank (نظفه علطول علشان ميكونس شكلك وحش 🌚)\n\n"
     "<b>💥 Daily Quiz</b>\n"
@@ -5760,10 +5854,10 @@ ONBOARDING_SPECIAL_TEXT = (
     "<b>🧠 Mistakes Bank</b>\n"
     "أي سؤال تغلط فيه بيتسجل هنا تلقائي، عشان ترجعله وتراجعه تاني وقت ما تحب. وتقدر تنظفه من "
     "الإعدادات (أخيراً بقا في زرار يمسح آخطائ الماضي ❤️‍🩹)\n\n"
-    "<b>📊 My Stats</b>\n"
+    "<b>📊 My Stats 📈</b>\n"
     "شوف الـ XP والـ Level بتاعك، عدد الأسئلة الصح والغلط، والـ achievements اللي فتحتها وحاجات "
     "تانيه كتير (جدا) 🔥🔥\n\n"
-    "<b>🏆 Leaderboard (العام)</b>\n"
+    "<b>🏆 Leaderboard</b>\n"
     "ترتيبك بين زمايلك في نفس السنة/الفرقة، حسب عدد الإجابات الصح ونسبة الدقة، عايزينك تبقا فخر "
     "بلدنا بقا 🤩\n\n"
     "<b>⚙️ Settings</b>\n"
@@ -5773,7 +5867,18 @@ ONBOARDING_SPECIAL_TEXT = (
     "/report_issue —\n"
     "لو فيه مشكلة أو سؤال غلط، ابعتلنا بلاغ وأدمن هيرد عليك فأقرب وقت (بنستخدمه لما يكون في "
     "مشكلة مش لما سؤال أنت مش فاهمه علشان نعتق الأدمنز 🙏🌹)\n\n"
-    "وأخيرا وليس آخرا...."
+    "<b>«عمرك سألت نفسك هو أزاي تيم كويز بيعملوا أسئلتهم؟!\n"
+    "حابب أقولك أنك دلوقتي واقف فالمصنع نفسه! (حرفيا)\n"
+    "وتقدر تجرب علشان تعرف سهولة الموضوع لو كتبت سؤال بشوية أختيارات البوت هيبعتلك الأسئلة "
+    "فشكل كويز جاهز»</b>\n"
+    "<code>What is the powerhouse of the cell?\n"
+    "a) choice 1\n"
+    "b) Mitochondria z  ← علّم الصح بـ z\n"
+    "c) choice 2\n"
+    "ex: تفسير (اختياري)</code>\n"
+    "بسكدا! طب ما الدنيا حلوه أهي!\n"
+    "لو حابب تشارك الدفعة بأفكارك, متترددش تدخل التيم وتورنا 🤩\n\n"
+    "<b>كفايه رغي بقا ويلا بينا؟!</b>"
 )
 
 async def _index_item(caption: str, message_ids: list):
