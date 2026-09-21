@@ -5770,12 +5770,11 @@ async def _index_item(caption: str, message_ids: list):
     await save_storage_index()
     return password
 
-async def _send_onboarding_special(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Sends the fixed onboarding "welcome tour" message (ONBOARDING_SPECIAL_TEXT),
-    then the final 🗣️🗣️🔥 يلا بينا button — as one message, since it no longer
-    needs to be a copy_messages() call that can't carry its own keyboard."""
-    await context.bot.send_message(
-        chat_id=user_id,
+async def _send_onboarding_special(query) -> None:
+    """Shows the fixed onboarding "welcome tour" message (ONBOARDING_SPECIAL_TEXT),
+    with the final 🗣️🗣️🔥 يلا بينا button — edited into the same message as the
+    "just kidding" step rather than sent as a separate new message."""
+    await query.edit_message_text(
         text=ONBOARDING_SPECIAL_TEXT,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
@@ -7256,14 +7255,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await query.answer(MSG_ADMIN_ONLY, show_alert=True)
             return
-        sample_label = year_class_label(YEAR_ORDER[0]) if YEAR_ORDER else "—"
         # Same single edited message as the real onboard_yc: onboarding
-        # branch (confirmation + bully question together, not two sends) —
-        # tapping either button leads to the (also state-free) "just
-        # kidding" step via the real onboard_bully: handler below.
+        # branch (happy quizzy face + bully question together, not two
+        # sends) — tapping either button leads to the (also state-free)
+        # "just kidding" step via the real onboard_bully: handler below.
         await query.edit_message_text(
-            f"✅ تمام، {sample_label}.\n\n"
-            "Do you want me to bully you when you get questions wrong?\n\n"
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'Do you want me to bully you when you get questions wrong?')}\n\n"
             "<i>🔍 Preview — دي عينة بس، مفيش سنة/كلاس اتسجلت فعلياً.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
@@ -8226,11 +8223,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (ONBOARDING_SPECIAL_TEXT, see _send_onboarding_special). They're two
     # differently-worded doors into the same room.
     if query.data in ("onboard_how", "onboard_where"):
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)   # buttons are one-shot
-        except Exception:
-            pass
-        await _send_onboarding_special(context, user_id)
+        await _send_onboarding_special(query)
         return
 
     if query.data == "onboard_go":
