@@ -12,6 +12,7 @@ import unicodedata
 import tempfile
 import zipfile
 import traceback
+from collections import OrderedDict
 from io import BytesIO
 from datetime import time as dt_time, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -176,6 +177,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     PollHandler,
     PollAnswerHandler,
+    MessageReactionHandler,
     filters,
     ContextTypes,
     AIORateLimiter,
@@ -326,6 +328,16 @@ def year_channel_id(year: str):
 
 def year_label(year: str) -> str:
     return YEARS.get(year, {}).get("label", year)
+
+# Credit line shown under the module-selection prompt. Year 1 & 2 were
+# built by MDM44; Year 3 is Medify44. Cosmetic only.
+YEAR_CREDITS = {"y1": "MDM44", "y2": "MDM44", "y3": "Medify44"}
+
+def year_credit_line(year: str) -> str:
+    """'\n\nCreated by <b>NAME</b>' for the module-selection screen, or ''
+    if that year has no credit configured."""
+    name = YEAR_CREDITS.get(year)
+    return f"\n\nCreated by <b>{name}</b>" if name else ""
 
 def year_modules(year: str) -> dict:
     return YEARS.get(year, {}).get("modules", {})
@@ -2088,8 +2100,16 @@ async def restore_lecture_results_from_channel(app):
 # mistakes_bank.json schema:
 # [
 #   {"user_id": int, "mid": int, "year": str, "module": str, "subject": str},
+#   {"user_id": int, "mid": int, "year": str, "module": str, "subject": str,
+#    "kind": "bookmark"},     # <- ❤️-reacted question, see BOOKMARKS below
 #   ...
 # ]
+#
+# BOOKMARKS live in this same list/file/backup, distinguished by
+# "kind": "bookmark" (entries with no "kind" are ordinary mistakes, so
+# existing data needs no migration). They are indexed separately
+# (_BOOKMARKS_BY_USER) so every existing mistakes reader — retake, the
+# menu count, /mystats, Clear Mistake Bank — keeps seeing mistakes only.
 #
 # Entries are lightweight REFERENCES, not self-contained snapshots — just
 # the question's message id (mid) plus enough scoping info to filter by
@@ -2162,6 +2182,14 @@ MISTAKES_BANK: list = load_mistakes_bank()
 # patched to match it at every mutation site (grep _reindex_mistakes,
 # _mistakes_index_add, _mistakes_index_remove to find all of them).
 _MISTAKES_BY_USER: dict[int, list] = {}
+_BOOKMARKS_BY_USER: dict[int, list] = {}   # same idea, for "kind": "bookmark" entries only
+
+def _is_bookmark_entry(m) -> bool:
+    return isinstance(m, dict) and m.get("kind") == "bookmark"
+
+def _index_for(entry) -> dict:
+    """Which per-user index an entry belongs in."""
+    return _BOOKMARKS_BY_USER if _is_bookmark_entry(entry) else _MISTAKES_BY_USER
 
 def _reindex_mistakes_bank() -> None:
     """Rebuilds _MISTAKES_BY_USER from scratch against the current
@@ -2171,15 +2199,16 @@ def _reindex_mistakes_bank() -> None:
     use _mistakes_index_add / _mistakes_index_remove instead, which
     update the index in O(1) rather than rescanning everything."""
     _MISTAKES_BY_USER.clear()
+    _BOOKMARKS_BY_USER.clear()
     for m in MISTAKES_BANK:
         if _is_valid_mistake_entry(m):
-            _MISTAKES_BY_USER.setdefault(m["user_id"], []).append(m)
+            _index_for(m).setdefault(m["user_id"], []).append(m)
 
 def _mistakes_index_add(entry: dict) -> None:
-    _MISTAKES_BY_USER.setdefault(entry["user_id"], []).append(entry)
+    _index_for(entry).setdefault(entry["user_id"], []).append(entry)
 
 def _mistakes_index_remove(entry: dict) -> None:
-    bucket = _MISTAKES_BY_USER.get(entry.get("user_id"))
+    bucket = _index_for(entry).get(entry.get("user_id"))
     if bucket and entry in bucket:
         bucket.remove(entry)
 
@@ -2244,6 +2273,104 @@ async def record_mistake(user_id: int, mid: int, year: str, module: str, subject
     _mistakes_index_add(entry)
     _mark_mistakes_bank_dirty()
     return True
+
+# ── ❤️ BOOKMARKS ───────────────────────────────────────────────────
+# A user reacting ❤️ to a quiz poll saves that question here; removing the
+# reaction un-saves it. Stored in MISTAKES_BANK itself (see schema note),
+# as {"kind": "bookmark"} entries, and surfaced by the main-menu
+# "❤️ Bookmarks" button (bookmarks_menu / bookmarks_retake in
+# button_handler, which reuse the Mistakes Bank retake flow).
+#
+# Telegram's message_reaction update only says "user X reacted to message
+# M in chat C" — it says nothing about which question that message was.
+# So every quiz poll we send that maps to a bank question registers
+# (chat_id, message_id) -> reference in _BOOKMARK_REFS at send time (see
+# _register_bookmarkable call sites). That registry is RAM-only and
+# capped: a ❤️ on a poll sent before the last bot restart is ignored.
+BOOKMARK_REF_CAP = 20000
+_BOOKMARK_REFS: "OrderedDict[tuple[int, int], dict]" = OrderedDict()
+
+def _register_bookmarkable(chat_id, message_id, mid, year, module, subject) -> None:
+    """Remembers that (chat_id, message_id) is a poll for bank question
+    (year, mid), so a later ❤️ reaction can be turned into a bookmark.
+    Silently a no-op if any identifying piece is missing."""
+    if chat_id is None or message_id is None or mid is None or not year:
+        return
+    _BOOKMARK_REFS[(chat_id, message_id)] = {
+        "mid": mid, "year": year, "module": module or "", "subject": subject or "",
+    }
+    while len(_BOOKMARK_REFS) > BOOKMARK_REF_CAP:
+        _BOOKMARK_REFS.popitem(last=False)
+
+def _bookmarks_for(user_id: int) -> list:
+    """This user's bookmark references (never scoped by /daily_module —
+    a bookmark is a personal pick, not part of the daily-quiz pool)."""
+    return list(_BOOKMARKS_BY_USER.get(user_id, []))
+
+def add_bookmark(user_id: int, mid: int, year: str, module: str, subject: str) -> bool:
+    """Deduped by (user_id, year, mid). Returns True if a new entry was added."""
+    for b in _BOOKMARKS_BY_USER.get(user_id, []):
+        if b["mid"] == mid and b["year"] == year:
+            return False
+    entry = {"user_id": user_id, "mid": mid, "year": year, "module": module,
+             "subject": subject, "kind": "bookmark"}
+    MISTAKES_BANK.append(entry)
+    _mistakes_index_add(entry)
+    _mark_mistakes_bank_dirty()
+    return True
+
+def remove_bookmark(user_id: int, mid: int, year: str) -> bool:
+    """Returns True if a bookmark was actually removed."""
+    for b in list(_BOOKMARKS_BY_USER.get(user_id, [])):
+        if b["mid"] == mid and b["year"] == year:
+            try:
+                MISTAKES_BANK.remove(b)
+            except ValueError:
+                pass
+            _mistakes_index_remove(b)
+            _mark_mistakes_bank_dirty()
+            return True
+    return False
+
+def _has_heart(reactions) -> bool:
+    """True if a reaction list contains the red heart. Telegram reports it
+    as "❤" while the keyboard emoji is "❤️" (with a variation selector),
+    so compare with the selector stripped."""
+    for r in reactions or ():
+        if isinstance(r, ReactionTypeEmoji) and (r.emoji or "").replace("\ufe0f", "") == "❤":
+            return True
+    return False
+
+async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """❤️ added to a quiz poll -> bookmark it; ❤️ removed -> un-bookmark.
+    Private chats only (chat id == user id). Needs "message_reaction" in
+    run_polling's allowed_updates (see MAIN) — Telegram doesn't send these
+    by default."""
+    mr = update.message_reaction
+    if mr is None or mr.user is None or mr.chat is None or mr.user.is_bot:
+        return
+    user_id = mr.user.id
+    if mr.chat.id != user_id:
+        return
+    # Reaction updates skip the group=-1 ban gate (it only sees messages
+    # and callbacks), so honor bans here too.
+    if get_ban_info(user_id)[0] is not None:
+        return
+    was_hearted, now_hearted = _has_heart(mr.old_reaction), _has_heart(mr.new_reaction)
+    if was_hearted == now_hearted:
+        return
+    ref = _BOOKMARK_REFS.get((mr.chat.id, mr.message_id))
+    if not ref:
+        return
+    try:
+        if now_hearted:
+            changed = add_bookmark(user_id, ref["mid"], ref["year"], ref["module"], ref["subject"])
+        else:
+            changed = remove_bookmark(user_id, ref["mid"], ref["year"])
+        if changed:
+            await backup_mistakes_bank_to_channel(context)
+    except Exception as e:
+        print(f"BOOKMARKS: failed to {'add' if now_hearted else 'remove'} for user {user_id}, mid {ref.get('mid')}: {e}")
 
 async def backup_mistakes_bank_to_channel(context):
     global _mistakes_bank_backup_msg_id, _last_mistakes_bank_backup_at
@@ -2525,6 +2652,7 @@ async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid:
     return {
         "question": question, "options": options, "correct_option_id": correct_id,
         "explanation": explanation, "year": year, "module": module, "subject": subject,
+        "mid": mid,   # lets _deliver_next_daily_question register the poll for ❤️ bookmarking
     }
 
 def _scoped_mistakes_bank(user_id: int) -> list:
@@ -2607,6 +2735,8 @@ def _search_quiz_questions(year: str, module: str | None, query_text: str,
             total += 1
             if len(matches) < limit:
                 matches.append({
+                    "mid":               mid,
+                    "year":              year,
                     "question":          question,
                     "options":           options,
                     "correct_option_id": correct_id,
@@ -2659,6 +2789,8 @@ async def _send_search_results(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         await deliver_quiz(
             context, chat_id, m["question"], m["options"], m["correct_option_id"],
             explanation=m.get("explanation"),
+            bookmark_ref={"mid": m["mid"], "year": m["year"],
+                          "module": m.get("module", ""), "subject": m.get("subject", "")},
         )
     await context.bot.send_message(chat_id, "🔎 عايز تبحث تاني؟", reply_markup=again_markup)
 
@@ -2832,6 +2964,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     session["current_correct_id"] = q["correct_option_id"]
     session["current_option_count"] = len(q.get("options") or [])
     session["current_message_id"] = msg.message_id
+    _register_bookmarkable(user_id, msg.message_id, q.get("mid"), q.get("year"), q.get("module"), q.get("subject"))
     session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
     # q was popped off the queue above, so stash its module/subject on the
     # session — _advance_daily_quiz_session / _advance_mistakes_retake_session
@@ -3241,16 +3374,18 @@ async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 MISTAKES_RETAKE_SESSIONS = {}   # user_id -> same session shape as DAILY_QUIZ_SESSIONS
 
-async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None, source: str = "mistakes") -> None:
     """Every question currently in this user's mistakes bank, restricted to
     the admin-set /daily_module scope (or the whole bank if no scope is
     set), sent one at a time. No once-per-day gate — unlike the Daily
     Quiz, this is an on-demand review the user can retake as often as they
     like."""
-    entries   = list(_scoped_mistakes_bank(user_id))
+    is_bm     = source == "bookmarks"   # ❤️ Bookmarks reuse this exact flow, just a different pool
+    entries   = _bookmarks_for(user_id) if is_bm else list(_scoped_mistakes_bank(user_id))
     questions = await _resolve_mistakes(context, entries) if entries else []
     if not questions:
-        text = "أما أنت كينج صحيح - 🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!"
+        text = ("📭 مفيش أسئلة محفوظة دلوقتي — حط ❤️ على أي سؤال في الكويز عشان يتحفظ هنا."
+                if is_bm else "أما أنت كينج صحيح - 🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!")
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
         if message:
             await message.edit_text(text, reply_markup=keyboard)
@@ -3262,11 +3397,12 @@ async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int
     session = {
         "queue": questions, "current_poll_id": None, "current_correct_id": None,
         "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
-        "kind": "retake",
+        "kind": "retake", "source": source,
     }
     MISTAKES_RETAKE_SESSIONS[user_id] = session
 
-    text = f"🧠 <b>مراجعة بنك الأخطاء</b> — {len(questions)} سؤال، هيتبعتولك واحد واحد 👇"
+    title = "❤️ <b>مراجعة الأسئلة المحفوظة</b>" if is_bm else "🧠 <b>مراجعة بنك الأخطاء</b>"
+    text = f"{title} — {len(questions)} سؤال، هيتبعتولك واحد واحد 👇"
     if message:
         await message.edit_text(text, parse_mode=ParseMode.HTML)
     else:
@@ -3331,8 +3467,10 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
         correct   = session["correct"]
         incorrect = session["answered"] - correct
         pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+        done_title = ("❤️ <b>خلصت مراجعة الأسئلة المحفوظة!</b>" if session.get("source") == "bookmarks"
+                      else "🧠 <b>خلصت مراجعة بنك الأخطاء!</b>")
         summary = (
-            f"🧠 <b>خلصت مراجعة بنك الأخطاء!</b>\n\n"
+            f"{done_title}\n\n"
             f"✅ صح: {correct}\n"
             f"❌ غلط: {incorrect}\n"
             f"📊 نسبة: {pct}%\n"
@@ -4593,7 +4731,7 @@ def _clear_pending_image(user_id: int):
 # ═══════════════════════════════════════════════════════════════
 # QUIZ DELIVERY  (single source of truth for sending a live quiz poll)
 # ═══════════════════════════════════════════════════════════════
-async def _send_quiz_poll(context, poll_kwargs: dict, image_path: str = None):
+async def _send_quiz_poll(context, poll_kwargs: dict, image_path: str = None, bookmark_ref: dict | None = None):
     """
     Sends the poll, attaching image_path as the quiz's native media (Bot API
     10.0+ InputPollMedia) when provided. Falls back to sending the image as a
@@ -4601,21 +4739,28 @@ async def _send_quiz_poll(context, poll_kwargs: dict, image_path: str = None):
     rejected — this feature is new enough (May 2026) that we don't want a
     server-side quirk to silently drop the question entirely.
     """
+    msg = None
     if image_path:
         try:
             with open(image_path, "rb") as f:
-                await context.bot.send_poll(**poll_kwargs, media=InputMediaPhoto(f))
-            return
+                msg = await context.bot.send_poll(**poll_kwargs, media=InputMediaPhoto(f))
         except Exception as e:
             print("POLL MEDIA ERROR (falling back to separate image message):", e)
             with open(image_path, "rb") as f:
                 await context.bot.send_photo(chat_id=poll_kwargs["chat_id"], photo=f)
-    await context.bot.send_poll(**poll_kwargs)
+    if msg is None:
+        msg = await context.bot.send_poll(**poll_kwargs)
+    # bookmark_ref (year/mid/module/subject) is only passed for polls that
+    # map to a bank question — see _register_bookmarkable.
+    if bookmark_ref:
+        _register_bookmarkable(poll_kwargs["chat_id"], msg.message_id, **bookmark_ref)
+    return msg
 
 async def deliver_quiz(
     context, chat_id: int, question: str, raw_options: list, correct_index: int,
     explanation: str = None, image_path: str = None,
     always_show_question_text: bool = False, header_label: str = "📋 <b>السؤال:</b>",
+    bookmark_ref: dict | None = None,
 ):
     """
     Sends a single live quiz poll to chat_id, handling Telegram's field-length
@@ -4662,7 +4807,7 @@ async def deliver_quiz(
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-        await _send_quiz_poll(context, poll_kwargs, image_path)
+        await _send_quiz_poll(context, poll_kwargs, image_path, bookmark_ref)
 
     elif not q_fits and answers_fit:
         await context.bot.send_message(
@@ -4676,7 +4821,7 @@ async def deliver_quiz(
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-        await _send_quiz_poll(context, poll_kwargs, image_path)
+        await _send_quiz_poll(context, poll_kwargs, image_path, bookmark_ref)
 
     else:
         answer_lines = "\n".join(
@@ -4697,7 +4842,7 @@ async def deliver_quiz(
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-        await _send_quiz_poll(context, poll_kwargs, image_path)
+        await _send_quiz_poll(context, poll_kwargs, image_path, bookmark_ref)
 
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARD HELPERS
@@ -4717,6 +4862,9 @@ def start_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🧠 Mistakes Bank", callback_data="mistakes_bank_menu"),
+        ],
+        [
+            InlineKeyboardButton("❤️ Bookmarks", callback_data="bookmarks_menu"),
         ],
         [
             InlineKeyboardButton("🏆 Leaderboard", callback_data="year_leaderboard"),
@@ -4774,6 +4922,9 @@ HOW_TO_USE_TEXT = (
     "أول مرة تستخدمه هيطلب منك تحدد سنتك/فرقتك — ومحاولة واحدة بس في اليوم.\n\n"
     "<b>🧠 Mistakes Bank</b>\n"
     "أي سؤال تغلط فيه بيتسجل هنا تلقائي، عشان ترجعله وتراجعه تاني وقت ما تحب.\n\n"
+    "<b>❤️ Bookmarks</b>\n"
+    "حط ❤️ ريأكشن على أي سؤال في الكويز عشان يتحفظ هنا، وراجع أسئلتك المحفوظة وقت ما تحب. "
+    "لو شلت الريأكشن السؤال بيتشال.\n\n"
     "<b>📊 My Stats</b>\n"
     "شوف الـ XP والـ Level بتاعك، عدد الأسئلة الصح والغلط، والـ achievements اللي فتحتها.\n\n"
     "<b>🏆 Leaderboard</b>\n"
@@ -5194,6 +5345,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         session["current_message_id"] = msg.message_id
         session["current_mid"]        = mid
         session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
+        _register_bookmarkable(user_id, msg.message_id, mid, year, session.get("module"), session.get("subject"))
         _schedule_question_timeout(context, session.get("kind", "lecture"), user_id, msg.poll.id, timer_seconds)
         return True
 
@@ -5458,6 +5610,7 @@ async def _maybe_deliver_spaced_repetition(context: ContextTypes.DEFAULT_TYPE, u
     session["sr_pending_poll_id"]    = msg.poll.id
     session["sr_pending_correct_id"] = status["correct_option_id"]
     session["sr_pending_message_id"] = msg.message_id
+    _register_bookmarkable(user_id, msg.message_id, wrong_mid, session.get("year"), session.get("module"), session.get("subject"))
     return True
 
 async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> None:
@@ -5853,7 +6006,7 @@ ONBOARDING_SPECIAL_TEXT = (
     "بصمجة يا دولي 😂)\n\n"
     "<b>🧠 Mistakes Bank</b>\n"
     "أي سؤال تغلط فيه بيتسجل هنا تلقائي، عشان ترجعله وتراجعه تاني وقت ما تحب. وتقدر تنظفه من "
-    "الإعدادات (أخيراً بقا في زرار يمسح آخطائ الماضي ❤️‍🩹)\n\n"
+    "الإعدادات (أخيراً بقا في زرار يمسح آخطاء الماضي ❤️‍🩹)\n\n"
     "<b>📊 My Stats 📈</b>\n"
     "شوف الـ XP والـ Level بتاعك، عدد الأسئلة الصح والغلط، والـ achievements اللي فتحتها وحاجات "
     "تانيه كتير (جدا) 🔥🔥\n\n"
@@ -5878,8 +6031,8 @@ ONBOARDING_SPECIAL_TEXT = (
     "ex: تفسير (اختياري)</code>\n"
     "بسكدا! طب ما الدنيا حلوه أهي!\n"
     "لو حابب تشارك الدفعة بأفكارك, متترددش تدخل التيم وتورنا 🤩\n\n"
-    "تواصل مع @Medify44\n"
-    "وهو هيرد عليك فأقرب وقت ❤️‍🔥\n"
+    "تواصل مع أي حد من هيدز تيم كويز\n"
+    "وهم هيردو عليك فأقرب وقت ❤️‍🔥\n"
 
     "<b>كفايه رغي بقا ويلا بينا؟!</b>"
 )
@@ -6279,7 +6432,7 @@ def _locked_year_modules_view(user_id: int | None, years: list) -> tuple[str, In
     # reopen this exact same screen. Back to Home is the only meaningful
     # "out" from here now.
     buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
-    text = f"📚 <b>{year_label(year_class)}</b> — اختار الموديول:"
+    text = f"📚 <b>{year_label(year_class)}</b> — اختار الموديول:" + year_credit_line(year_class)
     return text, InlineKeyboardMarkup(buttons)
 
 async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6881,7 +7034,7 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
             return None
 
         # ── starting a lecture quiz / a Mistakes Bank retake at 3–5 AM ──
-        if data.startswith("lecturego:") or data == "mistakes_retake":
+        if data.startswith("lecturego:") or data in ("mistakes_retake", "bookmarks_retake"):
             return QUIZZY_LATE_NIGHT_MSG if _quizzy_is_late_night() else None
 
         # ── Settings: the Spaced Repetition / Auto-Next mismatch warnings.
@@ -7571,7 +7724,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = [[InlineKeyboardButton(module_label(m), callback_data=f"module:{year}:{i}")] for i, m in enumerate(modules)]
         buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="quiz_years")])
         await query.edit_message_text(
-            f"📚 <b>{year_label(year)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
+            f"📚 <b>{year_label(year)}</b> — اختار الموديول:" + year_credit_line(year),
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
@@ -8579,6 +8733,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "mistakes_retake":
         await start_mistakes_retake(context, user_id, message=query.message)
+        return
+
+    # ── ❤️ Bookmarks menu button (main menu, right under Mistakes Bank) ──
+    if query.data == "bookmarks_menu":
+        count = len(_bookmarks_for(user_id))
+        text = (
+            f"❤️ <b>الأسئلة المحفوظة</b>\n\n"
+            f"عدد الأسئلة المحفوظة: <b>{count}</b>\n\n"
+            f"عشان تحفظ سؤال، حط ❤️ ريأكشن على رسالة الكويز. ولو شلت الريأكشن السؤال بيتشال من هنا."
+        )
+        buttons = []
+        if count:
+            buttons.append([InlineKeyboardButton("🔁 Practice Bookmarks", callback_data="bookmarks_retake")])
+        buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if query.data == "bookmarks_retake":
+        await start_mistakes_retake(context, user_id, message=query.message, source="bookmarks")
         return
 
     # ── Admin: /daily_module picker (dqy:/dqm:/dq_scope_off) ─────────
@@ -10810,6 +10983,10 @@ app.add_handler(MessageHandler(
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(PollHandler(poll_update_handler))
 app.add_handler(PollAnswerHandler(handle_poll_answer))
+# ❤️ reactions on quiz polls -> Bookmarks (see handle_message_reaction)
+app.add_handler(MessageReactionHandler(
+    handle_message_reaction, message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED,
+))
 
 # Text handler last — excludes the storage group and the quiz channel
 app.add_handler(MessageHandler(
@@ -10886,4 +11063,6 @@ def _print_startup_banner():
     print(f"{DIM}{'─' * 42}{RESET}\n")
 
 _print_startup_banner()
-app.run_polling()
+# message_reaction is NOT in Telegram's default update set — without ALL_TYPES
+# (or an explicit list containing it) ❤️ Bookmarks would never fire.
+app.run_polling(allowed_updates=Update.ALL_TYPES)
