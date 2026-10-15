@@ -11045,7 +11045,7 @@ def _pick_prev_view(st: dict, n_labeled: int, n_other: int):
     text = (
         f"{_pick_title(st)} — {year_label(st['year'])}\n"
         f"🔢 الأسئلة: <b>{st['count']}</b> · 📚 {len(_pick_selected(st))} محاضرة\n\n"
-        "📜 <b>نسبة أسئلة السنين اللي فاتت</b> (اللي فيها End أو Final وبعدها رقم من خانتين، زي End 23)؟\n"
+        "📜 <b>نسبة أسئلة السنين السابقة؟</b>\n"
         "0% = ولا سؤال منهم · 100% = كلها منهم\n\n"
         f"المتاح في المحاضرات دي: <b>{n_labeled}</b> من السنين اللي فاتت و<b>{n_other}</b> عادي."
     )
