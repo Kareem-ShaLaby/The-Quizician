@@ -1203,11 +1203,12 @@ STATS_HISTORY_FILE = "stats_history.json"
 # backup (STORAGE_GROUP_ID's pinned document) — see backup_storage_to_channel
 # / restore_storage_from_channel. It is also in the daily zipped export.
 STATS_HISTORY_BACKUP_MIN_INTERVAL = 3600   # seconds
-STATS_SOURCES = ("lecture", "daily", "mistakes", "bookmarks", "event")
+STATS_SOURCES = ("lecture", "daily", "mistakes", "bookmarks", "event", "custom")
 STATS_SOURCE_LABELS = {"lecture": "Lectures", "daily": "Daily", "mistakes": "Mistakes",
-                       "bookmarks": "Bookmarks", "event": "Events"}
+                       "bookmarks": "Bookmarks", "event": "Events", "custom": "Custom Quiz"}
 _STATS_SUM_KEYS = ("answered", "correct", "lectures", "daily_done", "daily_correct",
-                   "daily_total", "xp", "achievements", "errors")
+                   "daily_total", "xp", "achievements", "errors",
+                   "custom_runs", "custom_questions", "custom_correct", "custom_time")
 
 def _blank_stats_day() -> dict:
     return {
@@ -1217,6 +1218,7 @@ def _blank_stats_day() -> dict:
         "hours": [0] * 24,
         "lectures": 0, "lectures_year": {},
         "daily_done": 0, "daily_correct": 0, "daily_total": 0,
+        "custom_runs": 0, "custom_questions": 0, "custom_correct": 0, "custom_time": 0.0,
         "xp": 0, "achievements": 0, "errors": 0, "time_spent": 0.0,
         "users": [], "active": 0, "users_total": 0,
     }
@@ -1297,6 +1299,16 @@ def _stat_daily_completed(correct: int, answered: int) -> None:
     rec["daily_done"] += 1
     rec["daily_correct"] += correct
     rec["daily_total"] += answered
+    _mark_stats_dirty()
+
+def _stat_custom_finished(answered: int, correct: int, seconds: float) -> None:
+    """One finished 🎯 Custom Quiz run (the per-answer counts already went in
+    through _stat_answer with source "custom")."""
+    rec = _stats_today()[1]
+    rec["custom_runs"] = rec.get("custom_runs", 0) + 1
+    rec["custom_questions"] = rec.get("custom_questions", 0) + answered
+    rec["custom_correct"] = rec.get("custom_correct", 0) + correct
+    rec["custom_time"] = round(rec.get("custom_time", 0.0) + seconds, 1)
     _mark_stats_dirty()
 
 def _stats_week_key(day: str) -> str:
@@ -10431,7 +10443,7 @@ async def _event_advance(context, user_id: int, s: dict, is_correct: bool) -> No
     _t0 = s.pop("q_sent_at", None)
     if _t0:   # run time = sum of the time spent on each poll (written questions / idling don't count)
         s["duration"] = s.get("duration", 0.0) + max(0.0, time.time() - _t0)
-    _stat_answer(user_id, "event", is_correct)
+    _stat_answer(user_id, "custom" if s.get("custom") else "event", is_correct)
     if is_correct:
         s["correct"] += 1
     ev = _event_of(s)
@@ -10456,6 +10468,36 @@ def _event_of(s: dict):
 
 def _event_polls_left(s: dict) -> bool:
     return any(not isinstance(x, dict) for x in s.get("queue", []))
+
+CUSTOM_QUIZ_HISTORY_LIMIT = 20   # runs kept per user (the totals are never trimmed)
+
+async def _custom_quiz_save(context, user_id: int, s: dict) -> None:
+    """Saves a finished Custom Quiz on the user's analytics entry
+    (entry["custom_quiz"]): lifetime totals — runs, questions answered, correct,
+    seconds spent — plus their last CUSTOM_QUIZ_HISTORY_LIMIT runs as
+    [unix_time, questions_asked, answered, correct, seconds, previous_year_pct].
+    Accuracy = correct/questions, speed = seconds/questions. It rides the
+    analytics backup, and the bot-wide counters go to the stats history."""
+    answered, correct = s.get("answered", 0), s.get("correct", 0)
+    if answered <= 0:
+        return
+    seconds = round(s.get("duration", 0.0), 1)
+    entry = _get_entry(user_id)
+    cq = entry.setdefault("custom_quiz", {})
+    for k, v in (("runs", 0), ("questions", 0), ("correct", 0), ("seconds", 0.0), ("history", [])):
+        cq.setdefault(k, v)
+    cq["runs"] += 1
+    cq["questions"] += answered
+    cq["correct"] += correct
+    cq["seconds"] = round(cq["seconds"] + seconds, 1)
+    cq["history"].append([int(time.time()), s.get("total", answered), answered, correct, seconds, s.get("prev_pct", 0)])
+    del cq["history"][:-CUSTOM_QUIZ_HISTORY_LIMIT]
+    _mark_analytics_dirty()
+    _stat_custom_finished(answered, correct, seconds)
+    try:
+        await backup_analytics_to_channel(context)
+    except Exception as e:
+        print("CUSTOM QUIZ BACKUP ERROR:", e)
 
 async def _event_persist_safe(context) -> None:
     try:
@@ -10495,7 +10537,11 @@ async def _event_finish(context, user_id: int, s: dict, ev: dict) -> None:
     pct = round(correct / s["answered"] * 100) if s["answered"] else 0
     if not custom:
         _event_save_result(ev, user_id, s)
+    else:
+        await _custom_quiz_save(context, user_id, s)
     rank_line = ""
+    if custom and s["answered"] and s.get("duration"):
+        rank_line = f"\n⚡ السرعة: {s['duration'] / s['answered']:.1f} ثانية/سؤال"
     if not custom:
         _ranked = _event_rank(ev, limit=None)
         _pos = next((i for i, r in enumerate(_ranked, 1) if r["user_id"] == user_id), None)
@@ -10791,24 +10837,62 @@ def _event_q_from_snap(snap: dict) -> dict:
         q["case_group"] = snap["case_group"]
     return q
 
-async def _pick_draw_questions(context, year: str, keys: list, count: int) -> list:
-    """`count` random questions (fewer if the lectures don't have that many)
-    from the given lectures, as event-shaped dicts without ids."""
+# A question counts as a "previous year" one when its question text or case study
+# contains the word End or Final (any capitalisation) followed by a two-digit
+# number — "End 23", "FINAL-22", "final (21)", "End23" match. A year written in
+# full ("End 2023"), a bare "end"/"final", and words like "Endocrine"/"finally"
+# don't.
+PICK_PREV_CHOICES = (0, 25, 50, 75, 100)
+_PREV_YEAR_RE = re.compile(r"(?<![A-Za-z])(?:end|finals?)[^A-Za-z0-9]{0,3}\d{2}(?!\d)", re.IGNORECASE)
+
+def _pick_pools(year: str, keys: list) -> tuple:
+    """(labeled, other): the ready questions of the given lectures split by the
+    End/Final label, each a (mid, module, subject) tuple."""
     closed = _pick_closed_mids(year)
-    pool = []
+    status_by_mid = _poll_status_index(year)
+    labeled, other = [], []
     for key in keys:
         e = QUIZ_INDEX[year].get(key) or {}
-        pool += [(mid, e.get("module"), e.get("subject")) for mid in e.get("ids", []) if mid in closed]
-    random.shuffle(pool)
+        cases = {c.get("mid"): (c.get("content") or "") for c in (e.get("poll_case_studies") or [])}
+        for mid in e.get("ids", []):
+            if mid not in closed:
+                continue
+            text = f"{(status_by_mid.get(mid) or {}).get('question') or ''}\n{cases.get(mid, '')}"
+            (labeled if _PREV_YEAR_RE.search(text) else other).append((mid, e.get("module"), e.get("subject")))
+    return labeled, other
+
+def _pick_split(count: int, prev_pct: int, n_labeled: int, n_other: int) -> tuple:
+    """(labeled to take, other to take). prev_pct is the share of previous-year
+    questions: 0 = none of them, 100 = only them (both absolute, so the quiz may
+    come out shorter than `count`); in between, if one side runs short the other
+    fills in so the quiz keeps its size."""
+    want_l = round(count * prev_pct / 100)
+    want_o = count - want_l
+    take_l, take_o = min(want_l, n_labeled), min(want_o, n_other)
+    if 0 < prev_pct < 100:
+        short_l, short_o = want_l - take_l, want_o - take_o
+        take_o = min(n_other, take_o + short_l)
+        take_l = min(n_labeled, take_l + short_o)
+    return take_l, take_o
+
+async def _pick_draw_questions(context, year: str, keys: list, count: int, prev_pct: int = 0) -> tuple:
+    """(questions, n_previous_year): `count` random questions from the given
+    lectures with `prev_pct`% of them previous-year ones (see _pick_split),
+    as event-shaped dicts without ids."""
+    labeled, other = _pick_pools(year, keys)
+    random.shuffle(labeled)
+    random.shuffle(other)
+    take_l, take_o = _pick_split(count, prev_pct, len(labeled), len(other))
+    chosen = [(m, True) for m in labeled[:take_l]] + [(m, False) for m in other[:take_o]]
+    random.shuffle(chosen)
     status_by_mid = _poll_status_index(year)
-    out = []
-    for mid, module, subject in pool:
-        if len(out) >= count:
-            break
+    out, n_prev = [], 0
+    for (mid, module, subject), is_prev in chosen:
         snap = await _snapshot_from_mid(context, year, mid, module, subject, status_by_mid)
         if snap:
             out.append(_event_q_from_snap(snap))
-    return out
+            n_prev += is_prev
+    return out, n_prev
 
 async def custom_quiz_start(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
     """🎯 Custom Quiz main-menu button: count -> lectures -> private run."""
@@ -10933,19 +11017,57 @@ async def _picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         if not keys:
             await show(*_pick_modules_view(st))
             return
-        await show("⏳ بجهّز الأسئلة...")
-        qs = await _pick_draw_questions(context, year, keys, st["count"])
-        if not qs:
-            await show("⚠️ مفيش أسئلة جاهزة في المحاضرات دي — اختار محاضرات تانية.",
-                       InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="pk_back")]]))
-            return
-        PICKER.pop(uid, None)
-        short = f"\n⚠️ المتاح كان {len(qs)} بس من {st['count']} المطلوبين." if len(qs) < st["count"] else ""
-        if st["purpose"] == "custom":
-            await _custom_quiz_run(context, uid, st, qs, len(keys), short, show)
+        labeled, other = _pick_pools(year, keys)
+        if not labeled:   # no previous-year questions in these lectures — nothing to ask
+            st["prev_pct"] = 0
+            await _pick_build(context, uid, st, show, query.message.message_id)
         else:
-            await _event_fill_from_picker(context, uid, st, qs, len(keys), short, show, query.message.message_id)
+            await show(*_pick_prev_view(st, len(labeled), len(other)))
         return
+
+    if cmd == "pk_p":
+        if arg(0) not in PICK_PREV_CHOICES or not _pick_selected(st):
+            return
+        st["prev_pct"] = arg(0)
+        await _pick_build(context, uid, st, show, query.message.message_id)
+        return
+
+def _pick_prev_view(st: dict, n_labeled: int, n_other: int):
+    rows = [
+        [InlineKeyboardButton(f"{p}%", callback_data=f"pk_p:{p}") for p in PICK_PREV_CHOICES[:3]],
+        [InlineKeyboardButton(f"{p}%", callback_data=f"pk_p:{p}") for p in PICK_PREV_CHOICES[3:]],
+        [InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data="pk_back")],
+    ]
+    if st["purpose"] == "event":
+        rows.append([InlineKeyboardButton("❌ Cancel Event", callback_data="evta_cancel")])
+    else:
+        rows.append([InlineKeyboardButton("🏠 Back to Home", callback_data="pk_x")])
+    text = (
+        f"{_pick_title(st)} — {year_label(st['year'])}\n"
+        f"🔢 الأسئلة: <b>{st['count']}</b> · 📚 {len(_pick_selected(st))} محاضرة\n\n"
+        "📜 <b>نسبة أسئلة السنين اللي فاتت</b> (اللي فيها End أو Final وبعدها رقم من خانتين، زي End 23)؟\n"
+        "0% = ولا سؤال منهم · 100% = كلها منهم\n\n"
+        f"المتاح في المحاضرات دي: <b>{n_labeled}</b> من السنين اللي فاتت و<b>{n_other}</b> عادي."
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+async def _pick_build(context, uid: int, st: dict, show, msg_id: int) -> None:
+    """Draws the questions for the finished picker and starts the quiz / fills the event."""
+    year, keys, prev_pct = st["year"], _pick_selected(st), st.get("prev_pct", 0)
+    await show("⏳ بجهّز الأسئلة...")
+    qs, n_prev = await _pick_draw_questions(context, year, keys, st["count"], prev_pct)
+    if not qs:
+        await show("⚠️ مفيش أسئلة جاهزة بالشروط دي — جرّب محاضرات أو نسبة تانية.",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="pk_back")]]))
+        return
+    PICKER.pop(uid, None)
+    short = f"\n⚠️ المتاح كان {len(qs)} بس من {st['count']} المطلوبين." if len(qs) < st["count"] else ""
+    if prev_pct:
+        short += f"\n📜 أسئلة السنين اللي فاتت: {n_prev}/{len(qs)} (المطلوب {prev_pct}%)"
+    if st["purpose"] == "custom":
+        await _custom_quiz_run(context, uid, st, qs, len(keys), short, show)
+    else:
+        await _event_fill_from_picker(context, uid, st, qs, len(keys), short, show, msg_id)
 
 def _toggle_many(st: dict, keys: list) -> None:
     """Select all of `keys`, or clear them if they were all already selected."""
@@ -10978,7 +11100,8 @@ async def _custom_quiz_run(context, uid: int, st: dict, qs: list, n_lectures: in
     ev = {"name": "🎯 Custom Quiz", "year": st["year"], "live": True, "questions": qs,
           "next_qid": len(qs) + 1, "results": {}}
     s = {
-        "eid": None, "ev": ev, "custom": True, "year": st["year"], "queue": [q["id"] for q in qs],
+        "eid": None, "ev": ev, "custom": True, "year": st["year"], "prev_pct": st.get("prev_pct", 0),
+        "queue": [q["id"] for q in qs],
         "total": len(qs), "answered": 0, "correct": 0, "delivered": 0, "duration": 0.0,
         "current_poll_id": None, "current_correct_id": None, "current_option_count": None,
     }
@@ -17598,6 +17721,8 @@ ADMIN_TUTORIAL_CREATOR_SECTION = (
     "Dashboard: is the bot up, user and lecture counts, today / yesterday / this week / last week analytics (answers, accuracy, active users, sources, years, peak hour, XP), backups, live sessions, errors, uptime.\n\n"
     "<b>/stats</b>\n"
     "Permanent analytics history: last 14 days, <code>/stats weeks</code>, <code>/stats YYYY-MM-DD</code>, or <code>/stats export</code> to get stats_history.json.\n\n"
+    "<b>/report</b>\n"
+    "Builds one self-contained HTML analytics report (charts, growth rates, engagement, Custom Quiz, learners, content, events) and sends it as a file.\n\n"
     "<b>/backup_now</b>\n"
     "Forces the pinned channel backups to refresh right now.\n\n"
     "<b>/restore</b>\n"
@@ -17658,6 +17783,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("/previewtxt — text dump of every static message a normal user can see")
         lines.append("/health")
         lines.append("/stats — permanent daily/weekly analytics history — Creator only")
+        lines.append("/report — full HTML analytics report with charts — Creator only")
         lines.append("/restore")
         lines.append("/broadcast &lt;message&gt;  (or attach a file/photo/video with /broadcast as its caption)")
         lines.append("/ban &lt;ID&gt; &lt;hours&gt; &lt;reason&gt;")
@@ -18056,6 +18182,23 @@ def _fmt_day(day: str) -> str:
 def _add_days(day: str, n: int) -> str:
     return (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
 
+def _stats_all_time_block() -> str:
+    """Everything saved in STATS_HISTORY, summed. Day records are kept forever
+    (only their per-day user id lists are dropped once a week is rolled), so
+    this is exact for answers, lectures, quizzes, XP, … from the day tracking
+    began. Unique-user counts can't be summed across days, so it shows the
+    registered-user total instead of an 'active users' figure."""
+    days = STATS_HISTORY["days"]
+    if not days:
+        return "<b>♾️ All time</b>\nNo activity recorded yet."
+    agg = _agg_stats(list(days.values()))
+    agg["active"] = 0   # no exact all-time unique-user count (see docstring); hides the per-user time figure
+    first = min(days)
+    return _stats_block(
+        f"♾️ All time — since {_fmt_day(first)} ({len(days)} day(s) saved)", agg,
+        users_line=f"👥 Registered users: {_count_registered_users():,}",
+    )
+
 def _stats_year_name(y: str) -> str:
     try:
         return year_label(y) if y != "unknown" else "No year"
@@ -18066,7 +18209,8 @@ def _stats_one_liner(title: str, rec: dict) -> str:
     return (f"{title}: ❓ {rec['answered']:,} ({_pct_str(rec['correct'], rec['answered'])}) · "
             f"👤 {rec['active']:,} · 🎓 {rec['lectures']:,} · 💥 {rec['daily_done']:,}")
 
-def _stats_block(title: str, agg: dict | None, lectures_all_time: int | None = None, registered: bool = False) -> str:
+def _stats_block(title: str, agg: dict | None, lectures_all_time: int | None = None, registered: bool = False,
+                 users_line: str | None = None) -> str:
     """One analytics block for /health (a day, or a week)."""
     if not agg or not agg.get("answered") and not agg.get("lectures") and not agg.get("daily_done"):
         return f"<b>{title}</b>\nNo activity recorded yet."
@@ -18078,13 +18222,18 @@ def _stats_block(title: str, agg: dict | None, lectures_all_time: int | None = N
     users = f"👤 Active users: {agg['active']:,}"
     if registered and agg.get("users_total"):
         users += f" of {agg['users_total']:,} registered ({round(agg['active'] / agg['users_total'] * 100)}%)"
-    lines.append(users)
+    lines.append(users if users_line is None else users_line)
     lec = f"🎓 Lectures finished: {agg['lectures']:,}"
     if lectures_all_time is not None:
         lec += f" (all-time: {lectures_all_time:,})"
     lines.append(lec)
     if agg["daily_done"]:
         lines.append(f"💥 Daily Quiz completed: {agg['daily_done']:,} · avg {_pct_str(agg['daily_correct'], agg['daily_total'])}")
+    if agg.get("custom_runs"):
+        _cq = agg.get("custom_questions", 0)
+        _speed = f" · {agg['custom_time'] / _cq:.1f}s/question" if _cq and agg.get("custom_time") else ""
+        lines.append(f"🎯 Custom Quizzes: {agg['custom_runs']:,} run(s) · {_cq:,} questions · "
+                     f"{_pct_str(agg.get('custom_correct', 0), _cq)}{_speed}")
     src = [f"{STATS_SOURCE_LABELS.get(k, k)} {v[0]:,}" for k, v in agg["src"].items() if v[0]]
     if src:
         lines.append("📊 By source: " + " · ".join(src))
@@ -18105,7 +18254,8 @@ def _stats_block(title: str, agg: dict | None, lectures_all_time: int | None = N
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Creator-only: /stats (last 14 days), /stats weeks (last 12 weeks),
-    /stats <YYYY-MM-DD> (one full day), /stats export (stats_history.json)."""
+    /stats all (everything saved, all time), /stats <YYYY-MM-DD> (one full day),
+    /stats export (stats_history.json)."""
     if not is_creator(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
@@ -18125,6 +18275,10 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No record for that day.")
             return
         await update.message.reply_text(_stats_block(f"📅 {arg}", _agg_stats([rec]), registered=True), parse_mode=ParseMode.HTML)
+        return
+    if arg in ("all", "alltime", "all-time", "total"):
+        await _stats_flush()
+        await update.message.reply_text(_stats_all_time_block(), parse_mode=ParseMode.HTML)
         return
     if arg in ("weeks", "week", "w"):
         await _stats_flush()
@@ -18146,7 +18300,520 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"{r['active']:>6,} {r['lectures']:>5,} {r['daily_done']:>6,}")
     await update.message.reply_text(
         "📈 <b>Daily analytics</b> (last 14 days)\n<code>" + "\n".join(rows) + "</code>\n\n"
-        "<i>/stats weeks · /stats YYYY-MM-DD · /stats export</i>", parse_mode=ParseMode.HTML)
+        "<i>/stats all · /stats weeks · /stats YYYY-MM-DD · /stats export</i>", parse_mode=ParseMode.HTML)
+
+# ═══════════════════════════════════════════════════════════════
+# /report — one self-contained HTML analytics report (creator-only)
+#
+# Everything comes from data the bot already keeps: STATS_HISTORY (days/weeks),
+# ANALYTICS (per-user), SETTINGS (registered users + year), QUIZ_INDEX
+# (content), EVENTS and LECTURE_RESULTS. The file has no external requests —
+# charts are inline SVG, so it opens offline on any phone or laptop, follows
+# the device's light/dark mode, and prints cleanly. Hover a bar/point for the
+# exact numbers.
+# ═══════════════════════════════════════════════════════════════
+import math
+from collections import Counter
+
+_RP_SRC_COLORS = {"lecture": "#6366f1", "daily": "#f59e0b", "mistakes": "#ef4444",
+                  "bookmarks": "#14b8a6", "event": "#8b5cf6", "custom": "#ec4899"}
+_RP_BLUE, _RP_GREEN, _RP_RED, _RP_AMBER, _RP_TEAL = "#4f8cff", "#22c55e", "#ef4444", "#f59e0b", "#14b8a6"
+_RP_DAILY_CHART_DAYS = 120   # daily charts show the most recent N days; weekly ones cover everything
+
+def _rp_e(x) -> str:
+    return html.escape(str(x))
+
+def _rp_fmt(v: float) -> str:
+    a = abs(v)
+    if a >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if a >= 10_000:
+        return f"{v / 1000:.1f}k"
+    if float(v).is_integer() or a >= 100:
+        return f"{v:,.0f}"
+    return f"{v:,.1f}"
+
+def _rp_pct(c: float, a: float) -> float:
+    return (c / a * 100) if a else 0.0
+
+def _rp_change(cur: float, prev: float) -> float | None:
+    return None if not prev else (cur - prev) / prev * 100
+
+def _rp_nice(v: float) -> float:
+    if v <= 0:
+        return 1.0
+    exp = math.floor(math.log10(v))
+    f = v / 10 ** exp
+    for n in (1, 2, 2.5, 5, 10):
+        if f <= n:
+            return n * 10 ** exp
+    return 10 ** (exp + 1)
+
+def _rp_dur(seconds: float) -> str:
+    s = int(seconds)
+    if s >= 3600:
+        return f"{s // 3600}h {s % 3600 // 60}m"
+    return f"{s // 60}m {s % 60}s" if s >= 60 else f"{s}s"
+
+def _rp_chart(labels: list, series: list, kind: str = "line", w: int = 760, h: int = 250,
+              yfmt=_rp_fmt, suffix: str = "") -> str:
+    """Inline-SVG chart. kind: 'line' (series may set area=True), 'bar' (grouped)
+    or 'stack'. A series is {name, color, values[, colors, area]}; `colors` is a
+    per-value override (used to paint growth bars green/red). Every bucket has
+    a transparent hover strip whose tooltip lists all series."""
+    n = len(labels)
+    if n == 0 or not any(v is not None for s in series for v in s["values"]):
+        return '<div class="empty">No data yet</div>'
+    ml, mr, mt, mb = 50, 12, 12, 28
+    W, H = w - ml - mr, h - mt - mb
+    if kind == "stack":
+        hi, lo = max(sum((s["values"][i] or 0) for s in series) for i in range(n)), 0
+    else:
+        vals = [v for s in series for v in s["values"] if v is not None]
+        hi, lo = max(vals + [0]), min(vals + [0])
+    top = _rp_nice(hi) if hi > 0 else 0
+    bot = -_rp_nice(-lo) if lo < 0 else 0
+    if top == bot:
+        top = 1
+    rng = top - bot
+    step = W / n
+
+    def Y(v):
+        return mt + H * (1 - (v - bot) / rng)
+
+    def X(i):
+        return ml + step * (i + 0.5)
+
+    o = [f'<svg viewBox="0 0 {w} {h}" role="img" xmlns="http://www.w3.org/2000/svg">']
+    for k in range(5):   # grid + y labels
+        v = bot + rng * k / 4
+        y = Y(v)
+        o.append(f'<line x1="{ml}" x2="{w - mr}" y1="{y:.1f}" y2="{y:.1f}" class="{"zero" if abs(v) < 1e-9 else "gl"}"/>')
+        o.append(f'<text x="{ml - 6}" y="{y + 3.5:.1f}" text-anchor="end" class="ax">{_rp_e(yfmt(v))}{suffix}</text>')
+    every = max(1, math.ceil(n / 8))
+    for i in range(0, n, every):
+        o.append(f'<text x="{X(i):.1f}" y="{h - 8}" text-anchor="middle" class="ax">{_rp_e(labels[i])}</text>')
+    m = len(series)
+    if kind == "line":
+        for s in series:
+            pts = [(X(i), Y(v)) for i, v in enumerate(s["values"]) if v is not None]
+            if len(pts) > 1:
+                if s.get("area"):
+                    path = f'M{pts[0][0]:.1f},{Y(0):.1f} ' + " ".join(f"L{x:.1f},{y:.1f}" for x, y in pts) + f' L{pts[-1][0]:.1f},{Y(0):.1f}Z'
+                    o.append(f'<path d="{path}" fill="{s["color"]}" fill-opacity=".14"/>')
+                o.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in pts)}" fill="none" '
+                         f'stroke="{s["color"]}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"'
+                         + (' stroke-dasharray="5 4"' if s.get("dash") else "") + '/>')
+            if len(pts) == 1 or n <= 40:
+                for x, y in pts:
+                    o.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.6" fill="{s["color"]}"/>')
+    else:
+        base = [0.0] * n
+        bw = max(1.2, step * 0.74 / (1 if kind == "stack" else m))
+        for j, s in enumerate(series):
+            for i, v in enumerate(s["values"]):
+                if not v:
+                    continue
+                color = (s.get("colors") or [s["color"]] * n)[i]
+                if kind == "stack":
+                    y1, y2 = Y(base[i] + v), Y(base[i])
+                    base[i] += v
+                    x = X(i) - bw / 2
+                else:
+                    y1, y2 = sorted((Y(v), Y(0)))
+                    x = X(i) - step * 0.37 + j * bw
+                o.append(f'<rect x="{x:.1f}" y="{y1:.1f}" width="{bw:.1f}" height="{max(y2 - y1, .8):.1f}" '
+                         f'fill="{color}" rx="{1.6 if bw > 4 else 0}"/>')
+    for i in range(n):   # hover strips with tooltips
+        tip = labels[i] + "".join(
+            f"\n{s['name']}: {_rp_fmt(s['values'][i])}{suffix}" for s in series if s["values"][i] is not None)
+        o.append(f'<rect x="{ml + step * i:.1f}" y="{mt}" width="{step:.1f}" height="{H}" fill="transparent">'
+                 f'<title>{_rp_e(tip)}</title></rect>')
+    o.append("</svg>")
+    return "".join(o)
+
+def _rp_donut(items: list, center: str, sub: str) -> str:
+    items = [(n, v, c) for n, v, c in items if v > 0]
+    total = sum(v for _n, v, _c in items)
+    if not total:
+        return '<div class="empty">No data yet</div>'
+    R, SW, C = 70, 26, 2 * math.pi * 70
+    o = ['<svg viewBox="0 0 180 180" role="img" xmlns="http://www.w3.org/2000/svg" class="donut">']
+    off = 0.0
+    for name, v, color in items:
+        ln = v / total * C
+        o.append(f'<circle cx="90" cy="90" r="{R}" fill="none" stroke="{color}" stroke-width="{SW}" '
+                 f'stroke-dasharray="{ln:.2f} {C - ln:.2f}" stroke-dashoffset="{-off:.2f}" transform="rotate(-90 90 90)">'
+                 f'<title>{_rp_e(name)}: {_rp_fmt(v)} ({v / total * 100:.1f}%)</title></circle>')
+        off += ln
+    o.append(f'<text x="90" y="88" text-anchor="middle" class="dc">{_rp_e(center)}</text>'
+             f'<text x="90" y="106" text-anchor="middle" class="ds">{_rp_e(sub)}</text></svg>')
+    return "".join(o)
+
+def _rp_legend(items: list) -> str:
+    return '<div class="legend">' + "".join(
+        f'<span><i style="background:{c}"></i>{_rp_e(n)}</span>' for n, c in items) + "</div>"
+
+def _rp_hbars(items: list, color: str = _RP_BLUE, suffix: str = "") -> str:
+    """items: (label, value[, display text])."""
+    if not items:
+        return '<div class="empty">No data yet</div>'
+    top = max(i[1] for i in items) or 1
+    rows = []
+    for it in items:
+        shown = it[2] if len(it) > 2 else f"{_rp_fmt(it[1])}{suffix}"
+        rows.append(f'<div class="hb"><span dir="auto">{_rp_e(it[0])}</span>'
+                    f'<div class="bar"><i style="width:{it[1] / top * 100:.1f}%;background:{color}"></i></div>'
+                    f'<b>{_rp_e(shown)}</b></div>')
+    return "".join(rows)
+
+def _rp_table(headers: list, rows: list, num_from: int = 1) -> str:
+    if not rows:
+        return '<div class="empty">No data yet</div>'
+    th = "".join(f'<th class="{"n" if i >= num_from else ""}">{_rp_e(h)}</th>' for i, h in enumerate(headers))
+    body = "".join(
+        "<tr>" + "".join(f'<td class="{"n" if i >= num_from else ""}" dir="auto">{c}</td>' for i, c in enumerate(r)) + "</tr>"
+        for r in rows)
+    return f'<div class="tw"><table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>'
+
+def _rp_card(title: str, body: str, sub: str = "", legend: str = "", wide: bool = False) -> str:
+    return (f'<section class="card{" wide" if wide else ""}"><h3>{_rp_e(title)}</h3>'
+            + (f'<p class="sub">{sub}</p>' if sub else "") + legend + body + "</section>")
+
+def _rp_chip(change: float | None, suffix: str = "% vs prev 7d") -> str:
+    if change is None:
+        return '<span class="chip flat">no baseline yet</span>'
+    cls = "up" if change > 0.05 else ("down" if change < -0.05 else "flat")
+    arrow = "▲" if change > 0.05 else ("▼" if change < -0.05 else "■")
+    return f'<span class="chip {cls}">{arrow} {abs(change):.1f}{suffix}</span>'
+
+def _rp_kpi(icon: str, label: str, value: str, chip: str = "", note: str = "") -> str:
+    return (f'<div class="kpi"><div class="ki">{icon}</div><div class="kv">{_rp_e(value)}</div>'
+            f'<div class="kl">{_rp_e(label)}</div>{chip}' + (f'<div class="kn">{_rp_e(note)}</div>' if note else "") + "</div>")
+
+_RP_CSS = """
+:root{--bg:#f4f6fb;--card:#fff;--ink:#0f172a;--muted:#64748b;--grid:#e2e8f0;--line:#cbd5e1;--accent:#4f8cff;--accent2:#8b5cf6;
+--up:#16a34a;--down:#dc2626;--upbg:#dcfce7;--downbg:#fee2e2;--flatbg:#e2e8f0;--shadow:0 1px 2px rgba(15,23,42,.06),0 8px 24px rgba(15,23,42,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0b1020;--card:#131a2e;--ink:#e6ebf7;--muted:#93a0bd;--grid:#26304d;--line:#34405f;
+--up:#4ade80;--down:#f87171;--upbg:#12301f;--downbg:#3a1618;--flatbg:#222c47;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35)}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Arabic",sans-serif}
+.hero{background:linear-gradient(135deg,#4f8cff 0%,#8b5cf6 55%,#ec4899 100%);color:#fff;padding:34px 20px 70px}
+.wrap{max-width:1120px;margin:0 auto;padding:0 16px}
+.hero .wrap{padding:0}.hero h1{margin:0 0 4px;font-size:clamp(24px,5vw,36px);letter-spacing:-.02em}
+.hero p{margin:0;opacity:.9}.hero .meta{margin-top:12px;display:flex;flex-wrap:wrap;gap:8px}
+.pill{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.28);border-radius:999px;padding:3px 12px;font-size:13px}
+main{margin-top:-46px;padding-bottom:40px}
+h2{font-size:20px;margin:34px 0 12px;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
+h2 small{font-weight:400;color:var(--muted);font-size:13px}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
+.kpis{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.card,.kpi{background:var(--card);border-radius:16px;box-shadow:var(--shadow);padding:16px 18px;min-width:0}
+.card.wide{grid-column:1/-1}.card h3{margin:0 0 2px;font-size:15px}.sub{margin:0 0 8px;color:var(--muted);font-size:13px}
+.kpi .ki{font-size:20px}.kpi .kv{font-size:clamp(22px,4vw,28px);font-weight:700;letter-spacing:-.02em;line-height:1.2}
+.kpi .kl{color:var(--muted);font-size:13px;margin-bottom:6px}.kpi .kn{color:var(--muted);font-size:12px;margin-top:4px}
+.chip{display:inline-block;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:600}
+.chip.up{background:var(--upbg);color:var(--up)}.chip.down{background:var(--downbg);color:var(--down)}.chip.flat{background:var(--flatbg);color:var(--muted)}
+svg{width:100%;height:auto;display:block}.ax{fill:var(--muted);font-size:10.5px}.gl{}svg line.gl{stroke:var(--grid)}
+svg line.zero{stroke:var(--line);stroke-width:1.2}.donut{max-width:210px;margin:0 auto}.dc{fill:var(--ink);font-size:17px;font-weight:700}.ds{fill:var(--muted);font-size:9.5px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12.5px;color:var(--muted);margin:2px 0 6px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.hb{display:grid;grid-template-columns:minmax(80px,32%) 1fr auto;gap:10px;align-items:center;margin:7px 0;font-size:13.5px}
+.hb span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hb .bar{background:var(--grid);border-radius:99px;height:9px;overflow:hidden}
+.hb .bar i{display:block;height:100%;border-radius:99px}.hb b{font-variant-numeric:tabular-nums}
+.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:7px 10px;border-bottom:1px solid var(--grid);text-align:left;white-space:nowrap}th{color:var(--muted);font-weight:600;font-size:12.5px}
+.n{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover{background:var(--flatbg)}
+.empty{color:var(--muted);padding:26px 0;text-align:center;font-size:13px}
+.insights{display:grid;gap:8px;margin:0;padding:0;list-style:none}.insights li{background:var(--card);border-radius:12px;padding:10px 14px;box-shadow:var(--shadow);border-left:4px solid var(--accent)}
+.split{display:grid;grid-template-columns:210px 1fr;gap:14px;align-items:center}@media(max-width:560px){.split{grid-template-columns:1fr}}
+footer{color:var(--muted);font-size:12.5px;text-align:center;padding:10px 16px 30px}
+@media print{body{background:#fff}.hero{padding:18px}.card,.kpi{box-shadow:none;border:1px solid #ddd;break-inside:avoid}}
+"""
+
+def _rp_series() -> list:
+    """One entry per calendar day from the first to the last saved one (days
+    with no activity are zeros, so charts don't skip them); `reg` is the
+    registered-user total, carried forward over gaps."""
+    days = STATS_HISTORY["days"]
+    if not days:
+        return []
+    d, last = datetime.strptime(min(days), "%Y-%m-%d").date(), datetime.strptime(max(days), "%Y-%m-%d").date()
+    out, reg = [], 0
+    while d <= last:
+        key = d.isoformat()
+        r = days.get(key) or {}
+        reg = r.get("users_total") or reg
+        out.append({"date": key, "r": r, "reg": reg, "wd": d.weekday()})
+        d += timedelta(days=1)
+    return out
+
+def _rp_completed_weeks() -> list:
+    """[(week_start, aggregate)] for every finished week, oldest first."""
+    cur = _stats_week_key(_stats_today()[0])
+    keys = sorted({_stats_week_key(d) for d in STATS_HISTORY["days"]} | set(STATS_HISTORY["weeks"]))
+    return [(k, _week_agg(k)) for k in keys if k != cur and _week_agg(k)]
+
+def build_html_report() -> str:
+    now = datetime.now(DAILY_QUIZ_TZ)
+    days = STATS_HISTORY["days"]
+    ser = _rp_series()
+    allagg = _agg_stats(list(days.values())) if days else _blank_stats_day()
+    registered = _count_registered_users()
+    entries = [(k, e) for k, e in ANALYTICS.items() if isinstance(k, str) and k.lstrip("-").isdigit() and isinstance(e, dict)]
+    A = lambda r, k: r.get(k, 0) or 0   # noqa: E731
+
+    # ── windows for the headline trend chips: the 7 full days before today vs the 7 before those ──
+    full = ser[:-1] if ser and ser[-1]["date"] == now.strftime("%Y-%m-%d") else ser
+    w7, p7 = full[-7:], full[-14:-7]
+    have_two = len(full) >= 14
+
+    def win(rows, key):
+        return sum(A(x["r"], key) for x in rows)
+
+    def chip(key, rows_a=None, rows_b=None):
+        return _rp_chip(_rp_change(win(rows_a or w7, key), win(rows_b or p7, key))) if have_two else _rp_chip(None)
+
+    reg_now = ser[-1]["reg"] if ser else registered
+    reg_then = next((x["reg"] for x in reversed(ser[:-7]) if x["reg"]), 0) if len(ser) > 7 else 0
+    acc_w7, acc_p7 = _rp_pct(win(w7, "correct"), win(w7, "answered")), _rp_pct(win(p7, "correct"), win(p7, "answered"))
+    reach_base = (ser[-1]["reg"] if ser and ser[-1]["reg"] else registered)   # same user total the day records used
+    reach7 = min(100.0, sum(A(x["r"], "active") for x in w7) / len(w7) / reach_base * 100) if w7 and reach_base else 0.0
+    cq = [e.get("custom_quiz") or {} for _k, e in entries]
+    cq_users = sum(1 for c in cq if c.get("runs"))
+    xp_total = sum(e.get("xp", 0) or 0 for _k, e in entries)
+
+    # ── 1. KPIs ──
+    kpis = "".join([
+        _rp_kpi("👥", "Registered users", f"{registered:,}",
+                _rp_chip(_rp_change(reg_now, reg_then), "% in 7 days") if reg_then else "",
+                f"+{reg_now - reg_then:,} in the last 7 days" if reg_then and reg_now >= reg_then else ""),
+        _rp_kpi("❓", "Questions answered", f"{allagg['answered']:,}", chip("answered"), f"{win(w7, 'answered'):,} in the last 7 days"),
+        _rp_kpi("🎯", "Overall accuracy", f"{_rp_pct(allagg['correct'], allagg['answered']):.1f}%",
+                _rp_chip(acc_w7 - acc_p7, " pts vs prev 7d") if have_two and win(p7, "answered") else "", "all time"),
+        _rp_kpi("🔥", "Avg daily reach", f"{reach7:.1f}%", "", "active users ÷ registered, last 7 days"),
+        _rp_kpi("🎓", "Lectures finished", f"{allagg['lectures']:,}", chip("lectures")),
+        _rp_kpi("💥", "Daily Quizzes done", f"{allagg['daily_done']:,}", chip("daily_done"),
+                f"avg score {_rp_pct(allagg['daily_correct'], allagg['daily_total']):.0f}%" if allagg["daily_total"] else ""),
+        _rp_kpi("🎯", "Custom Quizzes", f"{allagg['custom_runs']:,}", chip("custom_runs"),
+                f"{cq_users:,} users · {_rp_pct(allagg['custom_correct'], allagg['custom_questions']):.0f}% accuracy" if allagg["custom_runs"] else ""),
+        _rp_kpi("✨", "XP earned (all users)", _rp_fmt(xp_total), "", f"{allagg['achievements']:,} achievements unlocked"),
+    ])
+
+    # ── 2. daily charts (most recent N days) ──
+    recent = ser[-_RP_DAILY_CHART_DAYS:]
+    lab = [x["date"][5:] for x in recent]
+    ans = [A(x["r"], "answered") for x in recent]
+    ma = [sum(ans[max(0, i - 6):i + 1]) / len(ans[max(0, i - 6):i + 1]) for i in range(len(ans))]
+    acc = [round(_rp_pct(A(x["r"], "correct"), A(x["r"], "answered")), 1) if A(x["r"], "answered") else None for x in recent]
+    dau = [A(x["r"], "active") for x in recent]
+    regs = [x["reg"] or None for x in recent]
+    note_days = f"last {len(recent)} days" if len(ser) > len(recent) else f"{len(recent)} day(s)"
+    c_answers = _rp_chart(lab, [{"name": "Answers", "color": _RP_BLUE, "values": ans, "area": True},
+                                {"name": "7-day average", "color": _RP_AMBER, "values": ma, "dash": True}])
+    c_acc = _rp_chart(lab, [{"name": "Accuracy", "color": _RP_GREEN, "values": acc, "area": True}], suffix="%")
+    c_dau = _rp_chart(lab, [{"name": "Active users", "color": _RP_BLUE, "values": dau}], kind="bar")
+    c_reg = _rp_chart(lab, [{"name": "Registered users", "color": "#8b5cf6", "values": regs, "area": True}])
+
+    # ── 3. weekly growth ──
+    weeks = _rp_completed_weeks()
+    wl = [k[5:] for k, _a in weeks]
+    w_ans = [a["answered"] for _k, a in weeks]
+    w_act = [a.get("active", 0) for _k, a in weeks]
+    w_lec = [a["lectures"] for _k, a in weeks]
+
+    def wow(vals):
+        return [None] + [(_rp_change(vals[i], vals[i - 1]) if vals[i - 1] else None) for i in range(1, len(vals))]
+
+    g_ans, g_act = wow(w_ans), wow(w_act)
+    clr = lambda g: [(_RP_GREEN if (v or 0) >= 0 else _RP_RED) for v in g]   # noqa: E731
+    c_growth = _rp_chart(wl[1:], [{"name": "Answers WoW", "color": _RP_BLUE, "values": [round(v, 1) if v is not None else None for v in g_ans[1:]],
+                                    "colors": clr(g_ans[1:])}], kind="bar", suffix="%")
+    c_weekly = _rp_chart(wl, [{"name": "Answers", "color": _RP_BLUE, "values": w_ans, "area": True},
+                              {"name": "Active users", "color": _RP_AMBER, "values": w_act}], kind="line")
+    cagr = None
+    if len(w_ans) >= 3 and w_ans[0] > 0 and w_ans[-1] > 0:
+        cagr = ((w_ans[-1] / w_ans[0]) ** (1 / (len(w_ans) - 1)) - 1) * 100
+    wk_rows = []
+    for i in range(len(weeks) - 1, max(len(weeks) - 13, -1), -1):
+        k, a = weeks[i]
+        def gcell(g):
+            return "—" if g is None else f'<span class="chip {"up" if g >= 0 else "down"}">{"▲" if g >= 0 else "▼"} {abs(g):.0f}%</span>'
+        wk_rows.append([_rp_e(k), f"{a['answered']:,}", gcell(g_ans[i]), f"{_rp_pct(a['correct'], a['answered']):.0f}%",
+                        f"{a.get('active', 0):,}", gcell(g_act[i]), f"{a['lectures']:,}", f"{a['daily_done']:,}"])
+
+    # ── 4. sources / years / hours / weekdays ──
+    src_items = [(STATS_SOURCE_LABELS.get(k, k), v[0], _RP_SRC_COLORS.get(k, "#94a3b8")) for k, v in allagg["src"].items() if v[0]]
+    donut = _rp_donut(src_items, _rp_fmt(allagg["answered"]), "answers")
+    src_legend = _rp_legend([(f"{n} · {_rp_fmt(v)} ({_rp_pct(v, allagg['answered']):.0f}%)", c) for n, v, c in src_items])
+    stack_series = [{"name": STATS_SOURCE_LABELS.get(k, k), "color": _RP_SRC_COLORS.get(k, "#94a3b8"),
+                     "values": [(a["src"].get(k) or [0, 0])[0] for _k, a in weeks]} for k in STATS_SOURCES]
+    c_stack = _rp_chart(wl, stack_series, kind="stack")
+    by_year = sorted(allagg["year"].items(), key=lambda kv: -kv[1][0])
+    year_bars = _rp_hbars([(_stats_year_name(k), v[0], f"{v[0]:,} · {_rp_pct(v[1], v[0]):.0f}% acc") for k, v in by_year if v[0]], _RP_TEAL)
+    reg_year = Counter(get_year_class(int(k)) for k, e in SETTINGS.items() if str(k).lstrip("-").isdigit() and e.get("nickname"))
+    reg_bars = _rp_hbars([(_stats_year_name(k or "unknown"), v) for k, v in reg_year.most_common()], "#8b5cf6")
+    hours = allagg["hours"]
+    c_hours = _rp_chart([f"{h:02d}" for h in range(24)], [{"name": "Answers", "color": _RP_AMBER, "values": hours}], kind="bar", h=210)
+    wd_tot, wd_n = [0] * 7, [0] * 7
+    for x in ser:
+        if x["r"]:
+            wd_tot[x["wd"]] += A(x["r"], "answered")
+            wd_n[x["wd"]] += 1
+    wd_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    wd_avg = [round(t / n) if n else 0 for t, n in zip(wd_tot, wd_n)]
+    c_wd = _rp_chart(wd_names, [{"name": "Avg answers", "color": _RP_BLUE, "values": wd_avg}], kind="bar", h=210)
+
+    # ── 5. Custom Quiz ──
+    c_runs = _rp_chart(lab, [{"name": "Custom Quiz runs", "color": "#ec4899", "values": [A(x["r"], "custom_runs") for x in recent]}], kind="bar", h=210)
+    sp = [round(A(x["r"], "custom_time") / A(x["r"], "custom_questions"), 1) if A(x["r"], "custom_questions") else None for x in recent]
+    c_speed = _rp_chart(lab, [{"name": "Seconds per question", "color": _RP_TEAL, "values": sp}], suffix="s", h=210)
+    cq_top = sorted(((get_nickname(int(k)) or "—", c) for (k, _e), c in zip(entries, cq) if c.get("runs") and get_nickname(int(k))),
+                    key=lambda t: -t[1].get("questions", 0))[:8]
+    cq_rows = [[_rp_e(n), f"{c['runs']:,}", f"{c['questions']:,}", f"{_rp_pct(c.get('correct', 0), c['questions']):.0f}%",
+                f"{c.get('seconds', 0) / c['questions']:.1f}s"] for n, c in cq_top]
+
+    # ── 6. learners ──
+    lv = Counter(int(e.get("level", 0) or 0) for _k, e in entries if e.get("last_active_date"))
+    lv_max = max(lv) if lv else 0
+    c_levels = _rp_chart([str(i) for i in range(lv_max + 1)], [{"name": "Users", "color": "#8b5cf6", "values": [lv.get(i, 0) for i in range(lv_max + 1)]}], kind="bar", h=210)
+    buckets = [("0", 0, 0), ("1–2", 1, 2), ("3–6", 3, 6), ("7–13", 7, 13), ("14–29", 14, 29), ("30+", 30, 10 ** 9)]
+    sb = [e.get("streak_best", 0) or 0 for _k, e in entries if e.get("last_active_date")]
+    streak_bars = _rp_hbars([(f"{n} days", sum(1 for s in sb if lo <= s <= hi)) for n, lo, hi in buckets], _RP_AMBER)
+    top_xp = sorted(((get_nickname(int(k)) or None, e) for k, e in entries), key=lambda t: -(t[1].get("xp", 0) or 0))
+    top_rows = [[str(i), _rp_e(n), f"{e.get('xp', 0):,}", str(e.get("level", 0)), f"{e.get('streak_best', 0)}d",
+                 f"{_rp_pct(e.get('lecture_questions_correct', 0), e.get('lecture_questions_answered', 0)):.0f}%"]
+                for i, (n, e) in enumerate([t for t in top_xp if t[0]][:10], 1)]
+
+    # ── 7. content / events / lectures ──
+    content = [(year_label(y), sum(len(e.get("ids", [])) for e in QUIZ_INDEX.get(y, {}).values()), len(QUIZ_INDEX.get(y, {})))
+               for y in YEAR_ORDER if QUIZ_INDEX.get(y)]
+    content_bars = _rp_hbars([(n, q, f"{q:,} questions · {l:,} lectures") for n, q, l in content], _RP_BLUE)
+    ev_rows = []
+    for eid, ev in sorted(EVENTS.items(), key=lambda kv: -(kv[1].get("created_at") or 0)):
+        res = ev.get("results") or {}
+        pcts = [_rp_pct(r.get("correct", 0), r.get("total", 0)) for r in res.values() if r.get("total")]
+        status = "🏁 ended" if ev.get("ended") else ("🟢 live" if ev.get("live") else "📝 draft")
+        ev_rows.append([_rp_e(ev.get("name", "—")), _rp_e(year_label(ev.get("year") or "")), status,
+                        f"{len(ev.get('questions') or []):,}" if not ev.get("ended") else "—", f"{len(res):,}",
+                        f"{sum(pcts) / len(pcts):.0f}%" if pcts else "—", f"{max(pcts):.0f}%" if pcts else "—"])
+    lec_stats = []
+    for lr_key, rows in LECTURE_RESULTS.items():
+        if not isinstance(rows, dict) or not rows:
+            continue
+        live = _lecture_live_ids(lr_key)
+        scores = [_lecture_live_score(live, r)[2] for r in rows.values() if isinstance(r, dict)]
+        if not scores:
+            continue
+        yr, _, name = lr_key.partition(":")
+        lec_stats.append((name, yr, len(scores), sum(r.get("attempts", 1) for r in rows.values() if isinstance(r, dict)), sum(scores) / len(scores)))
+    lec_stats.sort(key=lambda t: -t[2])
+    lec_rows = [[_rp_e(n), _rp_e(year_label(y)), f"{t:,}", f"{a:,}", f"{p:.0f}%"] for n, y, t, a, p in lec_stats[:10]]
+
+    # ── 8. recent days table + insights ──
+    day_rows = [[_rp_e(x["date"]), f"{A(x['r'], 'answered'):,}", f"{_rp_pct(A(x['r'], 'correct'), A(x['r'], 'answered')):.0f}%",
+                 f"{A(x['r'], 'active'):,}", f"{A(x['r'], 'lectures'):,}", f"{A(x['r'], 'daily_done'):,}", f"{A(x['r'], 'custom_runs'):,}"]
+                for x in reversed(ser[-14:])]
+    ins = []
+    if have_two and win(p7, "answered"):
+        ch = _rp_change(win(w7, "answered"), win(p7, "answered"))
+        ins.append(f"Answers are <b>{'up' if ch >= 0 else 'down'} {abs(ch):.1f}%</b> over the last 7 full days ({win(w7, 'answered'):,} vs {win(p7, 'answered'):,}).")
+    if cagr is not None:
+        ins.append(f"Weekly answers have compounded at <b>{cagr:+.1f}% per week</b> across {len(w_ans)} finished weeks.")
+    if ser and max(A(x["r"], "answered") for x in ser):
+        best = max(ser, key=lambda x: A(x["r"], "answered"))
+        ins.append(f"Best day so far: <b>{_rp_e(best['date'])}</b> with {A(best['r'], 'answered'):,} answers and {A(best['r'], 'active'):,} active users.")
+    if max(hours) > 0:
+        ph = max(range(24), key=lambda i: hours[i])
+        ins.append(f"Peak hour is <b>{ph:02d}:00</b> (Cairo) — {_rp_pct(hours[ph], sum(hours)):.1f}% of all answers.")
+    if any(wd_n):
+        bd = max(range(7), key=lambda i: wd_avg[i])
+        ins.append(f"Busiest weekday: <b>{wd_names[bd]}</b> (~{wd_avg[bd]:,} answers on average).")
+    if src_items:
+        s0 = max(src_items, key=lambda t: t[1])
+        ins.append(f"<b>{_rp_e(s0[0])}</b> drives {_rp_pct(s0[1], allagg['answered']):.0f}% of all answers.")
+    if allagg["custom_runs"]:
+        ins.append(f"<b>{cq_users:,}</b> users have finished a Custom Quiz — {allagg['custom_runs']:,} runs, "
+                   f"{allagg['custom_time'] / max(allagg['custom_questions'], 1):.1f}s per question on average.")
+    insights = '<ul class="insights">' + "".join(f"<li>{i}</li>" for i in ins) + "</ul>" if ins else ""
+
+    first_day = min(days) if days else "—"
+    sections = [
+        f'<div class="kpis">{kpis}</div>',
+        (f"<h2>💡 Highlights</h2>{insights}" if insights else ""),
+        f'<h2>📈 Growth <small>{note_days}</small></h2><div class="grid">'
+        + _rp_card("Questions answered per day", c_answers, "with a 7-day moving average", _rp_legend([("Answers", _RP_BLUE), ("7-day average", _RP_AMBER)]), True)
+        + _rp_card("Registered users", c_reg, "cumulative nicknames registered")
+        + _rp_card("Daily active users", c_dau)
+        + _rp_card("Accuracy per day", c_acc, "share of answers that were correct")
+        + _rp_card("Week-over-week growth in answers", c_growth,
+                   (f"compound growth <b>{cagr:+.1f}%/week</b>" if cagr is not None else "needs 3+ finished weeks for a trend"))
+        + _rp_card("Weekly volume", c_weekly, "answers and active users per finished week", _rp_legend([("Answers", _RP_BLUE), ("Active users", _RP_AMBER)]), True)
+        + _rp_card("Finished weeks (Fri→Thu)",
+                   _rp_table(["Week of", "Answers", "WoW", "Acc", "Users", "WoW", "Lect", "Daily"], wk_rows), wide=True)
+        + "</div>",
+        '<h2>🧭 Engagement</h2><div class="grid">'
+        + _rp_card("Where answers come from", f'<div class="split">{donut}<div>{src_legend}</div></div>', "all time")
+        + _rp_card("Source mix per week", c_stack, "", _rp_legend([(STATS_SOURCE_LABELS.get(k, k), _RP_SRC_COLORS.get(k, "#94a3b8")) for k in STATS_SOURCES]))
+        + _rp_card("Activity by hour", c_hours, "all-time answers, Cairo time")
+        + _rp_card("Average answers by weekday", c_wd)
+        + _rp_card("Answers by year", year_bars, "answers and accuracy")
+        + _rp_card("Registered users by year", reg_bars)
+        + "</div>",
+        '<h2>🎯 Custom Quiz</h2><div class="grid">'
+        + _rp_card("Runs per day", c_runs)
+        + _rp_card("Speed", c_speed, "average seconds per question")
+        + _rp_card("Most active Custom Quiz users", _rp_table(["Nickname", "Runs", "Questions", "Accuracy", "Speed"], cq_rows), wide=True)
+        + "</div>",
+        '<h2>🏆 Learners</h2><div class="grid">'
+        + _rp_card("Level distribution", c_levels, "users per level")
+        + _rp_card("Best streaks", streak_bars, "users by longest streak")
+        + _rp_card("Top 10 by XP", _rp_table(["#", "Nickname", "XP", "Level", "Best streak", "Lecture acc."], top_rows, 2), wide=True)
+        + "</div>",
+        '<h2>📚 Content & events</h2><div class="grid">'
+        + _rp_card("Question bank", content_bars, "ready questions per year")
+        + _rp_card("Most attempted lectures", _rp_table(["Lecture", "Year", "Users", "Attempts", "Avg best"], lec_rows, 2))
+        + _rp_card("Events", _rp_table(["Event", "Year", "Status", "Questions", "Solvers", "Avg", "Best"], ev_rows, 3), wide=True)
+        + "</div>",
+        '<h2>🗓 Daily log</h2><div class="grid">'
+        + _rp_card("Last 14 days", _rp_table(["Date", "Answers", "Acc", "Active", "Lectures", "Daily", "Custom"], day_rows), wide=True)
+        + "</div>",
+    ]
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<title>Quizician — Analytics Report {now.strftime("%Y-%m-%d")}</title><style>{_RP_CSS}</style></head><body>'
+        f'<header class="hero"><div class="wrap"><h1>Quizician Analytics</h1><p>Everything the bot has saved, in one place.</p>'
+        f'<div class="meta"><span class="pill">Generated {now.strftime("%Y-%m-%d %H:%M")} Cairo</span>'
+        f'<span class="pill">Tracking since {_rp_e(first_day)}</span><span class="pill">{len(days)} day(s) saved</span>'
+        f'<span class="pill">{registered:,} registered users</span></div></div></header>'
+        f'<main class="wrap">{"".join(sections)}</main>'
+        '<footer>Hover a bar or point for exact values · unique-user figures can’t be summed across days, so '
+        '“active users” are per day/week · numbers cover only the period since tracking began.</footer></body></html>'
+    )
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creator-only: /report — builds the HTML analytics report and sends it as a file."""
+    if not is_creator(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    status = await update.message.reply_text("⏳ Building the report…")
+    try:
+        await _stats_flush()   # roll weeks + save, so the report matches /stats
+        doc = build_html_report()
+    except Exception as e:
+        print("REPORT ERROR:", repr(e))
+        await status.edit_text(f"⚠️ Couldn't build the report: {e}")
+        return
+    day = datetime.now(DAILY_QUIZ_TZ).strftime("%Y-%m-%d")
+    await update.message.reply_document(
+        InputFile(BytesIO(doc.encode("utf-8")), filename=f"quizician_report_{day}.html"),
+        caption="📊 Quizician analytics report — open it in any browser (works offline, follows light/dark mode).",
+    )
+    try:
+        await status.delete()
+    except Exception:
+        pass
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only at-a-glance dashboard: is the bot up, how many users/
@@ -18215,6 +18882,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\n\n" + _stats_block(f"🗓 This week — since {_fmt_day(wk)}", this_week)
         + (("\n\n" + _stats_block(f"⏮ Last week — {_fmt_day(last_wk)} → {_fmt_day(_add_days(last_wk, 6))}", prev_week))
            if prev_week else "")
+        + "\n\n" + _stats_all_time_block()
     )
 
     text = (
@@ -19123,6 +19791,18 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
 
     mistake_count = _user_mistake_count(user_id)
 
+    # 🎯 Custom Quiz lifetime totals (saved by _custom_quiz_save) — omitted until they've finished one.
+    cq = entry.get("custom_quiz") or {}
+    cq_block = ""
+    if cq.get("runs") and cq.get("questions"):
+        cq_block = (
+            "🎯 Custom Quiz\n"
+            f"   Quizzes: {cq['runs']:,}\n"
+            f"   Questions: {cq['questions']:,}\n"
+            f"   Accuracy: {cq.get('correct', 0) / cq['questions'] * 100:.1f}%\n"
+            f"   Speed: {cq.get('seconds', 0.0) / cq['questions']:.1f}s per question\n\n"
+        )
+
     # Current module's subjects, strongest -> weakest. "Current module" is
     # the admin-set /daily_module scope when there is one, else the module
     # of the user's own latest answer — see _current_module_for_stats.
@@ -19194,6 +19874,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         f"   Answered: {lec_answered:,}\n"
         f"   Correct: {lec_correct:,}\n"
         f"   Accuracy: {accuracy:.1f}%\n\n"
+        f"{cq_block}"
         f"{subjects_block}"
         f"🧠 Mistakes Bank\n"
         f"  current: {mistake_count} questions\n\n"
@@ -20046,6 +20727,7 @@ app.add_handler(CommandHandler("set_year",       set_year_cmd))
 app.add_handler(CommandHandler("tell",           tell_cmd))
 app.add_handler(CommandHandler("health",         health_cmd))
 app.add_handler(CommandHandler("stats",          stats_cmd))
+app.add_handler(CommandHandler("report",         report_cmd))
 app.add_handler(CommandHandler("restore",        restore_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
 app.add_handler(CommandHandler("ban",            ban_cmd))
