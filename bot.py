@@ -5773,22 +5773,23 @@ async def restore_report_threads_from_channel(app) -> str:
 #     ONE deletes the previous pinned message on each new upload. A 30s
 #     cadence keeping full history would post thousands of documents a
 #     day for data nobody needs a history of.
-#   - A session older than SESSIONS_MAX_AGE_SECONDS (48h) is dropped on
+#   - A session older than SESSIONS_MAX_AGE_SECONDS (3 days) is dropped on
 #     restore rather than revived — see _cleanup_stale_sessions_job's own
-#     6h idle-based cleanup, which already reclaims abandoned sessions
-#     during normal operation; this 48h check is just what keeps a
+#     3-day idle-based cleanup, which already reclaims abandoned sessions
+#     during normal operation; this 3-day check is just what keeps a
 #     restored snapshot from ever reviving something that old.
-#   - _sessions_stale_sweep_job additionally re-runs that same 48h check
-#     against the LIVE in-memory dicts every 48h, as an independent
+#   - _sessions_stale_sweep_job additionally re-runs that same 3-day check
+#     against the LIVE in-memory dicts every day, as an independent
 #     backstop in case _cleanup_stale_sessions_job's hourly job was ever
 #     down for an extended stretch (e.g. a JobQueue outage) — it only
-#     removes entries already past 48h old, never active sessions, so it
+#     removes entries already past 3 days old, never active sessions, so it
 #     can't interrupt anyone mid-quiz.
 # ═══════════════════════════════════════════════════════════════
 SESSIONS_FILE                = "sessions.json"
 SESSIONS_BACKUP_MARKER       = "🧩 QUIZICIAN_SESSIONS_BACKUP"
 SESSIONS_BACKUP_MIN_INTERVAL = 30          # seconds
-SESSIONS_MAX_AGE_SECONDS     = 48 * 3600   # 48 hours
+SESSIONS_MAX_AGE_SECONDS     = 3 * 24 * 3600   # 3 days — must not be shorter than STALE_SESSION_IDLE_SECONDS, or a
+                                                   # restore / the stale sweep would kill sessions the idle rule still allows
 
 def _sessions_snapshot() -> dict:
     """A plain-dict, JSON-safe snapshot of all three session stores.
@@ -5848,7 +5849,7 @@ def _sessions_snapshot() -> dict:
     }
 
 def _session_age_seconds(session: dict) -> float:
-    """Best-effort age for the 48h checks above. Lecture sessions have
+    """Best-effort age for the 3-day checks above. Lecture sessions have
     started_at; Daily Quiz / mistakes-retake sessions don't, so this
     falls back to current_delivered_at (when the in-flight question was
     sent). If neither is present, treat it as already-ancient rather
@@ -6027,11 +6028,11 @@ async def _sessions_backup_job(context: ContextTypes.DEFAULT_TYPE):
     await _flush_sessions_if_changed()
     await backup_sessions_to_channel(context)
 
-SESSIONS_STALE_SWEEP_INTERVAL = 48 * 3600  # seconds
+SESSIONS_STALE_SWEEP_INTERVAL = 24 * 3600  # seconds — daily, so a swept session is at most ~1 day past the 3-day limit
 
 async def _sessions_stale_sweep_job(context: ContextTypes.DEFAULT_TYPE):
     """Independent backstop alongside _cleanup_stale_sessions_job's normal
-    6h idle-based cleanup — see the section banner above. Only removes
+    3-day idle-based cleanup — see the section banner above. Only removes
     entries already older than SESSIONS_MAX_AGE_SECONDS; never touches an
     active session, so this can't interrupt anyone mid-quiz."""
     removed = 0
@@ -6041,7 +6042,7 @@ async def _sessions_stale_sweep_job(context: ContextTypes.DEFAULT_TYPE):
                 sessions.pop(user_id, None)
                 removed += 1
     if removed:
-        print(f"SESSIONS — 48h stale sweep removed {removed} session(s).")
+        print(f"SESSIONS — 3-day stale sweep removed {removed} session(s).")
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context)
 
@@ -8410,6 +8411,11 @@ async def _close_add_lecture(context: ContextTypes.DEFAULT_TYPE, real_uid: int, 
     QUIZ_STATE[year]["current_lecture"] = None
     await save_quiz_state(year)
     ADD_LECTURE_STATE.pop(real_uid, None)
+    # The lecture's permanent quick-link id: assign it now (if it has none yet) so it's
+    # part of the index save + channel backup right below and can never change later.
+    _lec_uid, _lec_uid_new = _lecture_uid(year, current)
+    if _lec_uid_new:
+        await save_quiz_index(year)
     # Single backup for the whole lecture, once it's actually closed —
     # same "batched at close, not per-question" convention the
     # channel-authoring -END uses.
@@ -8418,9 +8424,16 @@ async def _close_add_lecture(context: ContextTypes.DEFAULT_TYPE, real_uid: int, 
     await admin_log(context, "📚 Lecture added",
                     f"{year_label(year)} — {html.escape(str(_ent.get('module', '')))} - {html.escape(str(_ent.get('subject', '')))}: {html.escape(str(current))}\n📝 {count} سؤال",
                     real_uid)
+    try:
+        _me = await context.bot.get_me()
+        _link = f"https://t.me/{_me.username}?start={_build_lecture_quicklink_payload(year, _lec_uid)}"
+        _link_block = f"\n\n🔗 <b>لينك سريع للمحاضرة:</b>\n{_link}"
+    except Exception as e:   # the lecture is already closed and saved — never fail the close over the link
+        print("ADD_LECTURE quick link failed:", repr(e))
+        _link_block = ""
     return (
         f"✅ اتقفلت محاضرة <b>{current}</b> — {count} سؤال، وكلهم جاهزين للإرسال على طول "
-        "(مفيش انتظار لإقفال بولات — الإجابات كانت معروفة من ساعة ما اتفورورد).",
+        "(مفيش انتظار لإقفال بولات — الإجابات كانت معروفة من ساعة ما اتفورورد)." + _link_block,
         None,
     )
 
@@ -9604,12 +9617,33 @@ def _quiz_year_arg(context) -> tuple[str | None, str | None]:
 #                                      unlike /quiz and /edit_quiz which only
 #                                      show closed ones — an open/stuck lecture
 #                                      must be deletable too)
+#   qbswp:<year>:<mi>:<si>:<li>        /quiz_list only: tap one lecture then another to swap their
+#                                      order (see _swap_lecture_order / QB_SWAP_PENDING)
 #   qbdel:<year>:<mi>:<si>:<li>        delete confirmation for one lecture; the
 #                                      final tap reuses quizdel_yes / PENDING_QUIZ_DELETE
 # Lectures are looked up by position inside their subject at tap time; the
 # confirmation screen shows the full lecture name before anything is removed.
 # ═══════════════════════════════════════════════════════════════
 QB_DELETE_BACK: dict = {}   # admin uid -> callback_data of the subject list to return to after a delete
+QB_SWAP_PENDING: dict = {}  # admin uid -> (year, lecture_key, (module, subject)): first lecture tapped in a swap
+
+def _swap_lecture_order(year: str, key_a: str, key_b: str) -> bool:
+    """Exchanges the positions of two lectures in the year's index. Lecture
+    order everywhere (/quiz, /edit_quiz, the lecture pickers) IS the index's key
+    order ("insertion order = numbering order"), so this is the whole feature.
+    Done in place with no await in between, so nothing ever sees a half-swapped
+    index. Lectures keep their lecture_number labels and their permanent quick-link
+    ids; only their place in the list changes."""
+    index = QUIZ_INDEX[year]
+    if key_a == key_b or key_a not in index or key_b not in index:
+        return False
+    keys = list(index)
+    i, j = keys.index(key_a), keys.index(key_b)
+    keys[i], keys[j] = keys[j], keys[i]
+    items = [(k, index[k]) for k in keys]
+    index.clear()
+    index.update(items)
+    return True
 
 def _qb_title(mode: str) -> str:
     return "📋 <b>Quiz List</b>" if mode == "l" else "🗑 <b>Quiz Delete</b>"
@@ -9653,7 +9687,7 @@ def _qb_subject_view(year: str, mod_idx: int, mode: str):
     rows.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"qbyr:{mode}:{year}")])
     return f"{_qb_title(mode)} — <b>{year_label(year)} — {html.escape(module)}</b> — اختار المادة:", InlineKeyboardMarkup(rows)
 
-def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str):
+def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str, uid: int | None = None):
     modules = ready_modules(year)
     if mod_idx >= len(modules):
         return "⚠️ الموديول ده مش موجود دلوقتي.", None
@@ -9669,10 +9703,16 @@ def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str):
         return header + "\n\n📭 لسه مفيش محاضرات هنا.", InlineKeyboardMarkup([[back]])
     rows = []
     lines = []
+    pending = QB_SWAP_PENDING.get(uid) if uid is not None else None
+    picked = pending[1] if pending and pending[0] == year and pending[2] == (module, subject) else None
     for i, (key, v) in enumerate(lectures):
         num = v.get("lecture_number") or (i + 1)
         status = "✅" if v.get("closed") else "🟡"
         count = _add_lecture_item_count(v)
+        if mode == "l" and len(lectures) > 1:   # tap one lecture, then another, to swap their order
+            rows.append([InlineKeyboardButton(
+                f"{'👉 ' if key == picked else '🔀 '}{i + 1}. {status} Lecture {num}: {v['name']}"[:64],
+                callback_data=f"qbswp:{year}:{mod_idx}:{subj_idx}:{i}")])
         if mode == "d":
             rows.append([InlineKeyboardButton(
                 f"🗑 {status} Lecture {num}: {v['name']} ({count})"[:64],
@@ -9685,6 +9725,10 @@ def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str):
         header += "\n\nاختار المحاضرة اللي عايز تمسحها:"
     else:
         header += "\n\n" + "\n".join(lines)
+        if len(lectures) > 1:
+            header += ("\n\n🔀 <b>لتبديل الترتيب:</b> دوس على المحاضرة الأولى وبعدين على التانية — هيتبدلوا."
+                       + (f"\n👉 مختار دلوقتي: <b>{html.escape(str(QUIZ_INDEX[year][picked]['name']))}</b> — دوس على المحاضرة التانية (أو عليها تاني عشان تلغي)."
+                          if picked in QUIZ_INDEX[year] else ""))
     return header, InlineKeyboardMarkup(rows)
 
 async def _qb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
@@ -9706,7 +9750,7 @@ async def _qb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query
         return
 
     # every other callback carries a year: validate + scope-check it once
-    year = parts[2] if cmd != "qbdel" else parts[1]
+    year = parts[2] if cmd not in ("qbdel", "qbswp") else parts[1]
     if year not in YEARS or not year_channel_id(year):
         await send("⚠️ السنة دي مش متاحة دلوقتي.")
         return
@@ -9721,7 +9765,23 @@ async def _qb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query
             text, markup = _qb_subject_view(year, int(parts[3]), parts[1])
         elif cmd == "qbsub":
             PENDING_QUIZ_DELETE.pop(uid, None)   # backing out of a confirm screen drops its pending delete
-            text, markup = _qb_lecture_view(year, int(parts[3]), int(parts[4]), parts[1])
+            QB_SWAP_PENDING.pop(uid, None)       # entering a subject's list starts with nothing picked
+            text, markup = _qb_lecture_view(year, int(parts[3]), int(parts[4]), parts[1], uid)
+        elif cmd == "qbswp":
+            mod_idx, subj_idx, lec_idx = int(parts[2]), int(parts[3]), int(parts[4])
+            modules = ready_modules(year)
+            module = modules[mod_idx]
+            subject = ready_subjects(year, module)[subj_idx]
+            key = _qb_lectures(year, module, subject)[lec_idx][0]
+            pending = QB_SWAP_PENDING.get(uid)
+            if pending and pending[0] == year and pending[2] == (module, subject) and pending[1] in QUIZ_INDEX[year]:
+                QB_SWAP_PENDING.pop(uid, None)
+                if _swap_lecture_order(year, pending[1], key):   # tapping the same lecture twice just un-picks it
+                    await save_quiz_index(year)
+                    await backup_quiz_to_channel(context, year)
+            else:
+                QB_SWAP_PENDING[uid] = (year, key, (module, subject))
+            text, markup = _qb_lecture_view(year, mod_idx, subj_idx, "l", uid)
         elif cmd == "qbdel":
             mod_idx, subj_idx, lec_idx = int(parts[2]), int(parts[3]), int(parts[4])
             modules = ready_modules(year)
@@ -9775,6 +9835,7 @@ async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lecnum = f" {v['lecture_number']}" if v.get("lecture_number") else ""
         lines.append(f"{i}. {v['module']} - {v['subject']} Lecture{lecnum}: {v['name']} — {len(v['ids'])} سؤال — {status}")
     lines.append(f"\nاستخدم /quiz_delete {year} &lt;رقم&gt; للحذف")
+    lines.append("لتبديل ترتيب محاضرتين: ابعت /quiz_list من غير سنة وافتح المادة.")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9892,7 +9953,7 @@ async def add_lecture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # It is NOT stored in QUIZ_INDEX (so it never shows
 # up in the module/lecture lists): it rides in the SESSIONS snapshot
 # (_sessions_snapshot / _restore_sessions_dict -> sessions.json + the pinned
-# backup in SESSIONS_GROUP_ID) and is exempt from the 48h session expiry. It
+# backup in SESSIONS_GROUP_ID) and is exempt from the 3-day session expiry. It
 # lives there until /event_end deletes it.
 #   draft  (live=False): admin is still forwarding polls; invisible to users
 #   live   (live=True) : a green button on top of the main menu for that
@@ -11045,7 +11106,7 @@ def _pick_prev_view(st: dict, n_labeled: int, n_other: int):
     text = (
         f"{_pick_title(st)} — {year_label(st['year'])}\n"
         f"🔢 الأسئلة: <b>{st['count']}</b> · 📚 {len(_pick_selected(st))} محاضرة\n\n"
-        "📜 <b>نسبة أسئلة السنين السابقة؟</b>\n"
+        "📜 <b>نسبة أسئلة السنين اللي فاتت</b> (اللي فيها End أو Final وبعدها رقم من خانتين، زي End 23)؟\n"
         "0% = ولا سؤال منهم · 100% = كلها منهم\n\n"
         f"المتاح في المحاضرات دي: <b>{n_labeled}</b> من السنين اللي فاتت و<b>{n_other}</b> عادي."
     )
@@ -16701,7 +16762,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── /quiz_list + /quiz_delete button flow (see the QB section) ──
-    if query.data.startswith(("qbyr:", "qbyr_root:", "qbmod:", "qbsub:", "qbdel:")):
+    if query.data.startswith(("qbyr:", "qbyr_root:", "qbmod:", "qbsub:", "qbdel:", "qbswp:")):
         if not is_admin(update):
             await query.answer("🚫 للأدمن فقط", show_alert=True)
             return
@@ -18355,12 +18416,17 @@ def _rp_dur(seconds: float) -> str:
         return f"{s // 3600}h {s % 3600 // 60}m"
     return f"{s // 60}m {s % 60}s" if s >= 60 else f"{s}s"
 
-def _rp_chart(labels: list, series: list, kind: str = "line", w: int = 760, h: int = 250,
+def _rp_chart(labels: list, series: list, kind: str = "line", wide: bool = False, h: int | None = None,
               yfmt=_rp_fmt, suffix: str = "") -> str:
     """Inline-SVG chart. kind: 'line' (series may set area=True), 'bar' (grouped)
     or 'stack'. A series is {name, color, values[, colors, area]}; `colors` is a
     per-value override (used to paint growth bars green/red). Every bucket has
-    a transparent hover strip whose tooltip lists all series."""
+    a transparent hover strip whose tooltip lists all series. Wide charts (full
+    row) and normal ones (a third of a row) get different coordinate systems so
+    axis text stays readable at either size; on a phone the chart scrolls
+    sideways rather than shrinking (see .cw in the CSS)."""
+    w = 760 if wide else 420
+    h = h or (250 if wide else 235)
     n = len(labels)
     if n == 0 or not any(v is not None for s in series for v in s["values"]):
         return '<div class="empty">No data yet</div>'
@@ -18384,7 +18450,7 @@ def _rp_chart(labels: list, series: list, kind: str = "line", w: int = 760, h: i
     def X(i):
         return ml + step * (i + 0.5)
 
-    o = [f'<svg viewBox="0 0 {w} {h}" role="img" xmlns="http://www.w3.org/2000/svg">']
+    o = [f'<div class="cw"><svg viewBox="0 0 {w} {h}" role="img" class="{"wide" if wide else "half"}" xmlns="http://www.w3.org/2000/svg">']
     for k in range(5):   # grid + y labels
         v = bot + rng * k / 4
         y = Y(v)
@@ -18429,7 +18495,7 @@ def _rp_chart(labels: list, series: list, kind: str = "line", w: int = 760, h: i
             f"\n{s['name']}: {_rp_fmt(s['values'][i])}{suffix}" for s in series if s["values"][i] is not None)
         o.append(f'<rect x="{ml + step * i:.1f}" y="{mt}" width="{step:.1f}" height="{H}" fill="transparent">'
                  f'<title>{_rp_e(tip)}</title></rect>')
-    o.append("</svg>")
+    o.append("</svg></div>")
     return "".join(o)
 
 def _rp_donut(items: list, center: str, sub: str) -> str:
@@ -18514,7 +18580,7 @@ h2 small{font-weight:400;color:var(--muted);font-size:13px}
 .kpi .kl{color:var(--muted);font-size:13px;margin-bottom:6px}.kpi .kn{color:var(--muted);font-size:12px;margin-top:4px}
 .chip{display:inline-block;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:600}
 .chip.up{background:var(--upbg);color:var(--up)}.chip.down{background:var(--downbg);color:var(--down)}.chip.flat{background:var(--flatbg);color:var(--muted)}
-svg{width:100%;height:auto;display:block}.ax{fill:var(--muted);font-size:10.5px}.gl{}svg line.gl{stroke:var(--grid)}
+.cw{overflow-x:auto}svg{width:100%;height:auto;display:block}.cw svg.wide{min-width:520px}.cw svg.half{min-width:290px}.ax{fill:var(--muted);font-size:10.5px}.gl{}svg line.gl{stroke:var(--grid)}
 svg line.zero{stroke:var(--line);stroke-width:1.2}.donut{max-width:210px;margin:0 auto}.dc{fill:var(--ink);font-size:17px;font-weight:700}.ds{fill:var(--muted);font-size:9.5px}
 .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12.5px;color:var(--muted);margin:2px 0 6px}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
@@ -18610,7 +18676,7 @@ def build_html_report() -> str:
     regs = [x["reg"] or None for x in recent]
     note_days = f"last {len(recent)} days" if len(ser) > len(recent) else f"{len(recent)} day(s)"
     c_answers = _rp_chart(lab, [{"name": "Answers", "color": _RP_BLUE, "values": ans, "area": True},
-                                {"name": "7-day average", "color": _RP_AMBER, "values": ma, "dash": True}])
+                                {"name": "7-day average", "color": _RP_AMBER, "values": ma, "dash": True}], wide=True)
     c_acc = _rp_chart(lab, [{"name": "Accuracy", "color": _RP_GREEN, "values": acc, "area": True}], suffix="%")
     c_dau = _rp_chart(lab, [{"name": "Active users", "color": _RP_BLUE, "values": dau}], kind="bar")
     c_reg = _rp_chart(lab, [{"name": "Registered users", "color": "#8b5cf6", "values": regs, "area": True}])
@@ -18629,8 +18695,8 @@ def build_html_report() -> str:
     clr = lambda g: [(_RP_GREEN if (v or 0) >= 0 else _RP_RED) for v in g]   # noqa: E731
     c_growth = _rp_chart(wl[1:], [{"name": "Answers WoW", "color": _RP_BLUE, "values": [round(v, 1) if v is not None else None for v in g_ans[1:]],
                                     "colors": clr(g_ans[1:])}], kind="bar", suffix="%")
-    c_weekly = _rp_chart(wl, [{"name": "Answers", "color": _RP_BLUE, "values": w_ans, "area": True},
-                              {"name": "Active users", "color": _RP_AMBER, "values": w_act}], kind="line")
+    c_weekly = _rp_chart(wl, [{"name": "Answers", "color": _RP_BLUE, "values": w_ans, "area": True}])
+    c_wact = _rp_chart(wl, [{"name": "Active users", "color": _RP_AMBER, "values": w_act}], kind="bar")
     cagr = None
     if len(w_ans) >= 3 and w_ans[0] > 0 and w_ans[-1] > 0:
         cagr = ((w_ans[-1] / w_ans[0]) ** (1 / (len(w_ans) - 1)) - 1) * 100
@@ -18748,7 +18814,8 @@ def build_html_report() -> str:
         + _rp_card("Accuracy per day", c_acc, "share of answers that were correct")
         + _rp_card("Week-over-week growth in answers", c_growth,
                    (f"compound growth <b>{cagr:+.1f}%/week</b>" if cagr is not None else "needs 3+ finished weeks for a trend"))
-        + _rp_card("Weekly volume", c_weekly, "answers and active users per finished week", _rp_legend([("Answers", _RP_BLUE), ("Active users", _RP_AMBER)]), True)
+        + _rp_card("Weekly answers", c_weekly, "per finished week")
+        + _rp_card("Weekly active users", c_wact, "unique users per finished week")
         + _rp_card("Finished weeks (Fri→Thu)",
                    _rp_table(["Week of", "Answers", "WoW", "Acc", "Users", "WoW", "Lect", "Daily"], wk_rows), wide=True)
         + "</div>",
@@ -20310,7 +20377,7 @@ async def _flush_mistakes_bank_job(context: ContextTypes.DEFAULT_TYPE):
 # come back and finish; it's only meant to catch sessions that are,
 # realistically, abandoned for good.
 # ═══════════════════════════════════════════════════════════════
-STALE_SESSION_IDLE_SECONDS   = 6 * 3600  # 6 hours of no activity before a session is reclaimed
+STALE_SESSION_IDLE_SECONDS   = 3 * 24 * 3600  # 3 days of no activity before a session is reclaimed
 STALE_SESSION_CHECK_INTERVAL = 3600      # check once an hour
 
 async def _cleanup_stale_sessions_job(context: ContextTypes.DEFAULT_TYPE):
