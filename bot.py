@@ -245,7 +245,8 @@ SUPERADMIN_IDS = {ADMIN_ID, 815351746}   # 815351746 = the Creator's alt account
 # up in /mystats as "Admin (<scope>)" (vs. "The Creator" for ADMIN_ID).
 UNIVERSITY_ADMINS = {
     8311176123: "mnu",    # MNU admin — all MNU years; MNU-only broadcast/ban
-    1019997042: "mnu",    # MNU admin — all MNU years; MNU-only broadcast/ban
+    1019997042: "mnu",
+    1239173255: "mnu",   # MNU admin — all MNU years; MNU-only broadcast/ban
     # 333333333: "mnu",   # (example) another MNU admin
     # 444444444: "mfm",   # MFM admin — all MFM years; MFM-only broadcast/ban
 }
@@ -323,9 +324,14 @@ YEARS = {
         "modules": {
             "Endocrine":      ["Biochemistry", "Physiology", "Pathology", "Histology", "Pharmacology"],
             "Genitourinary":  ["Anatomy", "Physiology", "Histology", "Pathology", "Microbiology"],
-            # Single-subject modules (same pattern as MNU's Community Medicine):
-            # titles are "Community - Community Lecture 1: ..." / "Research - Research Lecture 1: ..."
-            "Community":      ["Community"],
+            # Community is organised by CHAPTER: Module -> Chapter -> Lecture. The chapters
+            # sit at the "subject" level, so every screen/admin tool that already works
+            # per-subject (lecture lists, /add_lecture, /edit_quiz, stats, Daily Quiz pool)
+            # handles them with no other changes. Lecture titles look like:
+            #   "Community - Chapter 3 Lecture 2: Name"
+            "Community":      [f"Chapter {n}" for n in range(1, 10)],
+            # Single-subject module (same pattern as MNU's Community Medicine):
+            # titles are "Research - Research Lecture 1: ..."
             "Research":       ["Research"],
         },
     },
@@ -408,7 +414,21 @@ SUBJECT_EMOJI = {
     "Psychology":           "💭",
     "Life Support Basics":  "🚑",
     "Community Medicine":   "🏘️",
+    **{f"Chapter {n}": "📘" for n in range(1, 10)},   # MFM Year 3 Community chapters
 }
+
+def _is_chapter_module(year: str, module: str) -> bool:
+    """True when a module's 'subjects' are really chapters (e.g. Y3 Community)."""
+    subs = YEARS.get(year, {}).get("modules", {}).get(module) or []
+    return bool(subs) and all(str(s).startswith("Chapter ") for s in subs)
+
+def subject_pick_prompt(year: str, module: str) -> str:
+    """'اختار الشابتر' for chapter modules, 'اختار المادة' for everything else."""
+    return "اختار الشابتر" if _is_chapter_module(year, module) else "اختار المادة"
+
+def subject_back_label(year: str, module: str) -> str:
+    """Label of the 'back to the subject/chapter list' button."""
+    return "🔙 رجوع للشابترز" if _is_chapter_module(year, module) else "🔙 رجوع للمواد"
 
 def subject_label(subject: str) -> str:
     """Subject string for display: name + its emoji, if it has one in
@@ -425,6 +445,8 @@ MODULE_EMOJI = {
     "CNS":         "⚡️",
     "CNS 1":       "⚡️",
     "CNS 2":       "⚡️⚡️",
+    "Community":   "🌍",
+    "Research":    "📋",
 }
 
 def module_label(module: str) -> str:
@@ -3800,7 +3822,7 @@ async def _resolve_mistake(context: ContextTypes.DEFAULT_TYPE, entry: dict, stat
             _mistakes_index_remove(entry)
             await save_mistakes_bank()
         except ValueError:
-            pass   # already removed by a concurrent lookup — harmless
+            pass   # already removed by a concurrent lookup — harmlesss
     return snap
 
 async def _resolve_mistakes(context: ContextTypes.DEFAULT_TYPE, entries: list) -> list:
@@ -10283,7 +10305,7 @@ def _qb_subject_view(year: str, mod_idx: int, mode: str):
         n = len(_qb_lectures(year, module, sub))
         rows.append([InlineKeyboardButton(f"{subject_label(sub)} ({n})", callback_data=f"qbsub:{mode}:{year}:{mod_idx}:{i}")])
     rows.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"qbyr:{mode}:{year}")])
-    return f"{_qb_title(mode)} — <b>{year_label(year)} — {html.escape(module)}</b> — اختار المادة:", InlineKeyboardMarkup(rows)
+    return f"{_qb_title(mode)} — <b>{year_label(year)} — {html.escape(module)}</b> — {subject_pick_prompt(year, module)}:", InlineKeyboardMarkup(rows)
 
 def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str, uid: int | None = None):
     modules = ready_modules(year)
@@ -10295,7 +10317,7 @@ def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str, uid: int
         return "⚠️ المادة دي مش موجودة دلوقتي.", None
     subject = subjects[subj_idx]
     lectures = _qb_lectures(year, module, subject)
-    back = InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"qbmod:{mode}:{year}:{mod_idx}")
+    back = InlineKeyboardButton(subject_back_label(year, module), callback_data=f"qbmod:{mode}:{year}:{mod_idx}")
     header = f"{_qb_title(mode)} — <b>{year_label(year)} — {html.escape(module)} - {html.escape(subject)}</b>"
     if not lectures:
         return header + "\n\n📭 لسه مفيش محاضرات هنا.", InlineKeyboardMarkup([[back]])
@@ -11470,7 +11492,7 @@ def _pick_subjects_view(st: dict, mi: int):
         all_on = all(k in st["sel"] for k in keys_all)
         rows.append([InlineKeyboardButton("⬜ شيل كل الموديول" if all_on else "☑️ اختار كل الموديول", callback_data=f"pk_am:{mi}")])
     rows.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data="pk_back")])
-    return _pick_head(st, closed, f"🎓 <b>{html.escape(module)}</b> — اختار المادة:"), InlineKeyboardMarkup(rows + _pick_footer(st, closed))
+    return _pick_head(st, closed, f"🎓 <b>{html.escape(module)}</b> — {subject_pick_prompt(st['year'], module)}:"), InlineKeyboardMarkup(rows + _pick_footer(st, closed))
 
 def _pick_lectures_view(st: dict, mi: int, si: int):
     year, closed = st["year"], _pick_closed_mids(st["year"])
@@ -11494,7 +11516,7 @@ def _pick_lectures_view(st: dict, mi: int, si: int):
     if names:
         all_on = all(k in st["sel"] for k in names)
         rows.append([InlineKeyboardButton("⬜ شيل الكل" if all_on else "☑️ اختار الكل", callback_data=f"pk_as:{mi}:{si}")])
-    rows.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"pk_m:{mi}")])
+    rows.append([InlineKeyboardButton(subject_back_label(year, module), callback_data=f"pk_m:{mi}")])
     where = f"🎓 <b>{html.escape(module)} - {html.escape(subject)}</b>"
     if not names:
         where += "\n\n📭 لسه مفيش محاضرات هنا."
@@ -15872,7 +15894,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"yr:{year}")])
         await query.edit_message_text(
-            f"🎓 <b>{year_label(year)} — {module}</b> — اختار المادة:", parse_mode=ParseMode.HTML,
+            f"🎓 <b>{year_label(year)} — {module}</b> — {subject_pick_prompt(year, module)}:", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
@@ -15909,7 +15931,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return InlineKeyboardButton(f"✅ {label}", callback_data=cb)
             return _event_green_button(label, cb)
         buttons = [[_lecture_btn(i, name)] for i, name in enumerate(names)]
-        buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"module:{year}:{mod_idx}")])
+        buttons.append([InlineKeyboardButton(subject_back_label(year, module), callback_data=f"module:{year}:{mod_idx}")])
         header = f"🎓 <b>{year_label(year)} — {module} - {subject}</b>"
         if not names:
             header += "\n\n📭 لسه مفيش محاضرات هنا."
@@ -16217,7 +16239,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"alyr:{year}")])
         await query.edit_message_text(
-            f"📚 {module} — اختار المادة:", reply_markup=InlineKeyboardMarkup(buttons)
+            f"📚 {module} — {subject_pick_prompt(year, module)}:", reply_markup=InlineKeyboardMarkup(buttons)
         )
         return
 
@@ -16342,7 +16364,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton("🔎 Search in this module", callback_data=f"eqsrch:{year}:{mod_idx}")])
         buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"eqyr:{year}")])
         await query.edit_message_text(
-            f"✏️ <b>{year_label(year)} — {module}</b> — اختار المادة:", parse_mode=ParseMode.HTML,
+            f"✏️ <b>{year_label(year)} — {module}</b> — {subject_pick_prompt(year, module)}:", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
@@ -16371,7 +16393,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )]
             for i, name in enumerate(names)
         ]
-        buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"eqmodule:{year}:{mod_idx}")])
+        buttons.append([InlineKeyboardButton(subject_back_label(year, module), callback_data=f"eqmodule:{year}:{mod_idx}")])
         header = f"✏️ <b>{year_label(year)} — {module} - {subject}</b>"
         if not names:
             header += "\n\n📭 لسه مفيش محاضرات هنا."
