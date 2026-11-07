@@ -5,6 +5,7 @@ import random
 import json
 import os
 import time
+import sys
 import copy
 import asyncio
 import functools
@@ -13,6 +14,7 @@ import unicodedata
 import tempfile
 import zipfile
 import traceback
+import gc
 import gzip
 import hashlib
 import secrets
@@ -1157,7 +1159,7 @@ _analytics_backup_msg_id: int | None = None
 # like lecture-answer XP can fire dozens of times a minute and would
 # otherwise risk hitting Telegram's rate limits.
 _last_analytics_backup_at: float = 0.0
-ANALYTICS_BACKUP_MIN_INTERVAL = 30  # seconds
+ANALYTICS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))  # seconds
 
 # ── Local-disk debounce for the hot answer path ──────────────────
 # save_analytics() itself (deepcopy + atomic write of the WHOLE file, every
@@ -1236,7 +1238,7 @@ STATS_SOURCE_LABELS = {"lecture": "Lectures", "daily": "Daily", "mistakes": "Mis
 _STATS_SUM_KEYS = ("answered", "correct", "lectures", "daily_done", "daily_correct",
                    "daily_total", "xp", "achievements", "errors",
                    "custom_runs", "custom_questions", "custom_correct", "custom_time",
-                   "qz", "qz_fail")
+                   "qz", "qz_fail", "egress_bytes")
 
 def _blank_stats_day() -> dict:
     return {
@@ -1248,6 +1250,7 @@ def _blank_stats_day() -> dict:
         "daily_done": 0, "daily_correct": 0, "daily_total": 0,
         "custom_runs": 0, "custom_questions": 0, "custom_correct": 0, "custom_time": 0.0,
         "qz": 0, "qz_fail": 0,   # Quizzy (Gemini) requests sent / failed
+        "egress_bytes": 0,       # bytes of channel-backup uploads
         "xp": 0, "achievements": 0, "errors": 0, "time_spent": 0.0,
         "users": [], "active": 0, "users_total": 0,
     }
@@ -1454,7 +1457,7 @@ async def backup_stats_history_to_channel(context, force: bool = False) -> None:
     if not force and now - _stats_last_backup_at < STATS_HISTORY_BACKUP_MIN_INTERVAL:
         return
     _stats_last_backup_at = now
-    if await backup_storage_to_channel(context):
+    if await backup_storage_to_channel(context, force=force):
         _stats_backup_pending = False
 
 def _get_entry(user_id: int) -> dict:
@@ -2087,11 +2090,13 @@ def _uni_of_year(year) -> str:
 def _build_university_zip(base: str, parts: dict) -> bytes:
     """parts = {"mfm": obj, "mnu": obj} -> zip bytes containing
     <base>_mfm.json and <base>_mnu.json (both always present, even if
-    one is empty, so a restore can tell "no MNU data" from "broken zip")."""
+    one is empty, so a restore can tell "no MNU data" from "broken zip").
+    Compact JSON + fixed zip timestamps: smaller uploads, and identical data
+    yields identical bytes (so an unchanged backup can be skipped)."""
     buf = BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for uni in UNIVERSITY_ORDER:
-            zf.writestr(f"{base}_{uni}.json", json.dumps(parts[uni], indent=2))
+            _zip_member(zf, f"{base}_{uni}.json", json.dumps(parts[uni], separators=(",", ":"), ensure_ascii=False))
     return buf.getvalue()
 
 def _read_university_backup(raw: bytes, base: str) -> list:
@@ -2140,7 +2145,7 @@ def _split_mistakes_by_university() -> dict:
         parts[_uni_of_year(m.get("year") if isinstance(m, dict) else None)].append(m)
     return parts
 
-async def backup_analytics_to_channel(context):
+async def backup_analytics_to_channel(context, force: bool = False):
     global _analytics_backup_msg_id, _last_analytics_backup_at
     if not ANALYTICS_GROUP_ID:
         return
@@ -2148,12 +2153,16 @@ async def backup_analytics_to_channel(context):
         print("ANALYTICS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return
     now = time.monotonic()
-    if now - _last_analytics_backup_at < ANALYTICS_BACKUP_MIN_INTERVAL:
+    force = force or _backup_take_force("analytics")
+    if not force and now - _last_analytics_backup_at < ANALYTICS_BACKUP_MIN_INTERVAL:
+        _backup_defer("analytics", backup_analytics_to_channel)
         return   # backed up recently enough — local save_analytics() already has the latest data
     _last_analytics_backup_at = now
     data = _build_university_zip("analytics", _split_user_dict_by_university(ANALYTICS))
+    if not force and _backup_is_duplicate("analytics", data):
+        return   # nothing changed since the last upload
     try:
-        sent = await context.bot.send_document(
+        sent = await _send_backup_doc(context.bot, "analytics", data,
             chat_id=ANALYTICS_GROUP_ID,
             document=InputFile(BytesIO(data), filename=_backup_filename("analytics.zip")),
             caption=ANALYTICS_BACKUP_MARKER,
@@ -2291,7 +2300,7 @@ _settings_backup_msg_id: int | None = None
 
 # Channel mirror debounce — separate from the local-disk debounce below.
 _last_settings_backup_at: float = 0.0
-SETTINGS_BACKUP_MIN_INTERVAL = 30  # seconds
+SETTINGS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))  # seconds
 
 # ── Local-disk debounce for the hot settings paths ────────────────
 # save_settings() itself (deepcopy + atomic write of EVERY user's settings,
@@ -2596,7 +2605,7 @@ def year_class_keyboard(callback_prefix: str, university: str | None = None) -> 
         for yc in (university_years(university) if university in UNIVERSITIES else YEAR_ORDER)
     ])
 
-async def backup_settings_to_channel(context):
+async def backup_settings_to_channel(context, force: bool = False):
     global _settings_backup_msg_id, _last_settings_backup_at
     if not SETTINGS_GROUP_ID:
         return
@@ -2604,12 +2613,16 @@ async def backup_settings_to_channel(context):
         print("SETTINGS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return
     now = time.monotonic()
-    if now - _last_settings_backup_at < SETTINGS_BACKUP_MIN_INTERVAL:
+    force = force or _backup_take_force("settings")
+    if not force and now - _last_settings_backup_at < SETTINGS_BACKUP_MIN_INTERVAL:
+        _backup_defer("settings", backup_settings_to_channel)
         return   # backed up recently enough — local save_settings() already has the latest data
     _last_settings_backup_at = now
     data = _build_university_zip("settings", _split_user_dict_by_university(SETTINGS))
+    if not force and _backup_is_duplicate("settings", data):
+        return
     try:
-        sent = await context.bot.send_document(
+        sent = await _send_backup_doc(context.bot, "settings", data,
             chat_id=SETTINGS_GROUP_ID,
             document=InputFile(BytesIO(data), filename=_backup_filename("settings.zip")),
             caption=SETTINGS_BACKUP_MARKER,
@@ -2700,7 +2713,7 @@ _lecture_results_backup_msg_id: int | None = None
 # Same debounce pattern as analytics/settings — local save always
 # happens immediately; only the channel mirror is throttled.
 _last_lecture_results_backup_at: float = 0.0
-LECTURE_RESULTS_BACKUP_MIN_INTERVAL = 30  # seconds
+LECTURE_RESULTS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))  # seconds
 
 def _lr_key(year: str, lecture_key: str) -> str:
     """LECTURE_RESULTS is one shared file across all years — prefix with
@@ -2817,7 +2830,9 @@ async def backup_lecture_results_to_channel(context, force: bool = False):
         print("LECTURE RESULTS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return
     now = time.monotonic()
+    force = force or _backup_take_force("lecture_results")
     if not force and now - _last_lecture_results_backup_at < LECTURE_RESULTS_BACKUP_MIN_INTERVAL:
+        _backup_defer("lecture_results", backup_lecture_results_to_channel)
         return   # backed up recently enough — local save_lecture_results() already has the latest data
     _last_lecture_results_backup_at = now
     _daily_lb_backup_pending = False   # this upload carries the current daily leaderboard (re-armed below on failure)
@@ -2827,11 +2842,13 @@ async def backup_lecture_results_to_channel(context, force: bool = False):
     # older code reading this zip simply ignores it.
     _zbuf = BytesIO(data)
     with zipfile.ZipFile(_zbuf, "a", zipfile.ZIP_DEFLATED) as _zf:
-        _zf.writestr(DAILY_LEADERBOARD_ZIP_MEMBER,
-                     json.dumps(_daily_leaderboard_payload(), indent=2, ensure_ascii=False))
+        _zip_member(_zf, DAILY_LEADERBOARD_ZIP_MEMBER,
+                    json.dumps(_daily_leaderboard_payload(), separators=(",", ":"), ensure_ascii=False))
     data = _zbuf.getvalue()
+    if not force and _backup_is_duplicate("lecture_results", data):
+        return
     try:
-        sent = await context.bot.send_document(
+        sent = await _send_backup_doc(context.bot, "lecture_results", data,
             chat_id=LECTURE_RESULTS_GROUP_ID,
             document=InputFile(BytesIO(data), filename=_backup_filename("lecture_results.zip")),
             caption=LECTURE_RESULTS_BACKUP_MARKER,
@@ -3019,7 +3036,7 @@ _mistakes_bank_backup_msg_id: int | None = None
 
 # Channel mirror debounce — separate from the local-disk debounce below.
 _last_mistakes_bank_backup_at: float = 0.0
-MISTAKES_BANK_BACKUP_MIN_INTERVAL = 30  # seconds
+MISTAKES_BANK_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))  # seconds
 
 # ── Local-disk debounce for the hot mistakes-bank path ─────────────
 # save_mistakes_bank() (deepcopy + atomic write of EVERY user's mistakes,
@@ -3076,7 +3093,7 @@ async def record_mistake(user_id: int, mid: int, year: str, module: str, subject
     _mark_mistakes_bank_dirty()
     return True
 
-async def backup_mistakes_bank_to_channel(context):
+async def backup_mistakes_bank_to_channel(context, force: bool = False):
     global _mistakes_bank_backup_msg_id, _last_mistakes_bank_backup_at
     if not MISTAKES_BANK_GROUP_ID:
         return
@@ -3084,12 +3101,16 @@ async def backup_mistakes_bank_to_channel(context):
         print("MISTAKES BANK BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return
     now = time.monotonic()
-    if now - _last_mistakes_bank_backup_at < MISTAKES_BANK_BACKUP_MIN_INTERVAL:
+    force = force or _backup_take_force("mistakes_bank")
+    if not force and now - _last_mistakes_bank_backup_at < MISTAKES_BANK_BACKUP_MIN_INTERVAL:
+        _backup_defer("mistakes_bank", backup_mistakes_bank_to_channel)
         return   # backed up recently enough — local save_mistakes_bank() already has the latest data
     _last_mistakes_bank_backup_at = now
     data = _build_university_zip("mistakes_bank", _split_mistakes_by_university())
+    if not force and _backup_is_duplicate("mistakes_bank", data):
+        return
     try:
-        sent = await context.bot.send_document(
+        sent = await _send_backup_doc(context.bot, "mistakes_bank", data,
             chat_id=MISTAKES_BANK_GROUP_ID,
             document=InputFile(BytesIO(data), filename=_backup_filename("mistakes_bank.zip")),
             caption=MISTAKES_BANK_BACKUP_MARKER,
@@ -4957,7 +4978,10 @@ async def save_storage_backup_state():
 
 STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
 
-async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE) -> bool:
+STORAGE_BACKUP_MIN_INTERVAL = int(os.environ.get("STORAGE_BACKUP_MIN_INTERVAL", "300"))
+_last_storage_backup_at: float = -1e9
+
+async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> bool:
     """Uploads + pins the Storage backup (users + storage index + analytics
     history, zipped). Returns True if the document was sent."""
     if not STORAGE_GROUP_ID:
@@ -4965,23 +4989,32 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not RESTORE_OK["storage"]:
         print("STORAGE BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return False
+    global _last_storage_backup_at
+    now = time.monotonic()
+    force = force or _backup_take_force("storage")
+    if not force and now - _last_storage_backup_at < STORAGE_BACKUP_MIN_INTERVAL:
+        _backup_defer("storage", backup_storage_to_channel)
+        return False
+    _last_storage_backup_at = now
     payload = {"users": list(USERS), "storage_index": STORAGE_INDEX}
     data    = json.dumps(payload).encode("utf-8")
     # The analytics history (stats_history.json) travels in the same pinned
     # document — a zip of the two files — so it needs no group of its own.
     _zbuf = BytesIO()
-    with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(STORAGE_BACKUP_JSON_NAME, data)
-        zf.writestr(STATS_HISTORY_FILE, json.dumps(STATS_HISTORY, ensure_ascii=False))
-        zf.writestr(BROADCAST_LOG_FILE, json.dumps(BROADCAST_LOG, ensure_ascii=False))
+    with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        _zip_member(zf, STORAGE_BACKUP_JSON_NAME, data.decode("utf-8"))
+        _zip_member(zf, STATS_HISTORY_FILE, json.dumps(STATS_HISTORY, separators=(",", ":"), ensure_ascii=False))
+        _zip_member(zf, BROADCAST_LOG_FILE, json.dumps(BROADCAST_LOG, separators=(",", ":"), ensure_ascii=False))
     data = _zbuf.getvalue()
+    if not force and _backup_is_duplicate("storage", data):
+        return True   # identical to what's already pinned
     # A pinned document instead of a pinned text message: Bot API caps
     # documents at 50MB vs ~4KB for a text message — effectively removes
     # the size ceiling for any realistic amount of data this bot handles.
     filename = _backup_filename("quizician_storage_backup.zip")
 
     try:
-        sent = await context.bot.send_document(
+        sent = await _send_backup_doc(context.bot, "storage", data,
             chat_id=STORAGE_GROUP_ID,
             document=InputFile(BytesIO(data), filename=filename),
             caption=STORAGE_BACKUP_MARKER,
@@ -5259,7 +5292,7 @@ async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE, year: str):
     filename = _backup_filename(f"Quizician_Quiz_Backup_{year.upper()}.json")
 
     try:
-        sent = await context.bot.send_document(
+        sent = await _send_backup_doc(context.bot, f"quiz_{year}", data,
             chat_id=channel_id,
             document=InputFile(BytesIO(data), filename=filename),
             caption=QUIZ_BACKUP_MARKER,
@@ -5366,7 +5399,7 @@ MAX_PAUSED_LECTURES = 8
 # The bounded list is enough to recognize later ❤️ reactions without letting
 # old questions grow memory usage forever.
 BOOKMARKABLE_QUESTION_MESSAGES = {}   # user_id -> [message_id, ...]
-BOOKMARKABLE_QUESTION_LIMIT = 500
+BOOKMARKABLE_QUESTION_LIMIT = int(os.environ.get("BOOKMARKABLE_LIMIT", "150"))   # was 500: each remembered question costs memory per student
 # user_id -> message_id -> metadata used by bookmark/report reactions.
 # Kept bounded by the same 500-question window as BOOKMARKABLE_QUESTION_MESSAGES.
 QUESTION_MESSAGE_META = {}
@@ -5648,6 +5681,7 @@ BROADCAST_DRAFTS            = {}    # admin_id -> {"audience": "all"|"y1"|"y2"|"
                                     #   the admin sent/replied to; broadcast via copy_message (see _deliver_broadcast_item)
 AWAITING_BROADCAST_MESSAGE  = {}    # admin_id -> True, while waiting for the next text message to become the broadcast body
 AWAITING_BROADCAST_BUTTON   = {}    # admin_id -> True, while waiting for the next text message to become the broadcast's button label
+AWAITING_BROADCAST_SCHEDULE = {}    # admin_id -> True, while waiting for the typed send time of a scheduled broadcast
 BROADCAST_BUTTON_MAX_CHARS  = 40
 
 # ── /edit_quiz support ────────────────────────────────────────────
@@ -5813,9 +5847,9 @@ REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id",
 
 _report_threads_backup_msg_id: int | None = None
 _last_report_threads_backup_at: float = 0.0
-REPORT_THREADS_BACKUP_MIN_INTERVAL = 30   # seconds — same debounce as mistakes bank; local save is never throttled
+REPORT_THREADS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))   # seconds — same debounce as mistakes bank; local save is never throttled
 
-async def backup_report_threads_to_channel(context):
+async def backup_report_threads_to_channel(context, force: bool = False):
     global _report_threads_backup_msg_id, _last_report_threads_backup_at
     if not REPORT_ISSUE_GROUP_ID:
         return
@@ -5823,12 +5857,16 @@ async def backup_report_threads_to_channel(context):
         print("REPORT THREADS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return
     now = time.monotonic()
-    if now - _last_report_threads_backup_at < REPORT_THREADS_BACKUP_MIN_INTERVAL:
+    force = force or _backup_take_force("report_threads")
+    if not force and now - _last_report_threads_backup_at < REPORT_THREADS_BACKUP_MIN_INTERVAL:
+        _backup_defer("report_threads", backup_report_threads_to_channel)
         return   # backed up recently enough — local save_report_threads() already has the latest data
     _last_report_threads_backup_at = now
-    data = json.dumps({str(k): v for k, v in REPORT_THREADS.items()}, indent=2, ensure_ascii=False).encode("utf-8")
+    data = json.dumps({str(k): v for k, v in REPORT_THREADS.items()}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if not force and _backup_is_duplicate("report_threads", data):
+        return
     try:
-        sent = await context.bot.send_document(
+        sent = await _send_backup_doc(context.bot, "report_threads", data,
             chat_id=REPORT_ISSUE_GROUP_ID,
             document=InputFile(BytesIO(data), filename=_backup_filename("report_threads.json")),
             caption=REPORT_THREADS_BACKUP_MARKER,
@@ -5920,7 +5958,7 @@ SESSIONS_FILE                = "sessions.json"
 # question (or the resync below runs). See _resync_restored_session.
 _RESTORED_SESSIONS: set = set()
 SESSIONS_BACKUP_MARKER       = "🧩 QUIZICIAN_SESSIONS_BACKUP"
-SESSIONS_BACKUP_MIN_INTERVAL = 30          # seconds
+SESSIONS_BACKUP_MIN_INTERVAL = int(os.environ.get("SESSIONS_BACKUP_INTERVAL", "300"))          # seconds
 SESSIONS_BACKUP_WARN_BYTES   = 1_500_000   # log a warning when one upload is bigger than this (compressed)
 SESSIONS_MAX_AGE_SECONDS     = 3 * 24 * 3600   # 3 days — must not be shorter than STALE_SESSION_IDLE_SECONDS, or a
                                                    # restore / the stale sweep would kill sessions the idle rule still allows
@@ -6227,7 +6265,7 @@ async def backup_sessions_to_channel(context, force: bool = False) -> None:
         print(f"SESSIONS BACKUP LARGE — {len(data) / 1e6:.1f} MB compressed "
               f"({len(as_json) / 1e6:.1f} MB raw, {len(LECTURE_SESSIONS)} lecture / {len(DAILY_QUIZ_SESSIONS)} daily session(s)).")
     try:
-        sent = await context.bot.send_document(
+        sent = await _send_backup_doc(context.bot, "sessions", data,
             chat_id=SESSIONS_GROUP_ID,
             document=InputFile(BytesIO(data), filename=_backup_filename("sessions.gz")),
             caption=SESSIONS_BACKUP_MARKER,
@@ -13797,6 +13835,36 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
 
+    # ── AWAITING BROADCAST SEND TIME (/broadcast composer → ⏰ Schedule) ──
+    if AWAITING_BROADCAST_SCHEDULE.pop(real_uid, None):
+        if not can_broadcast(update):
+            return
+        when = _parse_schedule_time(update.message.text)
+        now_c = datetime.now(DAILY_QUIZ_TZ)
+        if when is None or when < now_c + timedelta(minutes=1) or when > now_c + timedelta(days=BCAST_SCHEDULE_MAX_DAYS):
+            AWAITING_BROADCAST_SCHEDULE[real_uid] = True
+            await update.message.reply_text(
+                "⚠️ الوقت مش مفهوم أو مش في المستقبل (أقل حاجة بعد دقيقة، وأقصاها "
+                f"{BCAST_SCHEDULE_MAX_DAYS} يوم). جرّب: <code>18:30</code> أو <code>2026-11-10 18:30</code> أو <code>+2h</code> (أو /cancel).",
+                parse_mode=ParseMode.HTML)
+            return
+        draft = BROADCAST_DRAFTS.get(real_uid)
+        if not draft or not (draft.get("text") or draft.get("media") or draft.get("poll")):
+            await update.message.reply_text("⚠️ لسه مفيش رسالة — ابدأ من /broadcast.")
+            return
+        if draft.get("audience") not in _broadcast_audiences_for(real_uid):
+            draft["audience"] = _broadcast_default_audience(real_uid)
+        sid = _bcast_schedule_add(real_uid, draft, when.timestamp())
+        BROADCAST_DRAFTS.pop(real_uid, None)
+        await _broadcast_log_flush()
+        await update.message.reply_text(
+            f"⏰ <b>البث #{sid} اتجدول</b>\n\n📅 {_fmt_schedule_time(when.timestamp())} (القاهرة)\n"
+            f"👥 {BROADCAST_AUDIENCE_LABELS.get(draft['audience'], draft['audience'])}\n\n"
+            "الجمهور بيتحسب وقت الإرسال، فأي حد يدخل قبلها هيوصله. "
+            "تقدر تشوف أو تلغي من /scheduled.",
+            parse_mode=ParseMode.HTML)
+        return
+
     # ── AWAITING BROADCAST BUTTON LABEL (/broadcast composer → 🔘 Set Button) ──
     if AWAITING_BROADCAST_BUTTON.pop(real_uid, None):
         if not can_broadcast(update):
@@ -15242,7 +15310,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # section for _broadcast_composer_view / _send_broadcast.
     if query.data.startswith("bc") and query.data.split(":", 1)[0] in (
         "bcaud", "bcmsg", "bcmsgcancel", "bcpreview", "bcsend", "bccancel", "bcbtn", "bcbtnclear", "bcbtncancel",
-        "bcstop", "bcdel", "bcdelok", "bcdelno"
+        "bcstop", "bcdel", "bcdelok", "bcdelno", "bcsched", "bcschedcancel", "bcsl", "bcsx", "bcback"
     ):
         if not can_broadcast(update):
             await query.answer("🚫 للأدمن فقط", show_alert=True)
@@ -15359,6 +15427,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             await query.edit_message_text(f"🗑 بيمسح Broadcast #{bid}…")
             _spawn_bg(_delete_broadcast(context, query.message, bid, query.from_user))
+            return
+
+        if query.data in ("bcback", "bcschedcancel"):
+            AWAITING_BROADCAST_SCHEDULE.pop(user_id, None)
+            body, markup = _broadcast_composer_view(user_id)
+            await query.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        if query.data == "bcsl":
+            body, markup = _bcast_scheduled_view(user_id)
+            await query.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        if query.data.startswith("bcsx:"):
+            _sid = query.data.split(":", 1)[1]
+            _it = BROADCAST_LOG["scheduled"].get(_sid)
+            if _it is not None and _bcast_owner_ok(_it, user_id):
+                BROADCAST_LOG["scheduled"].pop(_sid, None)
+                _bcast_mark_dirty()
+                await _broadcast_log_flush()
+            body, markup = _bcast_scheduled_view(user_id)
+            await query.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        if query.data == "bcsched":
+            draft = BROADCAST_DRAFTS.get(user_id)
+            if not draft or not (draft.get("text") or draft.get("media") or draft.get("poll")):
+                await query.edit_message_text("⚠️ لسه مفيش رسالة — اكتب الرسالة الأول.")
+                return
+            AWAITING_BROADCAST_SCHEDULE[user_id] = True
+            await query.edit_message_text(
+                "⏰ <b>ابعت وقت الإرسال</b> (بتوقيت القاهرة):\n\n"
+                "• <code>18:30</code> — النهارده (أو بكرة لو الوقت عدى)\n"
+                "• <code>2026-11-10 18:30</code> أو <code>10/11/2026 18:30</code>\n"
+                "• <code>+2h</code> أو <code>+1h30m</code> أو <code>+45m</code> — بعد مدة من دلوقتي\n\n"
+                f"أقصى مدة {BCAST_SCHEDULE_MAX_DAYS} يوم.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="bcschedcancel")]]),
+            )
             return
 
         if query.data == "bccancel":
@@ -18851,6 +18958,9 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("/previewtxt — text dump of every static message a normal user can see")
         lines.append("/health")
         lines.append("/all_nicknames — every registered nickname, in pages")
+        lines.append("/scheduled — view or cancel scheduled broadcasts")
+        lines.append("/memory — Creator: what is using the bot's memory")
+        lines.append("/packages — Creator: installed Python packages, what each is for, which are loaded")
         lines.append("/stats — permanent daily/weekly analytics history — Creator only")
         lines.append("/report — full HTML analytics report with charts — Creator only")
         lines.append("/restore")
@@ -20085,6 +20195,257 @@ async def all_nicknames_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
+# ═══════════════════════════════════════════════════════════════
+# RAILWAY EFFICIENCY — fewer/lighter channel backups (network egress) and a
+# leaner process (memory). Everything is tunable from Railway variables:
+#   BACKUP_MIN_INTERVAL        seconds between uploads of each data backup (default 300)
+#   SESSIONS_BACKUP_INTERVAL   same for the live-sessions backup (default 300 — a restored session re-sends its expected question, so a slightly stale backup self-heals)
+#   STORAGE_BACKUP_MIN_INTERVAL users/storage/stats zip (default 300)
+#   BACKUP_RECONCILE_INTERVAL  how often pins are checked (default 300)
+#   BOOKMARKABLE_LIMIT         past questions remembered per student for 🔖 reactions (default 150)
+# A backup that is skipped because it is "too soon" is remembered and retried by
+# _backup_trailing_job, so the LAST change is never left un-backed-up; identical
+# content is never uploaded twice; and a clean shutdown force-uploads everything.
+# ═══════════════════════════════════════════════════════════════
+BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))
+
+try:   # glibc only: fewer malloc arenas = much less RSS growth when worker threads (to_thread) allocate
+    import ctypes, ctypes.util
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    _libc.mallopt(-8, 2)   # M_ARENA_MAX
+except Exception:
+    _libc = None
+
+def _trim_memory() -> None:
+    """Hands freed heap pages back to the OS (Python rarely does this on its own)."""
+    try:
+        if _libc is not None:
+            _libc.malloc_trim(0)
+    except Exception:
+        pass
+
+def _rss_mb() -> float:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+_BACKUP_LAST_HASH: dict = {}      # backup key -> sha1 of the last bytes actually uploaded
+_BACKUP_PENDING: dict = {}        # backup key -> backup function whose call was throttled (retried by the trailing job)
+_BACKUP_FORCE_KEYS: set = set()   # keys the reconcile job wants uploaded regardless of throttle/duplicate checks
+_EGRESS_TODAY: dict = {"day": "", "by": {}}   # label -> bytes uploaded today (process lifetime; also persisted as stats "egress_bytes")
+
+def _backup_defer(key: str, fn) -> None:
+    _BACKUP_PENDING[key] = fn
+
+def _backup_take_force(key: str) -> bool:
+    if key in _BACKUP_FORCE_KEYS:
+        _BACKUP_FORCE_KEYS.discard(key)
+        _BACKUP_LAST_HASH.pop(key, None)
+        return True
+    return False
+
+def _backup_is_duplicate(key: str, data: bytes) -> bool:
+    return _BACKUP_LAST_HASH.get(key) == hashlib.sha1(data).hexdigest()
+
+async def _send_backup_doc(bot, key: str, data: bytes, **kwargs):
+    """send_document for a backup, plus: remember what was sent (duplicate check) and count the bytes (/health)."""
+    sent = await bot.send_document(**kwargs)
+    _BACKUP_LAST_HASH[key] = hashlib.sha1(data).hexdigest()
+    today = datetime.now(DAILY_QUIZ_TZ).strftime("%Y-%m-%d")
+    if _EGRESS_TODAY["day"] != today:
+        _EGRESS_TODAY["day"], _EGRESS_TODAY["by"] = today, {}
+    _EGRESS_TODAY["by"][key] = _EGRESS_TODAY["by"].get(key, 0) + len(data)
+    _stat_add("egress_bytes", len(data))
+    return sent
+
+def _zip_member(zf, name: str, text: str) -> None:
+    """Fixed timestamp => identical content gives byte-identical zips (so duplicates can be detected)."""
+    zi = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    zf.writestr(zi, text)
+
+async def _backup_trailing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Retries backups that were skipped as 'too soon' — each call re-checks its own throttle."""
+    for key, fn in list(_BACKUP_PENDING.items()):
+        _BACKUP_PENDING.pop(key, None)
+        try:
+            await fn(context)
+        except Exception as e:
+            print(f"BACKUP TRAILING — {key} failed: {e}")
+
+async def _prune_question_meta_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drops the remembered-questions cache of students who haven't been active since yesterday."""
+    from datetime import timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    dropped = 0
+    for uid in list(BOOKMARKABLE_QUESTION_MESSAGES):
+        last = (ANALYTICS.get(str(uid)) or {}).get("last_active_date")
+        if last is None or last < cutoff:
+            BOOKMARKABLE_QUESTION_MESSAGES.pop(uid, None)
+            QUESTION_MESSAGE_META.pop(uid, None)
+            dropped += 1
+    for uid in list(QUESTION_MESSAGE_META):
+        if uid not in BOOKMARKABLE_QUESTION_MESSAGES:
+            QUESTION_MESSAGE_META.pop(uid, None)
+    if dropped:
+        print(f"MEMORY — pruned remembered questions of {dropped} inactive student(s).")
+
+async def _memory_trim_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = time.time()
+    for u, h in list(_QZ_HISTORY.items()):
+        if now - h["t"] > QZ_HISTORY_TTL:
+            _QZ_HISTORY.pop(u, None)
+    today = _qz_today()
+    for u, v in list(_QZ_USAGE.items()):
+        if v["day"] != today:
+            _QZ_USAGE.pop(u, None)
+    gc.collect()
+    _trim_memory()
+
+def _deep_sizeof(root, limit: int = 4_000_000):
+    seen, stack, total, n = set(), [root], 0, 0
+    while stack and n < limit:
+        o = stack.pop()
+        if id(o) in seen:
+            continue
+        seen.add(id(o))
+        n += 1
+        try:
+            total += sys.getsizeof(o)
+        except Exception:
+            continue
+        if isinstance(o, dict):
+            stack.extend(o.keys())
+            stack.extend(o.values())
+        elif isinstance(o, (list, tuple, set, frozenset)):
+            stack.extend(o)
+    return total, n >= limit
+
+def _memory_report() -> str:
+    rows = []
+    for name, val in list(globals().items()):
+        if isinstance(val, (dict, list, set)) and len(val) > 0 and not name.startswith("__"):
+            size, capped = _deep_sizeof(val)
+            rows.append((size, name, len(val), capped))
+    rows.sort(reverse=True)
+    total = sum(r[0] for r in rows)
+    lines = [f"🧠 <b>Memory</b>\n\nRSS now: <b>{_rss_mb():.0f} MB</b> · tracked structures: <b>{total / 1e6:.0f} MB</b>\n"]
+    for size, name, n, capped in rows[:15]:
+        lines.append(f"• <code>{html.escape(name)}</code> — {size / 1e6:.1f} MB{'+' if capped else ''} ({n:,} items)")
+    lines.append("\n<i>RSS above the tracked total = Python/libraries + free heap. Sizes are estimates.</i>")
+    return "\n".join(lines)
+
+# ═══════════════════════════════════════════════════════════════
+# /packages — Creator only. Every installed Python package (site-packages),
+# what it is for, its size on disk, which package needs it, and whether it is
+# actually imported into the running bot (only imported packages cost RAM; the
+# rest only cost image size / build time).
+# ═══════════════════════════════════════════════════════════════
+_PKG_NOTES = {
+    "python-telegram-bot": "the Telegram framework the whole bot is built on",
+    "httpx": "HTTP client (PTB's transport; also used directly for the Gemini calls)",
+    "httpcore": "low-level engine under httpx",
+    "h11": "HTTP/1.1 protocol for httpcore",
+    "h2": "HTTP/2 support for httpx (only with the http2 extra)",
+    "hpack": "HTTP/2 header compression (needed by h2)",
+    "hyperframe": "HTTP/2 framing (needed by h2)",
+    "anyio": "async I/O layer used by httpx/httpcore",
+    "sniffio": "detects which async library is running (anyio)",
+    "idna": "international domain names (httpx)",
+    "certifi": "CA certificates for HTTPS",
+    "aiolimiter": "rate limiter behind AIORateLimiter (30 msg/s flood control)",
+    "apscheduler": "scheduler behind job_queue (all the run_repeating / run_daily jobs)",
+    "tzlocal": "local time zone lookup for APScheduler",
+    "pytz": "older time zone database (APScheduler 3.x)",
+    "six": "py2/3 compatibility helper (APScheduler 3.x)",
+    "tzdata": "IANA time zone data (needed for ZoneInfo('Africa/Cairo') on slim images)",
+    "cryptography": "Telegram Passport decryption — this bot doesn't use Passport",
+    "cffi": "C bridge needed by cryptography",
+    "pycparser": "C parser needed by cffi",
+    "tornado": "web server for webhooks — this bot uses polling, not webhooks",
+    "cachetools": "cache for arbitrary callback data — not used here",
+    "socksio": "SOCKS proxy support for httpx — not used here",
+    "typing-extensions": "typing backports",
+    "exceptiongroup": "exception groups backport for older Python (anyio)",
+    "pip": "installer (tooling)", "setuptools": "build tooling", "wheel": "build tooling",
+}
+
+def _norm_dist(n: str) -> str:
+    return re.sub(r"[-_.]+", "-", n or "").lower()
+
+def _packages_report() -> list:
+    from importlib import metadata
+    mod2dist = metadata.packages_distributions()
+    loaded = set()
+    for mod in list(sys.modules):
+        for d in mod2dist.get(mod.split(".")[0], []):
+            loaded.add(_norm_dist(d))
+    dists, needed_by = {}, {}
+    for d in metadata.distributions():
+        name = _norm_dist(d.metadata["Name"] or "")
+        if not name or name in dists:
+            continue
+        dists[name] = d
+    for name, d in dists.items():
+        for req in (d.requires or []):
+            if "extra ==" in req or "extra==" in req:
+                continue   # optional extras don't make a package required
+            m = re.match(r"\s*([A-Za-z0-9_.\-]+)", req)
+            if m:
+                needed_by.setdefault(_norm_dist(m.group(1)), []).append(name)
+    rows = []
+    for name, d in dists.items():
+        size = 0
+        try:
+            for f in (d.files or []):
+                try:
+                    size += os.path.getsize(d.locate_file(f))
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        rows.append((name in loaded, size, name, d.version, needed_by.get(name, [])))
+    rows.sort(key=lambda r: (not r[0], -r[1]))
+    out, cur = [], ""
+    head = f"📦 <b>Installed packages</b> — {len(rows)} total, {sum(1 for r in rows if r[0])} imported by the running bot\n"
+    head += f"RSS now: {_rss_mb():.0f} MB · ✅ = loaded in memory · 💤 = installed but never imported (costs disk only)\n"
+    for is_loaded, size, name, ver, by in rows:
+        note = _PKG_NOTES.get(name, "")
+        req = f"needed by: {', '.join(sorted(set(by))[:3])}" if by else "not required by anything installed (top-level / from requirements.txt)"
+        line = (f"\n{'✅' if is_loaded else '💤'} <b>{html.escape(name)}</b> {html.escape(ver)} · {size / 1e6:.1f} MB\n"
+                f"   {html.escape(note + ' — ' if note else '')}<i>{html.escape(req)}</i>")
+        if len(cur) + len(line) > 3600:
+            out.append(cur)
+            cur = ""
+        cur += line
+    if cur:
+        out.append(cur)
+    out[0:1] = [head + (out[0] if out else "")]
+    return out
+
+async def packages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_creator(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    pages = await asyncio.to_thread(_packages_report)
+    for page in pages:
+        await update.message.reply_text(page, parse_mode=ParseMode.HTML)
+
+async def memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creator only: where the bot's memory is going."""
+    if not is_creator(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    await asyncio.to_thread(_trim_memory)
+    text = await asyncio.to_thread(_memory_report)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only at-a-glance dashboard: is the bot up, how many users/
     lectures exist, whether each channel backup is currently trustworthy
@@ -20163,6 +20524,12 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧠 Model: <code>{html.escape(GEMINI_MODEL)}</code>"
         + ("" if GEMINI_API_KEY else " — ⚠️ GEMINI_API_KEY not set")
         + (" — ⛔ daily quota hit" if _QZ_QUOTA_HIT_DAY == _qz_today() else "")
+    )
+    _eg = sorted(_EGRESS_TODAY["by"].items(), key=lambda kv: -kv[1])[:3] if _EGRESS_TODAY["day"] == _qz_today() else []
+    qz_line += (
+        f"\n📤 Backup uploads today: {today_rec.get('egress_bytes', 0) / 1e6:.1f} MB"
+        + (" (" + ", ".join(f"{k} {v / 1e6:.1f}" for k, v in _eg) + ")" if _eg else "")
+        + f"\n🧠 RAM: {_rss_mb():.0f} MB"
     )
     text = (
         f"🟢 Bot: ONLINE\n"
@@ -20304,7 +20671,14 @@ async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # AWAITING_*/PENDING_* flow in this file.
 BROADCAST_ACTIVE_WINDOW_DAYS = 7   # "Active users" = engaged with the bot at least once in this many days
 BROADCAST_PROGRESS_EDIT_INTERVAL = 2.0   # seconds between progress-bar edits — Telegram's edit-rate limits are per-chat, so this only needs to be sane, not aggressive
-BROADCAST_SEND_DELAY             = 0.05  # seconds between sends — a light throttle against Telegram's global flood limits on a big broadcast
+BROADCAST_SEND_DELAY             = 0.05  # (legacy) no longer used by the send loop — see BROADCAST_RATE_PER_SEC
+# Telegram allows ~30 messages/second bot-wide. A broadcast takes only a share of
+# that so replies to active students never queue behind it: BROADCAST_RATE_PER_SEC
+# is the broadcast's own cap (everything else, e.g. quiz polls, uses the remainder),
+# spread over BROADCAST_WORKERS concurrent senders so network latency doesn't
+# make it slower than the cap. Both can be tuned from Railway variables.
+BROADCAST_RATE_PER_SEC = float(os.environ.get("BROADCAST_RATE", "15"))
+BROADCAST_WORKERS      = int(os.environ.get("BROADCAST_WORKERS", "6"))
 
 BROADCAST_AUDIENCE_ORDER  = ["all", "mfm", "mnu", "y1", "y2", "y3", "n1", "n2", "n3", "active", "inactive"]
 BROADCAST_AUDIENCE_LABELS = {
@@ -20475,8 +20849,12 @@ def _broadcast_composer_view(admin_id: int) -> tuple:
     action_row = []
     if (text or media or poll) and count:   # SEND only offered once there's actually something, to someone, to send
         action_row.append(InlineKeyboardButton("🚀 SEND", callback_data="bcsend"))
+        action_row.append(InlineKeyboardButton("⏰ Schedule", callback_data="bcsched"))
     action_row.append(InlineKeyboardButton("❌ CANCEL", callback_data="bccancel"))
     buttons.append(action_row)
+    _pending = _bcast_scheduled_for(admin_id)
+    if _pending:
+        buttons.append([InlineKeyboardButton(f"⏰ Scheduled ({len(_pending)})", callback_data="bcsl")])
     if admin_id in SUPERADMIN_IDS:   # Creator only
         buttons.append([InlineKeyboardButton("📈 Stats", callback_data="bcs:list")])
 
@@ -20767,6 +21145,9 @@ BROADCAST_LOG_KEEP = 25
 BROADCAST_STATS_PAGE_ROWS = 10
 BROADCAST_LOG: dict = _load_json_safe(BROADCAST_LOG_FILE, dict, dict, "BROADCAST LOG")
 BROADCAST_LOG.setdefault("items", {})
+BROADCAST_LOG.setdefault("scheduled", {})   # sid -> a composed broadcast waiting for its send time (persisted with the log + Storage backup)
+BROADCAST_LOG.setdefault("next_sid", 1 + max([int(k) for k in BROADCAST_LOG["scheduled"]] + [0]))
+BCAST_SCHEDULE_GRACE_SECONDS = 6 * 3600   # a schedule missed by more than this (bot was down) is dropped, not sent late
 BROADCAST_LOG.setdefault("next_id", 1 + max([int(k) for k in BROADCAST_LOG["items"]] + [0]))
 _BCAST_MSG_INDEX: dict = {}   # (user_id, message_id) -> broadcast id, rebuilt from BROADCAST_LOG
 _BCAST_POLL_INDEX: dict = {}  # poll_id -> broadcast id (poll broadcasts: every recipient gets their own poll), rebuilt from BROADCAST_LOG
@@ -20866,6 +21247,9 @@ def _broadcast_log_merge(part: dict) -> None:
                 or len(item.get("votes") or {}) > len(mine.get("votes") or {})):
             BROADCAST_LOG["items"][bid] = item
     BROADCAST_LOG["next_id"] = max(BROADCAST_LOG["next_id"], int(part.get("next_id", 1)))
+    for sid, item in (part.get("scheduled") or {}).items():
+        BROADCAST_LOG["scheduled"].setdefault(sid, item)
+    BROADCAST_LOG["next_sid"] = max(BROADCAST_LOG["next_sid"], int(part.get("next_sid", 1)))
     _bcast_prune()
 
 def _broadcast_stats(item: dict) -> dict:
@@ -21024,6 +21408,65 @@ async def _deliver_broadcast_item(bot, uid: int, text: str | None, media: dict |
         kwargs["reply_markup"] = markup
     return (await bot.copy_message(**kwargs)).message_id
 
+class _PacedGate:
+    """Shared pacing for a set of concurrent senders: hands out send slots at most
+    `rate` per second in total, and can be paused bot-wide when Telegram sends a
+    RetryAfter (flood-wait)."""
+    def __init__(self, rate: float):
+        self.interval = 1.0 / max(rate, 0.1)
+        self._next = 0.0
+        self._pause_until = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            slot = max(self._next, self._pause_until, now)
+            self._next = slot + self.interval
+        delay = slot - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def pause(self, seconds: float) -> None:
+        self._pause_until = max(self._pause_until, time.monotonic() + seconds)
+
+async def _paced_run(items: list, fn, rate: float, workers: int, should_stop) -> list:
+    """Runs `await fn(item)` for every item with `workers` concurrent senders under one
+    shared `rate`/second cap. fn handles its own errors but must let RetryAfter
+    through: the whole group then pauses for the flood-wait and the item is retried
+    (up to 3 times). Returns the items that never got through. Stops early when
+    should_stop() turns true."""
+    gate = _PacedGate(rate)
+    queue: asyncio.Queue = asyncio.Queue()
+    for it in items:
+        queue.put_nowait(it)
+    gave_up: list = []
+
+    async def worker():
+        while not should_stop():
+            try:
+                it = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            for attempt in range(4):
+                await gate.wait()
+                if should_stop():
+                    return
+                try:
+                    await fn(it)
+                    break
+                except RetryAfter as e:
+                    ra = e.retry_after
+                    ra = ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)
+                    print(f"BROADCAST: Telegram flood-wait {ra:.0f}s — pausing all senders")
+                    gate.pause(ra + 1)
+                    if attempt == 3:
+                        gave_up.append(it)
+
+    await asyncio.gather(*(worker() for _ in range(max(1, workers))))
+    return gave_up
+
+
 async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, audience: str, text: str | None, recipients: list, media: dict | None = None, actor=None,
                           button: str | None = None, button_url: str | None = None, poll: dict | None = None) -> None:
     """Sends text to every id in recipients, editing status_message into
@@ -21073,10 +21516,8 @@ async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, au
 
     await _update_progress(0, force=True)
 
-    for i, uid in enumerate(recipients, 1):
-        if bid in _BCAST_STOP:
-            cancelled = True
-            break
+    async def _send_one(uid):
+        nonlocal success, failed
         try:
             _pout: dict = {}
             sent_ids[uid] = await _deliver_broadcast_item(context.bot, uid, text, media, btn, poll, _pout)
@@ -21085,21 +21526,26 @@ async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, au
                 BROADCAST_LOG["items"][str(bid)]["poll_ids"][_pout["id"]] = uid
                 _BCAST_POLL_INDEX[_pout["id"]] = bid
             success += 1
+        except RetryAfter:
+            raise   # flood-wait: _paced_run pauses every sender and retries this recipient
         except Forbidden:
             # The user actually blocked the bot (or deleted their account) —
             # this is the only case where removing them from USERS is safe.
             failed += 1
             blocked.append(uid)
         except Exception as e:
-            # Any other error (network blip, rate limit, Telegram hiccup) is
-            # NOT proof the user blocked us — keep them in USERS so a
-            # transient failure doesn't silently and permanently unsubscribe
-            # a real, still-active user.
+            # Any other error (network blip, Telegram hiccup) is NOT proof the
+            # user blocked us — keep them in USERS so a transient failure
+            # doesn't silently and permanently unsubscribe a real, still-active user.
             failed += 1
             print(f"Broadcast failed for {uid} (not removed — not a block):", e)
-        await _update_progress(i)
-        if BROADCAST_SEND_DELAY:
-            await asyncio.sleep(BROADCAST_SEND_DELAY)
+        await _update_progress(success + failed)
+
+    gave_up = await _paced_run(recipients, _send_one, BROADCAST_RATE_PER_SEC, BROADCAST_WORKERS, lambda: bid in _BCAST_STOP)
+    if gave_up:
+        failed += len(gave_up)
+        print(f"Broadcast #{bid}: {len(gave_up)} recipients gave up after repeated flood-waits")
+    cancelled = bid in _BCAST_STOP and (success + failed) < total
 
     _BCAST_STOP.discard(bid)
     if blocked:
@@ -21134,6 +21580,121 @@ async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, au
     except Exception:
         pass
 
+# ═══════════════════════════════════════════════════════════════
+# SCHEDULED BROADCASTS — "⏰ Schedule" in the /broadcast composer.
+# The composed message is stored in BROADCAST_LOG["scheduled"] and a 20-second
+# job (_scheduled_broadcast_job) sends it at its time through the normal
+# _send_broadcast (paced, cancellable, deletable). The audience is resolved at
+# SEND time, so people who joined in between are included. Times are Cairo time.
+# ═══════════════════════════════════════════════════════════════
+BCAST_SCHEDULE_MAX_DAYS = 90
+
+def _parse_schedule_time(raw: str):
+    """'+2h' / '+1h30m' / '+45m' / '+1d' (from now), 'HH:MM' (today, or tomorrow if
+    it already passed), 'YYYY-MM-DD HH:MM' or 'DD/MM/YYYY HH:MM' -> aware Cairo datetime, or None."""
+    t = (raw or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")).lower()
+    now = datetime.now(DAILY_QUIZ_TZ)
+    try:
+        m = re.fullmatch(r"\+\s*(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m(?:in)?)?", t)
+        if m and any(m.groups()):
+            d, h, mi = (int(x or 0) for x in m.groups())
+            return now + timedelta(days=d, hours=h, minutes=mi)
+        m = re.fullmatch(r"(?:(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})[/-](\d{1,2})[/-](\d{4}))\s+(\d{1,2}):(\d{2})", t)
+        if m:
+            y1, mo1, d1, d2, mo2, y2, hh, mm = m.groups()
+            y, mo, d = (int(y1), int(mo1), int(d1)) if y1 else (int(y2), int(mo2), int(d2))
+            return datetime(y, mo, d, int(hh), int(mm), tzinfo=DAILY_QUIZ_TZ)
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
+        if m:
+            when = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+            return when if when > now else when + timedelta(days=1)
+    except ValueError:
+        return None
+    return None
+
+def _fmt_schedule_time(ts: float) -> str:
+    return datetime.fromtimestamp(ts, DAILY_QUIZ_TZ).strftime("%a %d %b %Y · %H:%M")
+
+def _bcast_schedule_add(admin_id: int, draft: dict, at_ts: float) -> int:
+    global _bcast_dirty
+    sid = BROADCAST_LOG["next_sid"]
+    BROADCAST_LOG["next_sid"] = sid + 1
+    BROADCAST_LOG["scheduled"][str(sid)] = copy.deepcopy({
+        "sid": sid, "at": at_ts, "actor": admin_id, "created": time.time(),
+        "audience": draft.get("audience"), "text": draft.get("text"), "media": draft.get("media"),
+        "poll": draft.get("poll"), "button": draft.get("button"), "button_url": draft.get("button_url"),
+    })
+    _bcast_dirty = True
+    return sid
+
+def _bcast_mark_dirty() -> None:
+    global _bcast_dirty
+    _bcast_dirty = True
+
+def _bcast_scheduled_for(admin_id: int) -> list:
+    return sorted((i for i in BROADCAST_LOG["scheduled"].values() if _bcast_owner_ok(i, admin_id)), key=lambda i: i["at"])
+
+def _bcast_scheduled_view(admin_id: int):
+    items = _bcast_scheduled_for(admin_id)
+    if not items:
+        return "⏰ <b>Scheduled broadcasts</b>\n\nمفيش بث مجدول دلوقتي.", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("↩️ Back", callback_data="bcback")]])
+    lines = ["⏰ <b>Scheduled broadcasts</b> (توقيت القاهرة)\n"]
+    buttons = []
+    for it in items[:15]:
+        prev = it.get("text") or ((it.get("poll") or {}).get("question") and f"📊 {it['poll']['question']}") or (it.get("media") or {}).get("caption") or "[مرفق]"
+        lines.append(f"<b>#{it['sid']}</b> · {_fmt_schedule_time(it['at'])}\n"
+                     f"👥 {BROADCAST_AUDIENCE_LABELS.get(it.get('audience'), it.get('audience'))} · "
+                     f"💬 {html.escape(re.sub(r'<[^>]+>', '', str(prev)))[:80]}")
+        buttons.append([InlineKeyboardButton(f"❌ Cancel #{it['sid']}", callback_data=f"bcsx:{it['sid']}")])
+    buttons.append([InlineKeyboardButton("↩️ Back", callback_data="bcback")])
+    return "\n\n".join(lines), InlineKeyboardMarkup(buttons)
+
+async def scheduled_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_broadcast(update):
+        await update.message.reply_text(
+            MSG_ADMIN_ONLY if not is_admin(update) else "🚫 /scheduled لأدمن الجامعة أو الـ Creator بس.")
+        return
+    text, markup = _bcast_scheduled_view(update.effective_user.id)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def _run_scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE, item: dict) -> None:
+    actor_id, sid = item["actor"], item["sid"]
+    try:
+        recipients = _broadcast_audience_user_ids(item["audience"], actor_id)
+        if not recipients:
+            await context.bot.send_message(chat_id=actor_id, text=f"⏰ البث المجدول #{sid} اتلغى: مفيش مستخدمين في الجمهور ده دلوقتي.")
+            return
+        status = await context.bot.send_message(chat_id=actor_id, text=f"⏰ بدأ إرسال البث المجدول #{sid}…")
+        poll = item.get("poll")
+        await _send_broadcast(
+            context, status, item["audience"], (f"📊 {poll['question']}" if poll else item.get("text")), recipients, item.get("media"),
+            actor=SimpleNamespace(id=actor_id, full_name=None, username=None),
+            button=item.get("button"), button_url=item.get("button_url"), poll=poll)
+    except Exception as e:
+        print(f"SCHEDULED BROADCAST #{sid} ERROR:", type(e).__name__, e)
+
+async def _scheduled_broadcast_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _bcast_dirty
+    now = time.time()
+    due = [it for it in BROADCAST_LOG["scheduled"].values() if it["at"] <= now]
+    if not due:
+        return
+    for it in due:   # removed first (and flushed) so a restart or overlapping tick can never send it twice
+        BROADCAST_LOG["scheduled"].pop(str(it["sid"]), None)
+    _bcast_dirty = True
+    await _broadcast_log_flush()
+    for it in sorted(due, key=lambda i: i["at"]):
+        if now - it["at"] > BCAST_SCHEDULE_GRACE_SECONDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=it["actor"],
+                    text=f"⚠️ البث المجدول #{it['sid']} ({_fmt_schedule_time(it['at'])}) فات ميعاده والبوت كان واقف، فاتلغى. اعمله جدولة من جديد.")
+            except Exception:
+                pass
+            continue
+        _spawn_bg(_run_scheduled_broadcast(context, it))
+
 async def _run_broadcast_bg(*args, **kwargs) -> None:
     try:
         await _send_broadcast(*args, **kwargs)
@@ -21166,20 +21727,25 @@ async def _delete_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, 
     try:
         msgs = dict(item.get("msgs") or {})
         total, done, failed, last = len(msgs), 0, 0, 0.0
-        for i, (uid_s, mid) in enumerate(msgs.items(), 1):
+        async def _del_one(pair):
+            nonlocal done, failed, last
+            uid_s, mid = pair
             try:
                 await context.bot.delete_message(chat_id=int(uid_s), message_id=mid)
                 done += 1
+            except RetryAfter:
+                raise
             except Exception:
                 failed += 1   # already deleted by the user, too old (>48h), or they blocked the bot
             now = time.monotonic()
             if now - last >= BROADCAST_PROGRESS_EDIT_INTERVAL:
                 last = now
                 try:
-                    await status_message.edit_text(f"🗑 بيمسح Broadcast #{bid}… {i}/{total}")
+                    await status_message.edit_text(f"🗑 بيمسح Broadcast #{bid}… {done + failed}/{total}")
                 except Exception:
                     pass
-            await asyncio.sleep(BROADCAST_SEND_DELAY)
+
+        failed += len(await _paced_run(list(msgs.items()), _del_one, BROADCAST_RATE_PER_SEC, BROADCAST_WORKERS, lambda: False))
         if done:
             item["deleted_at"], item["deleted_count"] = time.time(), done
             _bcast_dirty = True
@@ -21995,6 +22561,10 @@ async def _post_init(app):
             _flush_settings_job, interval=SETTINGS_FLUSH_INTERVAL, first=SETTINGS_FLUSH_INTERVAL,
         )
         app.job_queue.run_repeating(_stats_flush_job, interval=60, first=60)
+        app.job_queue.run_repeating(_scheduled_broadcast_job, interval=20, first=20)
+        app.job_queue.run_repeating(_backup_trailing_job, interval=60, first=90)
+        app.job_queue.run_repeating(_memory_trim_job, interval=300, first=180)
+        app.job_queue.run_repeating(_prune_question_meta_job, interval=1800, first=600)
         app.job_queue.run_repeating(
             _flush_daily_leaderboard_job, interval=DAILY_LEADERBOARD_FLUSH_INTERVAL, first=DAILY_LEADERBOARD_FLUSH_INTERVAL,
         )
@@ -22115,6 +22685,19 @@ async def _post_shutdown(app):
         await backup_stats_history_to_channel(SimpleNamespace(bot=app.bot), force=True)
     except Exception as e:
         print(f"Stats history shutdown flush failed: {e}")
+    # Final channel backups, so a redeploy never loses the last (now longer) backup window.
+    # Duplicates are skipped, so this only uploads what actually changed.
+    try:
+        from types import SimpleNamespace
+        _sctx = SimpleNamespace(bot=app.bot)
+        async def _final_backups():
+            for _fn in (backup_analytics_to_channel, backup_settings_to_channel, backup_mistakes_bank_to_channel,
+                        backup_lecture_results_to_channel, backup_report_threads_to_channel):
+                await _fn(_sctx, force=True)
+            await backup_sessions_to_channel(_sctx, force=True)
+        await asyncio.wait_for(_final_backups(), timeout=12)
+    except Exception as e:
+        print(f"Final backups on shutdown incomplete: {e}")
 
 # ── Backup reconciliation ────────────────────────────────────────
 # Every backup_*_to_channel() call above is reactive and fire-and-forget:
@@ -22138,7 +22721,7 @@ async def _post_shutdown(app):
 # Cheap: one get_chat per system per tick, and the throttle inside each
 # backup_*_to_channel() call means this never spams uploads if
 # everything's already fine.
-BACKUP_RECONCILE_INTERVAL = 60   # seconds (was 5: ~140 get_chat calls a minute for a check that almost never finds anything)
+BACKUP_RECONCILE_INTERVAL = int(os.environ.get("BACKUP_RECONCILE_INTERVAL", "300"))   # seconds (was 5: ~140 get_chat calls a minute for a check that almost never finds anything)
 # Once a system has been re-uploaded here it isn't re-uploaded again for this long, even if its pin
 # still looks out of sync. Without this, a channel whose pin never matches (two backups sharing one
 # chat, a pin call that keeps failing) re-uploaded on EVERY tick — and sessions use force=True, which
@@ -22184,6 +22767,7 @@ async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
             if _now - _reconcile_last_repair.get(key, -_cooldown) < _cooldown:
                 continue   # repaired a moment ago — give it time to settle rather than uploading again
             _reconcile_last_repair[key] = _now
+            _BACKUP_FORCE_KEYS.add(key)   # skip the "too soon" and "unchanged" checks for this one repair upload
             print(f"BACKUP RECONCILE — {key} pin out of sync, re-backing up.")
             try:
                 await backup_fn(context)
@@ -22549,6 +23133,9 @@ app.add_handler(CommandHandler("set_uni",        set_uni_cmd))
 app.add_handler(CommandHandler("tell",           tell_cmd))
 app.add_handler(CommandHandler("health",         health_cmd))
 app.add_handler(CommandHandler("all_nicknames",   all_nicknames_cmd))
+app.add_handler(CommandHandler("memory",          memory_cmd))
+app.add_handler(CommandHandler("packages",        packages_cmd))
+app.add_handler(CommandHandler("scheduled",       scheduled_cmd))
 app.add_handler(CommandHandler("stats",          stats_cmd))
 app.add_handler(CommandHandler("report",         report_cmd))
 app.add_handler(CommandHandler("broadcast_stats", broadcast_stats_cmd))
